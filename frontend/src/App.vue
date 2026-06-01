@@ -29,6 +29,13 @@ const mxHarFile = ref(null);
 const mxHarImporting = ref(false);
 const inventoryCleanupSubmitting = ref(false);
 const taskListCleanupSubmitting = ref(false);
+const diagnosticLogs = ref([]);
+const diagnosticConfig = reactive({ directory: "", active_file: "", max_file_mb: 0, backup_count: 0, files: [] });
+const diagnosticFilters = reactive({ level: "", component: "", search: "" });
+const diagnosticLoading = ref(false);
+const frontendLogQueue = [];
+let frontendLogFlushing = false;
+let frontendLogFlushTimer;
 
 const navItems = [
   { id: "dashboard", label: "仪表盘", hint: "Dashboard", icon: "grid" },
@@ -111,11 +118,104 @@ watch(() => sourceJob.lookback_days, (days, previousDays) => {
   }
 });
 
+watch(activePage, (page, previousPage) => {
+  frontendLog("info", "navigation.changed", "", { from: previousPage, to: page });
+  if (page === "audit") void loadDiagnosticLogs();
+});
+
+function clientRequestId() {
+  return globalThis.crypto?.randomUUID?.().replaceAll("-", "").slice(0, 12) || `${Date.now()}${Math.random()}`.replace(".", "").slice(-12);
+}
+
+function sanitizeClientContext(value, key = "") {
+  const normalizedKey = key.toLowerCase().replaceAll("-", "_");
+  if (/api.?key|authorization|cookie|password|secret|har.?text/i.test(normalizedKey) || normalizedKey === "token" || normalizedKey.endsWith("_token")) return "[REDACTED]";
+  if (Array.isArray(value)) return value.map((item) => sanitizeClientContext(item));
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([itemKey, itemValue]) => [itemKey, sanitizeClientContext(itemValue, itemKey)]));
+  if (typeof value === "string") return value.replace(/\bsk-[A-Za-z0-9_-]{10,}\b/gi, "[REDACTED]").slice(0, 4000);
+  return value;
+}
+
+function frontendLog(level, event, message = "", context = {}) {
+  frontendLogQueue.push({
+    timestamp: new Date().toISOString(),
+    level,
+    event,
+    message,
+    context: sanitizeClientContext({ page: activePage.value, ...context }),
+  });
+  if (frontendLogQueue.length > 200) frontendLogQueue.splice(0, frontendLogQueue.length - 200);
+  window.clearTimeout(frontendLogFlushTimer);
+  frontendLogFlushTimer = window.setTimeout(() => void flushFrontendLogs(), 500);
+}
+
+async function flushFrontendLogs() {
+  if (frontendLogFlushing || !frontendLogQueue.length) return;
+  frontendLogFlushing = true;
+  const entries = frontendLogQueue.splice(0, 40);
+  try {
+    await fetch(`${API}/api/diagnostics/frontend-logs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Request-ID": clientRequestId() },
+      body: JSON.stringify({ entries }),
+    });
+  } catch {
+    frontendLogQueue.unshift(...entries);
+  } finally {
+    frontendLogFlushing = false;
+    if (frontendLogQueue.length) frontendLogFlushTimer = window.setTimeout(() => void flushFrontendLogs(), 2000);
+  }
+}
+
 async function request(path, options = {}) {
-  const response = await fetch(API + path, { headers: { "Content-Type": "application/json" }, ...options });
-  const body = await response.json();
-  if (!response.ok) throw new Error(body.detail || "请求失败");
-  return body;
+  const requestId = clientRequestId();
+  const method = options.method || "GET";
+  const startedAt = performance.now();
+  try {
+    const response = await fetch(API + path, { headers: { "Content-Type": "application/json", "X-Request-ID": requestId }, ...options });
+    const body = await response.json();
+    const correlatedId = response.headers.get("X-Request-ID") || requestId;
+    if (!response.ok) {
+      frontendLog("error", "api.request.failed", body.detail || "请求失败", { method, path, status_code: response.status, request_id: correlatedId, latency_ms: Math.round(performance.now() - startedAt) });
+      throw new Error(`${body.detail || "请求失败"} · 请求 ID ${correlatedId}`);
+    }
+    if (method !== "GET" && path !== "/api/diagnostics/frontend-logs") {
+      frontendLog("info", "api.request.completed", "", { method, path, status_code: response.status, request_id: correlatedId, latency_ms: Math.round(performance.now() - startedAt) });
+    }
+    return body;
+  } catch (error) {
+    if (!String(error.message).includes("请求 ID")) {
+      frontendLog("error", "api.request.network_failed", error.message, { method, path, request_id: requestId, latency_ms: Math.round(performance.now() - startedAt) });
+      throw new Error(`${error.message} · 请求 ID ${requestId}`);
+    }
+    throw error;
+  }
+}
+
+async function loadDiagnosticLogs() {
+  diagnosticLoading.value = true;
+  try {
+    const params = new URLSearchParams({ limit: "240" });
+    if (diagnosticFilters.level) params.set("level", diagnosticFilters.level);
+    if (diagnosticFilters.component) params.set("component", diagnosticFilters.component);
+    if (diagnosticFilters.search) params.set("search", diagnosticFilters.search);
+    const result = await request(`/api/diagnostics/logs?${params}`);
+    diagnosticLogs.value = result.logs;
+    Object.assign(diagnosticConfig, result.config);
+  } catch (error) {
+    notice.value = error.message;
+  } finally {
+    diagnosticLoading.value = false;
+  }
+}
+
+function exportDiagnosticLogs() {
+  frontendLog("info", "diagnostics.export.clicked");
+  window.open(`${API}/api/diagnostics/logs/export`, "_blank", "noopener,noreferrer");
+}
+
+function formatDiagnosticFields(fields) {
+  return JSON.stringify(fields || {}, null, 2);
 }
 
 async function refresh() {
@@ -128,6 +228,7 @@ async function refresh() {
 }
 
 async function saveProvider() {
+  frontendLog("info", "provider.save.clicked", "", { editing_provider_id: editingProviderId.value, protocol: provider.protocol, model: provider.model });
   saving.value = true;
   try {
     const payload = { ...provider, extra_body: JSON.parse(provider.extra_body_text || "{}") };
@@ -142,6 +243,7 @@ async function saveProvider() {
 }
 
 async function testProvider(id) {
+  frontendLog("info", "provider.health_check.clicked", "", { provider_id: id });
   notice.value = "正在测试模型通道...";
   try {
     const result = await request(`/api/providers/${id}/test`, { method: "POST" });
@@ -195,6 +297,7 @@ async function createTask() {
     return notice.value = "个股研究时间窗口必须是 1-30 之间的整数";
   }
   try {
+    frontendLog("info", "research_task.create.clicked", "", { target: task.target, skill_name: task.skill_name, lookback_days: task.lookback_days });
     await request("/api/tasks", { method: "POST", body: JSON.stringify(task) });
     notice.value = "研究任务已进入队列";
     task.target = "";
@@ -215,6 +318,7 @@ async function createSourceJob() {
     : "任务正在提交，请稍候。";
   notice.value = sourceJobFeedback.value;
   try {
+    frontendLog("info", "source_job.create.clicked", "", { action: sourceJob.action, channel_ids: sourceJob.channel_ids, lookback_days: sourceJob.lookback_days });
     const result = await request("/api/source-jobs", { method: "POST", body: JSON.stringify(sourceJob) });
     const message = result.deduplicated && result.action === "report"
       ? result.status === "generating_report"
@@ -318,6 +422,7 @@ function toggleSourceChannel(channelId) {
 async function runTask(id) {
   notice.value = "模型正在编排研究计划...";
   try {
+    frontendLog("info", "research_task.analyze.clicked", "", { task_id: id });
     const result = await request(`/api/tasks/${id}/analyze`, { method: "POST" });
     const taskItem = data.tasks.find((item) => item.id === id);
     if (result.report) openReport(result.report, taskItem ? `${taskItem.target} - ${taskItem.title}` : "个股研究报告");
@@ -393,6 +498,7 @@ async function clearAuditInventory(scope) {
   if (!window.confirm(`确认删除${descriptions[scope]}吗？任务流水和审计记录会保留，此操作不可撤销。`)) return;
   inventoryCleanupSubmitting.value = true;
   try {
+    frontendLog("warning", "audit.inventory.clear.confirmed", "", { scope });
     const result = await request(`/api/audit/inventory/${scope}`, { method: "DELETE" });
     notice.value = `库存清理完成：删除 ${result.deleted.snapshot_count} 份快照、${result.deleted.normalized_item_count} 条结构化内容、${result.deleted.source_report_count + result.deleted.research_report_count} 份报告`;
     await refresh();
@@ -412,6 +518,7 @@ async function clearTaskList(scope) {
   if (!window.confirm(`确认永久删除${descriptions[scope]}吗？任务记录、内嵌报告和关联映射会直接删除，此操作不可撤销。原始快照库存不受影响。`)) return;
   taskListCleanupSubmitting.value = true;
   try {
+    frontendLog("warning", "audit.task_list.clear.confirmed", "", { scope });
     const result = await request(`/api/task-lists/${scope}`, { method: "DELETE" });
     notice.value = `任务列表已清理：删除 ${result.deleted_research_tasks} 个研究任务、${result.deleted_source_jobs} 个信源任务`;
     await refresh();
@@ -499,6 +606,7 @@ async function openChannelLogin() {
 async function checkChannel(channel) {
   notice.value = `正在检查 ${channelDisplayName(channel)} 登录状态...`;
   try {
+    frontendLog("info", "channel.check.clicked", "", { channel_id: channel.id });
     const result = await request(`/api/channels/${channel.id}/check`, { method: "POST" });
     notice.value = `${channelDisplayName(channel)}: ${result.message}`;
     await refresh();
@@ -525,6 +633,7 @@ async function importMxHar() {
   mxHarImporting.value = true;
   notice.value = "正在验证 MX HAR 并加密更新会话...";
   try {
+    frontendLog("info", "channel.mx_har.import.clicked", "", { channel_id: editingChannel.value.id, file_size: mxHarFile.value.size });
     const result = await request(`/api/channels/${editingChannel.value.id}/import-mx-har`, {
       method: "POST",
       body: JSON.stringify({ har_text: await mxHarFile.value.text() }),
@@ -556,6 +665,7 @@ function normalizeChannelForm() {
 }
 
 function openReport(report, title = "AlphaDesk 报告") {
+  frontendLog("info", "report.preview.opened", "", { title, report_chars: (report || "").length });
   selectedReport.value = report;
   selectedReportTitle.value = title || "AlphaDesk 报告";
   reportModal.value = true;
@@ -607,6 +717,7 @@ async function exportReportHtml() {
   const filename = reportExportFilename();
   const html = buildReportExportDocument(selectedReport.value);
   try {
+    frontendLog("info", "report.export.clicked", "", { filename, report_chars: html.length });
     if (window.alphadesk?.saveHtmlReport) {
       const result = await window.alphadesk.saveHtmlReport({ filename, html });
       if (result.status === "cancelled") return;
@@ -637,14 +748,30 @@ function closeTopmostModal(event) {
   event.preventDefault();
 }
 
+function captureWindowError(event) {
+  frontendLog("error", "frontend.window.error", event.message || "Unknown window error", { filename: event.filename, lineno: event.lineno, colno: event.colno });
+}
+
+function captureUnhandledRejection(event) {
+  frontendLog("error", "frontend.unhandled_rejection", event.reason?.message || String(event.reason || "Unknown rejection"));
+}
+
 let refreshTimer;
 onMounted(async () => {
   window.addEventListener("keydown", closeTopmostModal);
+  window.addEventListener("error", captureWindowError);
+  window.addEventListener("unhandledrejection", captureUnhandledRejection);
+  frontendLog("info", "frontend.mounted");
   await refresh();
   refreshTimer = setInterval(() => refresh().catch(() => {}), 5000);
 });
 onUnmounted(() => {
+  frontendLog("info", "frontend.unmounted");
+  void flushFrontendLogs();
   window.removeEventListener("keydown", closeTopmostModal);
+  window.removeEventListener("error", captureWindowError);
+  window.removeEventListener("unhandledrejection", captureUnhandledRejection);
+  window.clearTimeout(frontendLogFlushTimer);
   clearInterval(refreshTimer);
 });
 </script>
@@ -1068,6 +1195,43 @@ onUnmounted(() => {
                 <p class="mt-1 max-w-5xl break-all text-xs leading-5 text-slate-600">{{ event.detail }}</p>
               </div>
               <p class="whitespace-nowrap text-xs text-slate-500">{{ event.created_at }}</p>
+            </div>
+          </section>
+          <section class="panel mt-5 p-5">
+            <div class="flex items-start justify-between gap-5">
+              <div>
+                <h2 class="section-title">运行诊断日志</h2>
+                <p class="mt-1 text-xs leading-5 text-slate-500">后端、模型网关、采集 worker 和前端交互统一写入脱敏 JSONL。接口失败提示中的请求 ID 可直接用于检索。</p>
+                <p class="mt-1 text-xs text-slate-600">滚动策略：单文件 {{ diagnosticConfig.max_file_mb || 8 }} MB，保留 {{ diagnosticConfig.backup_count || 12 }} 份 · {{ diagnosticConfig.directory || 'data/logs' }}</p>
+              </div>
+              <div class="flex shrink-0 gap-2">
+                <button @click="loadDiagnosticLogs" :disabled="diagnosticLoading" class="secondary disabled:cursor-wait disabled:opacity-60">{{ diagnosticLoading ? '刷新中...' : '刷新日志' }}</button>
+                <button @click="exportDiagnosticLogs" class="report-action">导出诊断包</button>
+              </div>
+            </div>
+            <div class="mt-4 grid grid-cols-[.55fr_.8fr_1.65fr_auto] gap-3">
+              <select v-model="diagnosticFilters.level" class="field">
+                <option value="">全部级别</option>
+                <option value="error">error</option>
+                <option value="warning">warning</option>
+                <option value="info">info</option>
+              </select>
+              <input v-model="diagnosticFilters.component" class="field" placeholder="组件，例如 model_gateway" />
+              <input v-model="diagnosticFilters.search" class="field" placeholder="事件、任务 ID、信源 ID 或请求 ID" @keyup.enter="loadDiagnosticLogs" />
+              <button @click="loadDiagnosticLogs" class="primary">筛选</button>
+            </div>
+            <div class="mt-4 space-y-2">
+              <div v-if="!diagnosticLogs.length" class="empty">尚无匹配的运行日志</div>
+              <article v-for="(entry,index) in diagnosticLogs" :key="`${entry.timestamp}-${index}`" class="rounded-xl border border-white/[.07] bg-black/15 px-4 py-3">
+                <div class="flex flex-wrap items-center gap-2 text-xs">
+                  <span class="rounded-full px-2 py-0.5 font-semibold uppercase" :class="entry.level==='error'?'bg-rose-400/10 text-rose-300':entry.level==='warning'?'bg-amber-400/10 text-amber-300':'bg-teal-400/10 text-teal-300'">{{ entry.level }}</span>
+                  <strong class="text-slate-200">{{ entry.event }}</strong>
+                  <span class="text-slate-500">{{ entry.component }}</span>
+                  <span v-if="entry.request_id" class="font-mono text-blue-300">{{ entry.request_id }}</span>
+                  <span class="ml-auto text-slate-600">{{ entry.timestamp }}</span>
+                </div>
+                <pre v-if="Object.keys(entry.fields || {}).length" class="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-black/20 p-3 text-[11px] leading-5 text-slate-500">{{ formatDiagnosticFields(entry.fields) }}</pre>
+              </article>
             </div>
           </section>
         </template>

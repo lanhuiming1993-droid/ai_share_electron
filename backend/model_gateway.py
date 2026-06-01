@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import threading
+import time
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
@@ -13,7 +14,10 @@ from pydantic_ai.models import create_async_http_client
 from pydantic_ai.models.openai import OpenAIChatModel, OpenAIResponsesModel
 from pydantic_ai.providers.openai import OpenAIProvider
 
+from backend.logging_config import get_logger, log_event, log_exception
+
 OutputT = TypeVar("OutputT", bound=BaseModel)
+logger = get_logger("model_gateway")
 
 
 @dataclass(frozen=True)
@@ -42,15 +46,41 @@ class ModelGateway:
         self._local = threading.local()
 
     def run_text(self, config: ProviderRuntimeConfig, prompt: str, *, instructions: str) -> GatewayResult:
-        agent = Agent(
-            model=self._model(config),
-            output_type=str,
-            instructions=instructions,
-            model_settings=self._model_settings(config),
-            retries=2,
-        )
-        result = agent.run_sync(prompt)
-        return self._result(result.output, result.usage)
+        started_at = time.perf_counter()
+        log_event(logger, "INFO", "model.text.started", provider_id=config.id, model=config.model, protocol=config.protocol, prompt_chars=len(prompt))
+        try:
+            agent = Agent(
+                model=self._model(config),
+                output_type=str,
+                instructions=instructions,
+                model_settings=self._model_settings(config),
+                retries=2,
+            )
+            result = agent.run_sync(prompt)
+            output = self._result(result.output, result.usage)
+            log_event(
+                logger,
+                "INFO",
+                "model.text.completed",
+                provider_id=config.id,
+                model=config.model,
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+                input_tokens=output.input_tokens,
+                output_tokens=output.output_tokens,
+                requests=output.requests,
+            )
+            return output
+        except Exception as exc:
+            log_exception(
+                logger,
+                "model.text.failed",
+                exc,
+                provider_id=config.id,
+                model=config.model,
+                protocol=config.protocol,
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+            )
+            raise
 
     def run_structured(
         self,
@@ -60,15 +90,52 @@ class ModelGateway:
         instructions: str,
         output_type: type[OutputT],
     ) -> GatewayResult[OutputT]:
-        agent = Agent(
-            model=self._model(config),
-            output_type=PromptedOutput(output_type),
-            instructions=instructions,
-            model_settings=self._model_settings(config),
-            retries=2,
+        started_at = time.perf_counter()
+        log_event(
+            logger,
+            "INFO",
+            "model.structured.started",
+            provider_id=config.id,
+            model=config.model,
+            protocol=config.protocol,
+            output_type=output_type.__name__,
+            prompt_chars=len(prompt),
         )
-        result = agent.run_sync(prompt)
-        return self._result(result.output, result.usage)
+        try:
+            agent = Agent(
+                model=self._model(config),
+                output_type=PromptedOutput(output_type),
+                instructions=instructions,
+                model_settings=self._model_settings(config),
+                retries=2,
+            )
+            result = agent.run_sync(prompt)
+            output = self._result(result.output, result.usage)
+            log_event(
+                logger,
+                "INFO",
+                "model.structured.completed",
+                provider_id=config.id,
+                model=config.model,
+                output_type=output_type.__name__,
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+                input_tokens=output.input_tokens,
+                output_tokens=output.output_tokens,
+                requests=output.requests,
+            )
+            return output
+        except Exception as exc:
+            log_exception(
+                logger,
+                "model.structured.failed",
+                exc,
+                provider_id=config.id,
+                model=config.model,
+                protocol=config.protocol,
+                output_type=output_type.__name__,
+                latency_ms=int((time.perf_counter() - started_at) * 1000),
+            )
+            raise
 
     def _model(self, config: ProviderRuntimeConfig):
         cache = getattr(self._local, "models", None)
@@ -93,6 +160,18 @@ class ModelGateway:
             else OpenAIChatModel(config.model, provider=provider)
         )
         cache[fingerprint] = model
+        log_event(
+            logger,
+            "INFO",
+            "model.client.created",
+            provider_id=config.id,
+            base_url=config.base_url,
+            model=config.model,
+            protocol=config.protocol,
+            timeout_seconds=self.timeout_seconds,
+            connect_timeout_seconds=self.connect_timeout_seconds,
+            network_retries=self.network_retries,
+        )
         return model
 
     def _model_settings(self, config: ProviderRuntimeConfig) -> dict:

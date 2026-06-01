@@ -11,6 +11,9 @@ from typing import Callable
 from uuid import uuid4
 
 from backend.collectors import collect_channel
+from backend.logging_config import get_logger, log_event, log_exception
+
+logger = get_logger("collection_worker")
 
 
 def current_time() -> str:
@@ -74,17 +77,31 @@ class CollectionWorker:
 
     def start(self) -> None:
         if self.thread and self.thread.is_alive():
+            log_event(logger, "INFO", "worker.start.skipped", reason="already_running")
             return
         self.thread = threading.Thread(target=self.run, daemon=True, name="source-collection-worker")
         self.thread.start()
+        log_event(logger, "INFO", "worker.started", poll_seconds=self.poll_seconds)
 
     def stop(self) -> None:
         self.stop_event.set()
+        log_event(logger, "INFO", "worker.stop.requested")
 
     def run(self) -> None:
         while not self.stop_event.is_set():
             job = self.claim_next()
             if job:
+                log_event(
+                    logger,
+                    "INFO",
+                    "worker.job.claimed",
+                    job_id=job["id"],
+                    action=job["action"],
+                    status=job["status"],
+                    resume_report=bool(job.get("_resume_report")),
+                    parent_task_id=job.get("parent_task_id", ""),
+                    evidence_layer=job.get("evidence_layer", ""),
+                )
                 if job.pop("_resume_report", False):
                     self.generate_report(job)
                 else:
@@ -216,12 +233,33 @@ class CollectionWorker:
                 """,
                 (window["channel_id"], scope_key, window["window_end"]),
             )
+        log_event(
+            logger,
+            "INFO",
+            "worker.channel.persisted",
+            job_id=job["id"],
+            channel_id=window["channel_id"],
+            scope_type=scope_type,
+            scope_key=scope_key,
+            received_snapshots=len(snapshots),
+            inserted_snapshots=inserted,
+            duplicate_snapshots=duplicates,
+        )
         return inserted, duplicates, inserted_snapshot_ids
 
     def execute(self, job: dict) -> None:
         successful_channels: set[str] = set()
         errors: dict[str, str] = {}
         total_inserted = 0
+        log_event(
+            logger,
+            "INFO",
+            "worker.collection.started",
+            job_id=job["id"],
+            action=job["action"],
+            parent_task_id=job.get("parent_task_id", ""),
+            evidence_layer=job.get("evidence_layer", ""),
+        )
         try:
             with self.connect() as conn:
                 channels = {row["id"]: dict(row) for row in conn.execute("SELECT * FROM channels")}
@@ -232,6 +270,16 @@ class CollectionWorker:
             for window in json.loads(job["windows"]):
                 channel = channels[window["channel_id"]]
                 started_at = current_time()
+                log_event(
+                    logger,
+                    "INFO",
+                    "worker.channel.started",
+                    job_id=job["id"],
+                    channel_id=channel["id"],
+                    collection_mode=channel.get("collection_mode", ""),
+                    window_start=window["window_start"],
+                    window_end=window["window_end"],
+                )
                 self.record_run(job["id"], channel["id"], "running", started_at=started_at)
                 try:
                     channel_snapshots = collect_channel(
@@ -255,15 +303,42 @@ class CollectionWorker:
                         duplicate_count=duplicates,
                         coverage_complete=coverage_complete,
                     )
+                    log_event(
+                        logger,
+                        "WARNING" if not coverage_complete else "INFO",
+                        "worker.channel.completed",
+                        job_id=job["id"],
+                        channel_id=channel["id"],
+                        received_snapshots=len(channel_snapshots),
+                        inserted_snapshots=inserted,
+                        duplicate_snapshots=duplicates,
+                        coverage_complete=coverage_complete,
+                    )
                     if self.normalize_snapshot:
                         for snapshot_id in snapshot_ids:
                             try:
                                 self.normalize_snapshot(snapshot_id)
                             except Exception as exc:
                                 errors[channel["id"]] = f"Normalization failed after collection: {exc}"[:1200]
+                                log_exception(
+                                    logger,
+                                    "worker.normalization.failed",
+                                    exc,
+                                    job_id=job["id"],
+                                    channel_id=channel["id"],
+                                    snapshot_id=snapshot_id,
+                                )
                 except Exception as exc:
                     errors[channel["id"]] = str(exc)[:1200]
                     self.record_run(job["id"], channel["id"], "failed", started_at=started_at, error=str(exc))
+                    log_exception(
+                        logger,
+                        "worker.channel.failed",
+                        exc,
+                        job_id=job["id"],
+                        channel_id=channel["id"],
+                        collection_mode=channel.get("collection_mode", ""),
+                    )
                     if (channel.get("request_config") or {}).get("adapter") == "mx_authorized_request_replay":
                         checked_at = current_time()
                         with self.connect() as conn:
@@ -273,6 +348,7 @@ class CollectionWorker:
                             )
             self.finish_collection(job, successful_channels, errors, total_inserted)
         except Exception as exc:
+            log_exception(logger, "worker.collection.failed", exc, job_id=job["id"])
             self.fail_job(job, str(exc))
 
     def finish_collection(self, job: dict, successful_channels: set[str], errors: dict[str, str], inserted: int) -> None:
@@ -294,12 +370,29 @@ class CollectionWorker:
             )
             if job.get("parent_task_id"):
                 conn.execute("UPDATE tasks SET status='evidence_ready' WHERE id=?", (job["parent_task_id"],))
+        log_event(
+            logger,
+            "WARNING" if errors else "INFO",
+            "worker.collection.completed",
+            job_id=job["id"],
+            status=status,
+            inserted_snapshots=inserted,
+            successful_channels=sorted(successful_channels),
+            channel_errors=errors,
+        )
         if job["action"] == "collect_report":
             self.generate_report(job)
         if job.get("parent_task_id") and self.on_evidence_ready:
             try:
                 self.on_evidence_ready(job["parent_task_id"])
             except Exception as exc:
+                log_exception(
+                    logger,
+                    "worker.evidence_callback.failed",
+                    exc,
+                    job_id=job["id"],
+                    parent_task_id=job["parent_task_id"],
+                )
                 with self.connect() as conn:
                     conn.execute(
                         "UPDATE tasks SET status='agent_failed',agent_error=? WHERE id=?",
@@ -307,6 +400,7 @@ class CollectionWorker:
                     )
 
     def fail_job(self, job: dict, error: str) -> None:
+        log_event(logger, "ERROR", "worker.job.failed", job_id=job["id"], parent_task_id=job.get("parent_task_id", ""), error=error)
         with self.connect() as conn:
             conn.execute(
                 "UPDATE source_collection_jobs SET status='failed',error=?,completed_at=? WHERE id=?",
@@ -319,6 +413,7 @@ class CollectionWorker:
                 )
 
     def generate_report(self, job: dict) -> None:
+        log_event(logger, "INFO", "worker.report.started", job_id=job["id"], action=job["action"], report_title=job["report_title"])
         try:
             report, anchor = self.report_after_collection(job)
             completed_at = current_time()
@@ -336,7 +431,17 @@ class CollectionWorker:
                     """,
                     (status, report, anchor, completed_at, job["id"]),
                 )
+            log_event(
+                logger,
+                "INFO",
+                "worker.report.completed",
+                job_id=job["id"],
+                status=status,
+                report_anchor=anchor,
+                report_chars=len(report),
+            )
         except Exception as exc:
+            log_exception(logger, "worker.report.failed", exc, job_id=job["id"], report_title=job["report_title"])
             with self.connect() as conn:
                 conn.execute(
                     "UPDATE source_collection_jobs SET status='report_failed',error=?,completed_at=? WHERE id=?",

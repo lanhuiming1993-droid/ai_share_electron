@@ -5,6 +5,7 @@ frontend/dist/
 data/*.db
 data/*.key
 data/browser-profile/
+data/logs/
 __pycache__/
 *.pyc
 *.har

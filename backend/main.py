@@ -18,11 +18,22 @@ from uuid import uuid4
 
 import requests
 from cryptography.fernet import Fernet
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from backend.agent_runtime import AgentDecision, build_agent_step_prompt
+from backend.logging_config import (
+    diagnostics_config,
+    export_log_bundle,
+    get_logger,
+    log_event,
+    log_exception,
+    recent_logs,
+    reset_request_id,
+    set_request_id,
+)
 from backend.model_gateway import GatewayResult, ModelGateway, ProviderRuntimeConfig
 from backend.worker import CollectionWorker
 
@@ -52,6 +63,8 @@ CANONICAL_CHANNEL_NAMES = {
     "146aa28e21": "TG 小作文频道",
 }
 DATA_DIR.mkdir(exist_ok=True)
+logger = get_logger("api")
+frontend_logger = get_logger("frontend")
 
 app = FastAPI(title="A股成长猎手本地服务", version="0.1.0")
 app.add_middleware(
@@ -59,7 +72,51 @@ app.add_middleware(
     allow_origins=["http://127.0.0.1:5173", "http://localhost:5173", "null"],
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["X-Request-ID"],
 )
+
+
+@app.middleware("http")
+async def request_logging(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or uuid4().hex[:12]
+    token = set_request_id(request_id)
+    started_at = time.perf_counter()
+    quiet_poll = request.method == "GET" and request.url.path in {"/health", "/api/dashboard", "/api/audit", "/api/diagnostics/logs"}
+    if not quiet_poll:
+        log_event(
+            logger,
+            "INFO",
+            "http.request.started",
+            method=request.method,
+            path=request.url.path,
+            query=request.url.query,
+        )
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        log_exception(
+            logger,
+            "http.request.failed",
+            exc,
+            method=request.method,
+            path=request.url.path,
+            latency_ms=int((time.perf_counter() - started_at) * 1000),
+        )
+        reset_request_id(token)
+        raise
+    response.headers["X-Request-ID"] = request_id
+    if not quiet_poll or response.status_code >= 400:
+        log_event(
+            logger,
+            "WARNING" if response.status_code >= 400 else "INFO",
+            "http.request.completed",
+            method=request.method,
+            path=request.url.path,
+            status_code=response.status_code,
+            latency_ms=int((time.perf_counter() - started_at) * 1000),
+        )
+    reset_request_id(token)
+    return response
 
 
 class ProviderInput(BaseModel):
@@ -148,6 +205,18 @@ class MarketDataConfigInput(BaseModel):
     tushare_token: str = Field(default="", repr=False)
     clear_tushare_token: bool = False
     component_timeout_seconds: int = Field(default=35, ge=5, le=120)
+
+
+class FrontendLogInput(BaseModel):
+    timestamp: str = ""
+    level: Literal["debug", "info", "warning", "error"] = "info"
+    event: str = Field(min_length=1, max_length=120)
+    message: str = Field(default="", max_length=2_000)
+    context: dict[str, Any] = Field(default_factory=dict)
+
+
+class FrontendLogBatchInput(BaseModel):
+    entries: list[FrontendLogInput] = Field(min_length=1, max_length=100)
 
 
 def now() -> str:
@@ -642,6 +711,7 @@ def init_db() -> None:
 
 
 init_db()
+log_event(logger, "INFO", "application.initialized", database=str(DB_PATH), version=app.version)
 
 TOOLS = [
     {"id": "akshare", "name": "AkShare 市场数据", "kind": "python", "priority": 1, "status": "ready", "detail": "行情、财务、股东与公告基础数据"},
@@ -867,6 +937,19 @@ def record_model_call(provider_id: str, purpose: str, status: str, latency_ms: i
                 now(),
             ),
         )
+    log_event(
+        logger,
+        "ERROR" if status == "failed" else "INFO",
+        "model.call.recorded",
+        provider_id=provider_id,
+        purpose=purpose,
+        status=status,
+        latency_ms=latency_ms,
+        input_tokens=result.input_tokens if result else 0,
+        output_tokens=result.output_tokens if result else 0,
+        request_count=result.requests if result else 0,
+        error=error,
+    )
 
 
 def call_provider(prompt: str, provider_id: str = "", system_prompt: str = "", purpose: str = "text") -> str:
@@ -877,6 +960,7 @@ def call_provider(prompt: str, provider_id: str = "", system_prompt: str = "", p
     if not provider["enabled"]:
         raise HTTPException(409, "模型通道已停用")
     config = provider_runtime_config(provider)
+    log_event(logger, "INFO", "model.call.started", provider_id=provider["id"], purpose=purpose, model=provider["model"], protocol=provider["protocol"], prompt_chars=len(prompt))
     started_at = time.perf_counter()
     try:
         result = model_gateway.run_text(config, prompt, instructions=system_prompt or analysis_system_prompt())
@@ -898,6 +982,17 @@ def call_provider_structured(prompt: str, output_type: type[BaseModel], provider
     if not provider["enabled"]:
         raise HTTPException(409, "模型通道已停用")
     config = provider_runtime_config(provider)
+    log_event(
+        logger,
+        "INFO",
+        "model.call.started",
+        provider_id=provider["id"],
+        purpose=purpose,
+        model=provider["model"],
+        protocol=provider["protocol"],
+        prompt_chars=len(prompt),
+        output_type=output_type.__name__,
+    )
     started_at = time.perf_counter()
     try:
         result = model_gateway.run_structured(
@@ -1149,6 +1244,7 @@ def ai_normalized_items(snapshot: sqlite3.Row, channel: sqlite3.Row, mode: str) 
 
 
 def normalize_snapshot_record(snapshot_id: str, force: bool = False) -> dict:
+    log_event(logger, "INFO", "normalization.started", snapshot_id=snapshot_id, force=force)
     with db() as conn:
         snapshot = conn.execute(
             """
@@ -1243,18 +1339,53 @@ def normalize_snapshot_record(snapshot_id: str, force: bool = False) -> dict:
             """,
             (status, created_at, normalization_error, stored_count, snapshot_id),
         )
-    return {
+    result = {
         "snapshot_id": snapshot_id,
         "status": status,
         "parsed_item_count": len(items),
         "stored_item_count": stored_count,
         "average_quality": average_quality,
     }
+    log_event(logger, "WARNING" if status in {"failed", "low_quality"} else "INFO", "normalization.completed", **result)
+    return result
 
 
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "service": "alphadesk-local-api", "version": app.version, "time": now()}
+
+
+@app.post("/api/diagnostics/frontend-logs", status_code=202)
+def receive_frontend_logs(payload: FrontendLogBatchInput) -> dict:
+    for entry in payload.entries:
+        log_event(
+            frontend_logger,
+            entry.level,
+            entry.event,
+            client_timestamp=entry.timestamp,
+            message=entry.message,
+            **entry.context,
+        )
+    return {"status": "accepted", "count": len(payload.entries)}
+
+
+@app.get("/api/diagnostics/logs")
+def diagnostics_logs(limit: int = 200, level: str = "", component: str = "", search: str = "") -> dict:
+    return {
+        "logs": recent_logs(limit=limit, level=level, component=component, search=search),
+        "config": diagnostics_config(),
+    }
+
+
+@app.get("/api/diagnostics/logs/export")
+def export_diagnostics_logs():
+    filename = f"alphadesk-diagnostics-{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S')}.zip"
+    log_event(logger, "INFO", "diagnostics.logs.exported", filename=filename)
+    return StreamingResponse(
+        export_log_bundle(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 def channel_names_for_ids(channel_ids: list[str], names: dict[str, str] | None = None) -> list[str]:
@@ -1421,7 +1552,9 @@ def clear_audit_inventory(scope: Literal["snapshots", "reports", "all"]) -> dict
                 """
             )
         after = inventory_summary(conn)
-    return {"scope": scope, "deleted": {key: before[key] - after[key] for key in before}, "inventory": after}
+    result = {"scope": scope, "deleted": {key: before[key] - after[key] for key in before}, "inventory": after}
+    log_event(logger, "WARNING", "audit.inventory.cleared", **result)
+    return result
 
 
 @app.delete("/api/task-lists/{scope}")
@@ -1456,11 +1589,13 @@ def clear_task_list(scope: Literal["research", "source-jobs", "all"]) -> dict:
             conn.execute("DELETE FROM source_collection_runs")
             cursor = conn.execute("DELETE FROM source_collection_jobs")
             deleted_source_jobs += cursor.rowcount
-    return {
+    result = {
         "scope": scope,
         "deleted_research_tasks": deleted_research_tasks,
         "deleted_source_jobs": deleted_source_jobs,
     }
+    log_event(logger, "WARNING", "audit.task_list.cleared", **result)
+    return result
 
 
 def market_data_component_status() -> dict:
@@ -1567,8 +1702,11 @@ def import_mx_har(channel_id: str, payload: MxHarImportInput) -> dict:
     try:
         from backend.import_mx_har import import_har_text
 
-        return import_har_text(payload.har_text)
+        result = import_har_text(payload.har_text)
+        log_event(logger, "INFO", "channel.mx_har.imported", channel_id=channel_id, validated_snapshot_count=result.get("validated_snapshot_count", 0))
+        return result
     except RuntimeError as exc:
+        log_exception(logger, "channel.mx_har.failed", exc, channel_id=channel_id)
         raise HTTPException(409, str(exc)[:600]) from exc
 
 
@@ -1645,6 +1783,7 @@ def launch_channel_login(channel_id: str) -> dict:
 
 @app.post("/api/channels/{channel_id}/check")
 def check_channel(channel_id: str) -> dict:
+    log_event(logger, "INFO", "channel.check.started", channel_id=channel_id)
     with db() as conn:
         channel = conn.execute("SELECT * FROM channels WHERE id=?", (channel_id,)).fetchone()
     if channel_id == "akshare" and channel:
@@ -1654,6 +1793,7 @@ def check_channel(channel_id: str) -> dict:
                 "UPDATE channels SET status=?,last_check=?,updated_at=? WHERE id=?",
                 (result["status"], result["checked_at"], result["checked_at"], channel_id),
             )
+        log_event(logger, "INFO" if result["status"] == "online" else "WARNING", "channel.check.completed", channel_id=channel_id, status=result["status"], message=result["message"])
         return result
     if channel_id == "industry-news" and channel:
         from backend.industry_news_sources import check_public_industry_news
@@ -1664,15 +1804,20 @@ def check_channel(channel_id: str) -> dict:
                 "UPDATE channels SET status=?,last_check=?,updated_at=? WHERE id=?",
                 (result["status"], result["checked_at"], result["checked_at"], channel_id),
             )
+        log_event(logger, "INFO" if result["status"] == "online" else "WARNING", "channel.check.completed", channel_id=channel_id, status=result["status"], message=result["message"])
         return result
     if channel:
         request_config = channel_request_config(channel_id)
         if request_config.get("adapter") == "mx_authorized_request_replay":
-            return check_mx_channel(channel_id, request_config)
+            result = check_mx_channel(channel_id, request_config)
+            log_event(logger, "INFO" if result["status"] == "online" else "WARNING", "channel.check.completed", channel_id=channel_id, status=result["status"], message=result["message"])
+            return result
     if not channel:
         raise HTTPException(404, "渠道不存在")
     if channel["collection_mode"] != "playwright":
-        return {"status": channel["status"], "message": "该渠道无需浏览器登录检查"}
+        result = {"status": channel["status"], "message": "该渠道无需浏览器登录检查"}
+        log_event(logger, "INFO", "channel.check.completed", channel_id=channel_id, **result)
+        return result
     validation_url = channel["validation_url"] or channel["url"]
     if not validation_url:
         raise HTTPException(409, "请先填写检查 URL 或渠道入口 URL")
@@ -1703,7 +1848,9 @@ def check_channel(channel_id: str) -> dict:
     checked_at = now()
     with db() as conn:
         conn.execute("UPDATE channels SET status=?,last_check=?,updated_at=? WHERE id=?", (status, checked_at, checked_at, channel_id))
-    return {"status": status, "message": detail["message"], "checked_at": checked_at, "final_url": detail["final_url"]}
+    result = {"status": status, "message": detail["message"], "checked_at": checked_at, "final_url": detail["final_url"]}
+    log_event(logger, "INFO" if status == "online" else "WARNING", "channel.check.completed", channel_id=channel_id, **result)
+    return result
 
 
 def refresh_browser_channel_states() -> None:
@@ -1718,7 +1865,8 @@ def refresh_browser_channel_states() -> None:
         if channel["id"] in ("web-rumors", "akshare", "industry-news") or browser_profile(channel["id"]).exists():
             try:
                 check_channel(channel["id"])
-            except HTTPException:
+            except HTTPException as exc:
+                log_exception(logger, "channel.startup_check.failed", exc, channel_id=channel["id"], detail=exc.detail)
                 checked_at = now()
                 with db() as conn:
                     conn.execute("UPDATE channels SET status='offline',last_check=?,updated_at=? WHERE id=?", (checked_at, checked_at, channel["id"]))
@@ -1732,6 +1880,7 @@ def check_all_channels() -> dict:
 
 @app.on_event("startup")
 def schedule_startup_channel_check() -> None:
+    log_event(logger, "INFO", "application.startup.channel_check_scheduled")
     threading.Thread(target=refresh_browser_channel_states, daemon=True).start()
 
 
@@ -1930,11 +2079,13 @@ collection_worker = CollectionWorker(
 
 @app.on_event("startup")
 def start_collection_worker() -> None:
+    log_event(logger, "INFO", "application.startup.worker")
     collection_worker.start()
 
 
 @app.on_event("shutdown")
 def stop_collection_worker() -> None:
+    log_event(logger, "INFO", "application.shutdown.worker")
     collection_worker.stop()
 
 
@@ -2023,8 +2174,28 @@ def create_source_job(payload: SourceJobInput) -> dict:
                 ),
             ).fetchone()
             if existing:
+                log_event(
+                    logger,
+                    "INFO",
+                    "source_job.deduplicated",
+                    job_id=existing["id"],
+                    action=payload.action,
+                    channel_ids=channel_ids,
+                    lookback_days=payload.lookback_days,
+                    status=existing["status"],
+                )
                 return source_job_response(dict(existing), deduplicated=True)
             insert_source_job(conn, job)
+        log_event(
+            logger,
+            "INFO",
+            "source_job.created",
+            job_id=job["id"],
+            action=job["action"],
+            channel_ids=channel_ids,
+            lookback_days=job["lookback_days"],
+            status=job["status"],
+        )
         return source_job_response(job)
     else:
         current = datetime.now(timezone.utc).astimezone().replace(microsecond=0)
@@ -2050,6 +2221,19 @@ def create_source_job(payload: SourceJobInput) -> dict:
         }
     with db() as conn:
         insert_source_job(conn, job)
+    log_event(
+        logger,
+        "INFO",
+        "source_job.created",
+        job_id=job["id"],
+        action=job["action"],
+        channel_ids=payload.channel_ids,
+        lookback_days=job["lookback_days"],
+        status=job["status"],
+        window_count=len(windows),
+        parent_task_id=job["parent_task_id"],
+        evidence_layer=job["evidence_layer"],
+    )
     return source_job_response(job)
 
 
@@ -2370,6 +2554,18 @@ def save_provider_record(provider_id: str, payload: ProviderInput, current: dict
                 """,
                 {**value, "is_default": int(count == 0), "created_at": now()},
             )
+    log_event(
+        logger,
+        "INFO",
+        "provider.saved",
+        provider_id=provider_id,
+        name=value["name"],
+        base_url=value["base_url"],
+        model=value["model"],
+        protocol=value["protocol"],
+        enabled=bool(value["enabled"]),
+        operation="updated" if current else "created",
+    )
     return provider_public(provider_row(provider_id)) or {}
 
 
@@ -2422,12 +2618,14 @@ def activate_provider(provider_id: str) -> dict:
 
 @app.post("/api/providers/{provider_id}/test")
 def test_provider(provider_id: str) -> dict:
+    log_event(logger, "INFO", "provider.health_check.started", provider_id=provider_id)
     started = time.perf_counter()
     try:
         answer = call_provider("只回复：模型通道可用", provider_id, purpose="provider_health_check")
-    except HTTPException:
+    except HTTPException as exc:
         with db() as conn:
             conn.execute("UPDATE model_providers SET status='failed',last_test_at=?,updated_at=? WHERE id=?", (now(), now(), provider_id))
+        log_exception(logger, "provider.health_check.failed", exc, provider_id=provider_id, detail=exc.detail)
         raise
     latency_ms = round((time.perf_counter() - started) * 1000)
     with db() as conn:
@@ -2435,6 +2633,7 @@ def test_provider(provider_id: str) -> dict:
             "UPDATE model_providers SET status='online',latency_ms=?,last_test_at=?,updated_at=? WHERE id=?",
             (latency_ms, now(), now(), provider_id),
         )
+    log_event(logger, "INFO", "provider.health_check.completed", provider_id=provider_id, latency_ms=latency_ms)
     return {"status": "online", "message": answer, "latency_ms": latency_ms}
 
 
@@ -2474,6 +2673,7 @@ def create_task(payload: TaskInput) -> dict:
             """,
             task,
         )
+    log_event(logger, "INFO", "research_task.created", task_id=task["id"], target=task["target"], skill_name=task["skill_name"], lookback_days=task["lookback_days"])
     return task
 
 
@@ -2487,6 +2687,7 @@ def record_agent_event(task_id: str, event_type: str, detail: dict | str) -> Non
             "INSERT INTO agent_events(id,task_id,event_type,detail,created_at) VALUES(?,?,?,?,?)",
             (uuid4().hex[:12], task_id, event_type, text[:6000], now()),
         )
+    log_event(logger, "INFO", f"agent.{event_type}", task_id=task_id, detail=detail)
 
 
 def save_agent_state(task_id: str, state: dict, status: str | None = None, error: str = "") -> None:
@@ -2611,6 +2812,7 @@ def completed_evidence_layers(task_id: str, state: dict) -> set[str]:
 
 
 def advance_analysis_task(task_id: str) -> dict:
+    log_event(logger, "INFO", "agent.advance.started", task_id=task_id)
     with db() as conn:
         task_row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
     if not task_row:
@@ -2652,6 +2854,7 @@ def advance_analysis_task(task_id: str) -> dict:
                     (report, anchor, json.dumps(state, ensure_ascii=False), task_id),
                 )
             record_agent_event(task_id, "report_ready", {"anchor": anchor})
+            log_event(logger, "INFO", "agent.advance.completed", task_id=task_id, status="review", report_chars=len(report), anchor=anchor)
             return {"id": task_id, "status": "review", "report": report, "report_anchor": anchor}
         requested_layer = decision["next_source"]
         if next_layer == "final_report":
@@ -2700,6 +2903,7 @@ def analyze_stock_task(task_id: str) -> dict:
         with db() as conn:
             conn.execute("UPDATE tasks SET status='agent_failed',agent_error=? WHERE id=?", (str(detail)[:1200], task_id))
         record_agent_event(task_id, "agent_failed", str(detail))
+        log_exception(logger, "agent.advance.failed", exc, task_id=task_id, detail=detail)
         raise
 
 
