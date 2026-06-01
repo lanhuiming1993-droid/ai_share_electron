@@ -66,7 +66,7 @@ class ProviderInput(BaseModel):
     base_url: str = "https://api.deepseek.com"
     model: str = "deepseek-chat"
     api_key: str = Field(default="", repr=False)
-    protocol: Literal["openai_chat_completions"] = "openai_chat_completions"
+    protocol: Literal["openai_chat_completions", "openai_responses"] = "openai_chat_completions"
     enabled: bool = True
     extra_body: dict = Field(default_factory=dict)
 
@@ -739,8 +739,12 @@ def research_red_lines() -> dict:
             "source_reports_use_general_snapshots_only",
             "source_reports_forbid_research_task_context",
             "source_reports_forbid_stock_skill_injection",
+            "source_reports_selected_channels_only",
             "research_tasks_may_read_general_snapshots",
+            "research_tasks_may_read_all_source_snapshots",
+            "research_tasks_may_read_source_reports",
             "research_tasks_may_collect_scoped_evidence",
+            "research_tasks_refresh_stale_general_sources",
         )
     ):
         raise RuntimeError("Invalid red-line policy: source reports and stock research workflows must remain isolated")
@@ -787,11 +791,30 @@ def source_report_system_prompt() -> str:
 
 def provider_endpoint(provider: dict) -> str:
     base_url = provider["base_url"].rstrip("/")
-    if base_url.endswith("/chat/completions"):
+    resource = "responses" if provider["protocol"] == "openai_responses" else "chat/completions"
+    if base_url.endswith(f"/{resource}"):
         return base_url
     if base_url.endswith("/v1"):
-        return base_url + "/chat/completions"
-    return base_url + "/v1/chat/completions"
+        return base_url + f"/{resource}"
+    return base_url + f"/v1/{resource}"
+
+
+def provider_response_text(provider: dict, response_body: dict) -> str:
+    if provider["protocol"] == "openai_chat_completions":
+        return str(response_body["choices"][0]["message"]["content"])
+    output_text = response_body.get("output_text")
+    if isinstance(output_text, str) and output_text:
+        return output_text
+    chunks = []
+    for item in response_body.get("output", []):
+        if not isinstance(item, dict):
+            continue
+        for content in item.get("content", []):
+            if isinstance(content, dict) and content.get("type") in {"output_text", "text"} and content.get("text"):
+                chunks.append(str(content["text"]))
+    if not chunks:
+        raise ValueError("Responses API returned no output text")
+    return "".join(chunks)
 
 
 def normalization_system_prompt() -> str:
@@ -816,21 +839,31 @@ def call_provider(prompt: str, provider_id: str = "", system_prompt: str = "") -
         raise HTTPException(409, "模型通道已停用")
     api_key = cipher().decrypt(provider["encrypted_api_key"].encode()).decode()
     url = provider_endpoint(provider)
-    payload = {
-        "model": provider["model"],
-        "messages": [
-            {"role": "system", "content": system_prompt or analysis_system_prompt()},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.2,
-    }
+    if provider["protocol"] == "openai_responses":
+        payload = {
+            "model": provider["model"],
+            "instructions": system_prompt or analysis_system_prompt(),
+            "input": prompt,
+            "store": False,
+        }
+    else:
+        payload = {
+            "model": provider["model"],
+            "messages": [
+                {"role": "system", "content": system_prompt or analysis_system_prompt()},
+                {"role": "user", "content": prompt},
+            ],
+            "temperature": 0.2,
+        }
     payload.update(provider.get("extra_body") or {})
     try:
         response = requests.post(url, headers={"Authorization": f"Bearer {api_key}"}, json=payload, timeout=90)
         response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
+        return provider_response_text(provider, response.json())
     except requests.RequestException as exc:
         raise HTTPException(502, f"模型供应商请求失败: {exc}") from exc
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(502, f"模型供应商返回格式异常: {exc}") from exc
 
 
 def parse_json_object(raw: str) -> dict:
@@ -1703,6 +1736,7 @@ def local_snapshot_context(
     *,
     general_snapshots_only: bool = False,
     research_scope_key: str = "",
+    include_source_reports: bool = False,
 ) -> tuple[str, str, str]:
     placeholders = ",".join("?" for _ in channel_ids)
     scoped_key = canonical_scope_key(research_scope_key)
@@ -1753,6 +1787,18 @@ def local_snapshot_context(
                 [*channel_ids, window_start, anchor, *scope_params],
             )
         ]
+        source_reports = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT report_title,report_anchor,report
+                FROM source_collection_jobs
+                WHERE report IS NOT NULL AND parent_task_id='' AND query='' AND evidence_layer=''
+                ORDER BY report_anchor DESC,created_at DESC
+                LIMIT 12
+                """
+            )
+        ] if include_source_reports else []
     if not normalized_items and not snapshots:
         raise HTTPException(409, "本地快照存在，但所选时间窗口内没有可用于报告的内容。")
     normalized_chunks = [
@@ -1773,15 +1819,19 @@ def local_snapshot_context(
         f"[raw:{item['channel_id']}] {item['occurred_at']} {item['source_url']}\n{item['content'][:12_000]}"
         for item in raw_fallbacks
     ]
+    report_chunks = [
+        f"[source-report] {item['report_anchor']} {item['report_title']}\n{item['report'][:20_000]}"
+        for item in source_reports
+    ]
     if normalized_chunks:
         chunks = [
             (
                 f"{chunk}"
             )
-            for chunk in [*normalized_chunks, *raw_chunks]
+            for chunk in [*normalized_chunks, *raw_chunks, *report_chunks]
         ]
     else:
-        chunks = raw_chunks
+        chunks = [*raw_chunks, *report_chunks]
     selected: list[str] = []
     length = 0
     for chunk in chunks:
@@ -1990,7 +2040,8 @@ def complete_source_job(job_id: str, payload: CompleteSourceJobInput) -> dict:
             if not datetime.fromisoformat(window["window_start"]) <= item.occurred_at.astimezone() <= datetime.fromisoformat(window["window_end"]):
                 raise HTTPException(409, f"快照时间戳不属于当前采集窗口: {item.channel_id}")
         collected_at = now()
-        scope_type = "research" if job["parent_task_id"] or job["query"] or job["evidence_layer"] else "general"
+        general_refresh = job["evidence_layer"] == "local_source_snapshots" and not canonical_scope_key(job["query"])
+        scope_type = "general" if general_refresh or not (job["parent_task_id"] or job["query"] or job["evidence_layer"]) else "research"
         scope_key = canonical_scope_key(job["query"]) if scope_type == "research" else ""
         inserted = 0
         inserted_snapshot_ids: list[str] = []
@@ -2441,13 +2492,70 @@ def channel_ids_for_layer(layer: str) -> list[str]:
         ]
 
 
+def research_refresh_channel_ids() -> list[str]:
+    with db() as conn:
+        return [
+            row["id"]
+            for row in conn.execute(
+                """
+                SELECT id FROM channels
+                WHERE status='online' AND collection_mode<>'manual'
+                ORDER BY builtin DESC,updated_at
+                """
+            )
+        ]
+
+
+def stale_general_channel_ids(channel_ids: list[str]) -> list[str]:
+    current = datetime.now(timezone.utc).astimezone()
+    with db() as conn:
+        return [
+            channel_id
+            for channel_id in channel_ids
+            if not (reserved := latest_reserved_at(conn, channel_id, ""))
+            or current - reserved >= MIN_COLLECTION_INTERVAL
+        ]
+
+
+def refresh_general_sources_before_research(task: dict, state: dict) -> dict | None:
+    channel_ids = research_refresh_channel_ids()
+    stale_channel_ids = stale_general_channel_ids(channel_ids)
+    if not stale_channel_ids:
+        return None
+    job = create_source_job(
+        SourceJobInput(
+            action="collect",
+            channel_ids=channel_ids,
+            lookback_days=task["lookback_days"],
+            report_title=f"{task['target']} · 个股分析前置全量信源刷新",
+            skill_name=task["skill_name"],
+            parent_task_id=task["id"],
+            evidence_layer="local_source_snapshots",
+        )
+    )
+    record_agent_event(
+        task["id"],
+        "general_source_refresh_created",
+        {"job_id": job["id"], "channel_ids": channel_ids, "stale_channel_ids": stale_channel_ids, "status": job["status"]},
+    )
+    if job["status"] == "deduplicated":
+        return None
+    save_agent_state(task["id"], state, "evidence_queued")
+    return {"id": task["id"], "status": "evidence_queued", "job_id": job["id"], "evidence_layer": "local_source_snapshots"}
+
+
 def task_snapshot_context(lookback_days: int, scope_key: str) -> tuple[str, str, str]:
     with db() as conn:
-        channel_ids = [row["id"] for row in conn.execute("SELECT id FROM channels WHERE status='online'")]
+        channel_ids = [row["id"] for row in conn.execute("SELECT id FROM channels ORDER BY builtin DESC,updated_at")]
     if not channel_ids:
-        return "无在线信源", "无本地快照", "当前没有在线信源，也没有可传递给模型的本地快照。"
+        return "无已配置信源", "无本地快照", "当前没有已配置信源，也没有可传递给模型的本地快照。"
     try:
-        return local_snapshot_context(channel_ids, lookback_days, research_scope_key=scope_key)
+        return local_snapshot_context(
+            channel_ids,
+            lookback_days,
+            research_scope_key=scope_key,
+            include_source_reports=True,
+        )
     except HTTPException:
         return "无本地快照", "无本地快照", "当前没有可用的本地信源快照。不能形成事实判断，只能请求下一层证据。"
 
@@ -2477,6 +2585,9 @@ def advance_analysis_task(task_id: str) -> dict:
     state = json.loads(task.get("agent_state") or "{}")
     state.setdefault("completed_layers", [])
     state.setdefault("steps", 0)
+    refresh_job = refresh_general_sources_before_research(task, state)
+    if refresh_job:
+        return refresh_job
     for _ in range(8):
         completed = completed_evidence_layers(task_id, state)
         state["completed_layers"] = [layer for layer in EVIDENCE_LAYERS if layer in completed]

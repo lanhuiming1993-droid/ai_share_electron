@@ -39,7 +39,7 @@ def build_analysis_prompt(*, target: str, objective: str, skill_name: str, windo
 本地已聚合证据：
 {evidence}
 
-严格遵守系统提示中的证据升级顺序。先检索并使用全量本地快照。
+严格遵守系统提示中的证据升级顺序。先检索并使用全量本地快照和已有通用信源报告。
 如果当前证据不足，不得直接使用模型知识库给出事实结论；请输出明确的 `EVIDENCE_REQUESTS` 清单，
 按 akshare、http_requests、playwright 顺序列出仍需补充的证据。
 最终报告必须是完整 HTML 文档，严禁使用 Markdown。"""
@@ -88,7 +88,7 @@ def build_agent_step_prompt(
 指定 Skill 全文：
 {skill}
 
-当前本地聚合证据：
+当前本地聚合证据（包含分析前已按节流规则刷新的全量通用信源快照、当前标的补采快照和已有通用信源报告）：
 {evidence}
 
 {decision_contract}

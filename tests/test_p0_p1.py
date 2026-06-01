@@ -7,7 +7,7 @@ import unittest
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from backend.collectors import collect_http
 from backend.industry_news_sources import collect_public_industry_news
@@ -155,6 +155,21 @@ class WorkerBehaviorTests(unittest.TestCase):
             scopes = conn.execute("SELECT scope_type,scope_key FROM source_snapshots ORDER BY scope_type").fetchall()
         self.assertEqual(scopes, [("general", ""), ("research", "300782")])
 
+    def test_research_preflight_refresh_persists_general_snapshots(self) -> None:
+        self.insert_channels("good")
+        window = {"channel_id": "good", "window_start": timestamp(-30), "window_end": timestamp()}
+        job = self.insert_job("refresh", [window])
+        job.update({"parent_task_id": "task", "evidence_layer": "local_source_snapshots"})
+        with database(self.db_path) as conn:
+            conn.execute("UPDATE source_collection_jobs SET parent_task_id=?,evidence_layer=? WHERE id=?", ("task", "local_source_snapshots", "refresh"))
+            conn.execute("INSERT INTO tasks(id,status) VALUES('task','evidence_queued')")
+        item = {"channel_id": "good", "occurred_at": timestamp(-1), "source_url": "good://refresh", "content": "{}"}
+        with patch("backend.worker.collect_channel", return_value=[item]):
+            self.worker.execute(job)
+        with database(self.db_path) as conn:
+            scope = conn.execute("SELECT scope_type,scope_key FROM source_snapshots").fetchone()
+        self.assertEqual(scope, ("general", ""))
+
 
 class MainBehaviorTests(unittest.TestCase):
     @classmethod
@@ -240,6 +255,108 @@ class MainBehaviorTests(unittest.TestCase):
         self.assertGreaterEqual(mx_items[0]["quality_score"], 80)
         self.assertEqual(tg_items[0]["content"], "world")
         self.assertGreaterEqual(tg_items[0]["quality_score"], 80)
+
+    def test_responses_provider_uses_responses_endpoint_and_extracts_output_text(self) -> None:
+        provider = {
+            "base_url": "https://api.openai.com/v1",
+            "model": "gpt-test",
+            "protocol": "openai_responses",
+            "encrypted_api_key": "encrypted",
+            "enabled": True,
+            "extra_body": {},
+        }
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"output": [{"content": [{"type": "output_text", "text": "ok"}]}]}
+        cipher = Mock()
+        cipher.decrypt.return_value = b"secret"
+        with patch.object(self.main, "provider_row", return_value=provider), patch.object(self.main, "cipher", return_value=cipher), patch.object(self.main.requests, "post", return_value=response) as post:
+            result = self.main.call_provider("hello", system_prompt="rules")
+        self.assertEqual(result, "ok")
+        self.assertEqual(post.call_args.args[0], "https://api.openai.com/v1/responses")
+        self.assertEqual(post.call_args.kwargs["json"], {"model": "gpt-test", "instructions": "rules", "input": "hello", "store": False})
+
+    def test_stock_context_can_include_general_source_reports(self) -> None:
+        now = timestamp()
+        with self.main.db() as conn:
+            conn.execute(
+                "INSERT INTO channels(id,name,type,url,collection_mode,status,updated_at) VALUES('context-test','context','test','','requests','offline',?)",
+                (now,),
+            )
+            conn.execute(
+                """
+                INSERT INTO source_snapshots(id,channel_id,occurred_at,collected_at,source_url,content,scope_type,scope_key)
+                VALUES('context-snapshot','context-test',?,?,?,?, 'general','')
+                """,
+                (now, now, "context://snapshot", "RAW_CONTEXT"),
+            )
+            conn.execute(
+                """
+                INSERT INTO source_collection_jobs(
+                  id,action,channel_ids,windows,lookback_days,skill_name,report_title,status,created_at,report,report_anchor
+                ) VALUES('context-report','report','["context-test"]','[]',30,'skill','行业聚合','review',?,?,?)
+                """,
+                (now, "<html><body>SOURCE_REPORT_CONTEXT</body></html>", now),
+            )
+        _, _, context = self.main.local_snapshot_context(["context-test"], 30, include_source_reports=True)
+        self.assertIn("RAW_CONTEXT", context)
+        self.assertIn("SOURCE_REPORT_CONTEXT", context)
+
+    def test_stock_research_refreshes_all_online_sources_before_analysis(self) -> None:
+        now = timestamp()
+        with self.main.db() as conn:
+            conn.execute("UPDATE channels SET status='offline'")
+            conn.executemany(
+                "INSERT INTO channels(id,name,type,url,collection_mode,status,updated_at) VALUES(?,?,?,?,?,?,?)",
+                [
+                    ("online-a", "a", "test", "", "requests", "online", now),
+                    ("online-b", "b", "test", "", "playwright", "online", now),
+                    ("offline-c", "c", "test", "", "requests", "offline", now),
+                ],
+            )
+        task = {"id": "task-refresh", "target": "300782", "title": "研究", "skill_name": "a-share-growth-hunter", "lookback_days": 30}
+        result = self.main.refresh_general_sources_before_research(task, {"completed_layers": [], "steps": 0})
+        self.assertEqual(result["evidence_layer"], "local_source_snapshots")
+        with self.main.db() as conn:
+            job = conn.execute("SELECT channel_ids,windows,parent_task_id,query,evidence_layer FROM source_collection_jobs WHERE id=?", (result["job_id"],)).fetchone()
+        self.assertEqual(set(json.loads(job["channel_ids"])), {"online-a", "online-b"})
+        self.assertEqual({window["channel_id"] for window in json.loads(job["windows"])}, {"online-a", "online-b"})
+        self.assertEqual(job["parent_task_id"], "task-refresh")
+        self.assertEqual(job["query"], "")
+        self.assertEqual(job["evidence_layer"], "local_source_snapshots")
+        self.assertIsNone(self.main.refresh_general_sources_before_research(task, {"completed_layers": [], "steps": 0}))
+
+    def test_general_source_report_reads_only_selected_channels(self) -> None:
+        now = timestamp()
+        with self.main.db() as conn:
+            conn.executemany(
+                "INSERT INTO channels(id,name,type,url,collection_mode,status,updated_at) VALUES(?,?,?,?,?,?,?)",
+                [
+                    ("selected", "selected", "test", "", "requests", "online", now),
+                    ("excluded", "excluded", "test", "", "requests", "online", now),
+                ],
+            )
+            conn.executemany(
+                """
+                INSERT INTO source_snapshots(id,channel_id,occurred_at,collected_at,source_url,content,scope_type,scope_key)
+                VALUES(?,?,?,?,?,?,'general','')
+                """,
+                [
+                    ("selected-snapshot", "selected", now, now, "selected://item", "SELECTED_CONTENT"),
+                    ("excluded-snapshot", "excluded", now, now, "excluded://item", "EXCLUDED_CONTENT"),
+                ],
+            )
+
+        def capture_prompt(prompt, system_prompt=""):
+            self.assertIn("SELECTED_CONTENT", prompt)
+            self.assertNotIn("EXCLUDED_CONTENT", prompt)
+            return "<html><head></head><body>ok</body></html>"
+
+        with patch.object(self.main, "call_provider", side_effect=capture_prompt):
+            report, _ = self.main.generate_source_report(
+                self.main.SourceJobInput(action="report", channel_ids=["selected"], report_title="selected only")
+            )
+        self.assertIn("<html>", report)
 
 
 class PaginationBehaviorTests(unittest.TestCase):

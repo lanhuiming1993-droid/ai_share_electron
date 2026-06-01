@@ -901,7 +901,7 @@ onUnmounted(() => {
                     <b :class="item.status==='online'?'status-good':item.status==='failed'?'status-warn':'text-slate-600'" class="text-xs">{{ item.status }}</b>
                     <b v-if="item.latency_ms" class="text-xs text-amber-300">{{ item.latency_ms }} ms</b>
                   </span>
-                  <small class="truncate">{{ item.base_url }} · {{ item.model }}</small>
+                  <small class="truncate">{{ item.base_url }} · {{ item.model }} · {{ item.protocol === 'openai_responses' ? 'Responses API' : 'Chat Completions' }}</small>
                 </span>
                 <div class="flex shrink-0 items-center gap-2">
                   <button v-if="!item.is_default" @click="activateProvider(item.id)" class="secondary">设为默认</button>
@@ -922,11 +922,12 @@ onUnmounted(() => {
               <div class="space-y-4 p-5">
                 <label class="block"><span class="form-label">名称</span><input v-model="provider.name" placeholder="例如 DeepSeek" class="field mt-2 w-full" /></label>
                 <label class="block"><span class="form-label">Base URL</span><input v-model="provider.base_url" placeholder="https://api.deepseek.com" class="field mt-2 w-full" /></label>
-                <label class="block"><span class="form-label">API Key（密文占位）</span><input v-model="provider.api_key" placeholder="输入新的 API Key" class="field mt-2 w-full" /></label>
+                <label class="block"><span class="form-label">API Key（密文占位）</span><input v-model="provider.api_key" type="password" autocomplete="new-password" placeholder="输入新的 API Key" class="field mt-2 w-full" /></label>
                 <label class="block"><span class="form-label">模型名称</span><input v-model="provider.model" placeholder="例如 deepseek-chat" class="field mt-2 w-full" /></label>
                 <label class="block"><span class="form-label">协议</span>
                   <select v-model="provider.protocol" class="field mt-2 w-full">
                     <option value="openai_chat_completions">OpenAI Chat Completions</option>
+                    <option value="openai_responses">OpenAI Responses API</option>
                   </select>
                 </label>
                 <label class="block"><span class="form-label">额外参数 JSON</span><textarea v-model="provider.extra_body_text" rows="4" class="field mt-2 w-full"></textarea></label>
@@ -1100,6 +1101,7 @@ onUnmounted(() => {
               <div class="setting-row px-5 py-4"><span><strong>禁止本地分析</strong><small>本地程序仅执行聚合、去重、时间窗口控制和证据传递。所有分析必须交给大模型。</small></span><b class="text-emerald-300">{{ data.research_red_lines?.analysis?.local_analysis_enabled ? '未生效' : '已强制生效' }}</b></div>
               <div class="setting-row px-5 py-4"><span><strong>采集阶段 AI 仅允许整理</strong><small>原始快照先落库。模型仅可提取、拆分、去重、标注和评分，严禁在采集阶段分析，也严禁触发新的网络访问。</small></span><b class="text-emerald-300">{{ data.research_red_lines?.collection_normalization?.analysis_forbidden && data.research_red_lines?.collection_normalization?.preserve_raw_snapshot ? '已强制生效' : '未生效' }}</b></div>
               <div class="setting-row px-5 py-4"><span><strong>信源报告与个股研究隔离</strong><small>通用信源报告仅读取 general 快照，不继承股票代码、个股研究目标、Skill 或临时补采证据。个股研究仍可读取通用快照并按证据链补采。</small></span><b class="text-emerald-300">{{ data.research_red_lines?.workflow_isolation?.source_reports_use_general_snapshots_only && data.research_red_lines?.workflow_isolation?.source_reports_forbid_research_task_context ? '已强制生效' : '未生效' }}</b></div>
+              <div class="setting-row px-5 py-4"><span><strong>个股分析前置全量刷新</strong><small>个股研究会读取全部渠道的历史快照和已有通用报告。任一在线自动信源超过 15 分钟未刷新时，会先按精确窗口补采全部在线信源，再继续模型分析。</small></span><b class="text-emerald-300">{{ data.research_red_lines?.workflow_isolation?.research_tasks_refresh_stale_general_sources ? '已强制生效' : '未生效' }}</b></div>
               <div class="setting-row px-5 py-4"><span><strong>模型知识库最后使用</strong><small>仅当外部证据链无法确认时允许使用，并强制标记为低置信推断。</small></span><b class="text-emerald-300">{{ data.research_red_lines?.analysis?.model_knowledge_last_resort ? '已强制生效' : '未生效' }}</b></div>
               <div class="setting-row px-5 py-4"><span><strong>报告必须使用 HTML</strong><small>模型必须生成完整 HTML 文档。严禁 Markdown；非 HTML 报告会被服务端拒绝保存。</small></span><b class="text-emerald-300">{{ data.research_red_lines?.report_output?.format === 'html' && !data.research_red_lines?.report_output?.markdown_allowed ? '已强制生效' : '未生效' }}</b></div>
               <div class="px-5 py-4">

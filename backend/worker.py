@@ -163,7 +163,8 @@ class CollectionWorker:
 
     def persist_channel_result(self, job: dict, window: dict, snapshots: list[dict]) -> tuple[int, int, list[str]]:
         collected_at = current_time()
-        scope_type = "research" if job.get("parent_task_id") or job.get("query") or job.get("evidence_layer") else "general"
+        general_refresh = job.get("evidence_layer") == "local_source_snapshots" and not canonical_scope_key(job.get("query", ""))
+        scope_type = "general" if general_refresh or not (job.get("parent_task_id") or job.get("query") or job.get("evidence_layer")) else "research"
         scope_key = canonical_scope_key(job.get("query", "")) if scope_type == "research" else ""
         inserted = 0
         duplicates = 0
