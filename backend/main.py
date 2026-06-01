@@ -46,6 +46,7 @@ from backend.runtime_health import (
     worker_check,
 )
 from backend.source_registry import CANONICAL_CHANNEL_NAMES, source_catalog, tool_catalog
+from backend.wechat_rss import check_werss, normalize_werss_config, public_werss_config
 from backend.worker import CollectionWorker
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -159,7 +160,7 @@ class ChannelInput(BaseModel):
     name: str
     type: str
     url: str = ""
-    collection_mode: Literal["akshare", "industry_news", "requests", "playwright", "manual"] = "playwright"
+    collection_mode: Literal["akshare", "industry_news", "wechat_rss", "requests", "playwright", "manual"] = "playwright"
     status: Literal["online", "pending", "offline"] = "pending"
     notes: str = ""
     validation_url: str = ""
@@ -223,6 +224,16 @@ class MarketDataConfigInput(BaseModel):
     tushare_token: str = Field(default="", repr=False)
     clear_tushare_token: bool = False
     component_timeout_seconds: int = Field(default=35, ge=5, le=120)
+
+
+class WechatRssConfigInput(BaseModel):
+    base_url: str = "http://127.0.0.1:8001"
+    feed_ids: list[str] = Field(default_factory=lambda: ["all"])
+    access_key: str = Field(default="", repr=False)
+    secret_key: str = Field(default="", repr=False)
+    clear_credentials: bool = False
+    timeout_seconds: int = Field(default=20, ge=3, le=120)
+    max_items_per_feed: int = Field(default=100, ge=1, le=500)
 
 
 class FrontendLogInput(BaseModel):
@@ -387,6 +398,14 @@ def market_data_config_public() -> dict:
     config["tushare_token_configured"] = token_configured
     config["tushare_token"] = MASKED_SECRET if token_configured else ""
     return config
+
+
+def wechat_rss_config() -> dict:
+    return normalize_werss_config(channel_request_config("wechat-mp-rss"))
+
+
+def wechat_rss_config_public() -> dict:
+    return public_werss_config(wechat_rss_config())
 
 
 def init_db() -> None:
@@ -687,6 +706,39 @@ def init_db() -> None:
                 "行业资讯、公司资料与公告补证",
                 "东方财富行业排名与资讯、个股资料和巨潮公告；按时间窗采集并保留证据来源",
             ),
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO channels(
+              id,name,type,url,collection_mode,status,notes,parsing_strategy,
+              normalization_quality_threshold,max_scrolls,research_enabled,builtin,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "wechat-mp-rss",
+                "微信公众号（WeRSS）",
+                "外部 RSS 聚合",
+                "http://127.0.0.1:8001",
+                "wechat_rss",
+                "pending",
+                "读取独立部署的 WeRSS RSS 服务；请先在 WeRSS 中完成公众号订阅",
+                "fixed",
+                85,
+                1,
+                1,
+                1,
+                now(),
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE channels
+            SET name='微信公众号（WeRSS）',type='外部 RSS 聚合',collection_mode='wechat_rss',
+                notes='读取独立部署的 WeRSS RSS 服务；请先在 WeRSS 中完成公众号订阅',
+                parsing_strategy='fixed',normalization_quality_threshold=85,max_scrolls=1,
+                research_enabled=1,builtin=1
+            WHERE id='wechat-mp-rss'
+            """
         )
         provider_count = conn.execute("SELECT COUNT(*) AS count FROM model_providers").fetchone()["count"]
         legacy_provider = conn.execute("SELECT value FROM settings WHERE key='provider'").fetchone()
@@ -1124,6 +1176,34 @@ def fixed_normalized_items(snapshot: sqlite3.Row, mode: str = "fixed") -> tuple[
                 "normalization_mode": mode,
             }
         ], ""
+    if isinstance(payload, dict) and payload.get("platform") == "werss_external_rss":
+        article = payload.get("article") if isinstance(payload.get("article"), dict) else {}
+        title = str(article.get("title") or "").strip()
+        item_content = str(article.get("content") or article.get("description") or title).strip()
+        item_source_url = str(article.get("link") or source_url).strip()
+        if not item_content:
+            return [], "WeRSS article content is empty"
+        return [
+            {
+                "item_key": stable_item_key(snapshot["channel_id"], item_source_url, occurred_at, title, item_content),
+                "occurred_at": occurred_at,
+                "author": str(article.get("author") or "")[:255],
+                "title": title[:500],
+                "content": item_content,
+                "source_url": item_source_url,
+                "attachments": [],
+                "metadata": {
+                    "platform": payload["platform"],
+                    "adapter": payload.get("adapter", ""),
+                    "feed_id": payload.get("feed_id", ""),
+                    "article_id": article.get("id", ""),
+                    "query": payload.get("query", ""),
+                    "collection_window": payload.get("collection_window", {}),
+                },
+                "quality_score": 90,
+                "normalization_mode": mode,
+            }
+        ], ""
     if isinstance(payload, dict) and payload.get("adapter") == "market_data_aggregate":
         return [
             {
@@ -1440,6 +1520,8 @@ def dashboard() -> dict:
         channel["profile_exists"] = browser_profile(channel["id"]).exists()
         if channel["id"] == "akshare":
             channel["market_data_config"] = market_data_config_public()
+        if channel["id"] == "wechat-mp-rss":
+            channel["wechat_rss_config"] = wechat_rss_config_public()
     skills = [
         {"name": item.name, "path": str(item.relative_to(ROOT)), "status": "loaded"}
         for item in SKILLS_DIR.iterdir()
@@ -1683,6 +1765,47 @@ def update_market_data_config(payload: MarketDataConfigInput) -> dict:
     return {"status": "saved", "config": market_data_config_public()}
 
 
+@app.put("/api/channels/wechat-mp-rss/config")
+def update_wechat_rss_config(payload: WechatRssConfigInput) -> dict:
+    existing = wechat_rss_config()
+    supplied_access_key = payload.access_key.strip()
+    supplied_secret_key = payload.secret_key.strip()
+    if payload.clear_credentials:
+        access_key = ""
+        secret_key = ""
+    else:
+        access_key = supplied_access_key if supplied_access_key and supplied_access_key != MASKED_SECRET else str(existing.get("access_key") or "")
+        secret_key = supplied_secret_key if supplied_secret_key and supplied_secret_key != MASKED_SECRET else str(existing.get("secret_key") or "")
+    try:
+        config = normalize_werss_config(
+            {
+                "base_url": payload.base_url,
+                "feed_ids": payload.feed_ids,
+                "access_key": access_key,
+                "secret_key": secret_key,
+                "timeout_seconds": payload.timeout_seconds,
+                "max_items_per_feed": payload.max_items_per_feed,
+            }
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    save_channel_request_config("wechat-mp-rss", config)
+    with db() as conn:
+        conn.execute(
+            "UPDATE channels SET url=?,status='pending',updated_at=? WHERE id='wechat-mp-rss'",
+            (config["base_url"], now()),
+        )
+    log_event(
+        logger,
+        "INFO",
+        "channel.wechat_rss.config.saved",
+        channel_id="wechat-mp-rss",
+        feed_count=len(config["feed_ids"]),
+        credentials_configured=bool(config["access_key"]),
+    )
+    return {"status": "saved", "config": public_werss_config(config)}
+
+
 @app.post("/api/channels")
 def create_channel(payload: ChannelInput) -> dict:
     channel = {"id": uuid4().hex[:10], **payload.model_dump(), "builtin": 0, "last_check": "", "updated_at": now()}
@@ -1839,6 +1962,15 @@ def check_channel(channel_id: str) -> dict:
             )
         log_event(logger, "INFO" if result["status"] == "online" else "WARNING", "channel.check.completed", channel_id=channel_id, status=result["status"], message=result["message"])
         return result
+    if channel_id == "wechat-mp-rss" and channel:
+        result = check_werss(wechat_rss_config())
+        with db() as conn:
+            conn.execute(
+                "UPDATE channels SET status=?,last_check=?,updated_at=? WHERE id=?",
+                (result["status"], result["checked_at"], result["checked_at"], channel_id),
+            )
+        log_event(logger, "INFO" if result["status"] == "online" else "WARNING", "channel.check.completed", channel_id=channel_id, status=result["status"], message=result["message"])
+        return result
     if channel:
         request_config = channel_request_config(channel_id)
         if request_config.get("adapter") == "mx_authorized_request_replay":
@@ -1891,11 +2023,11 @@ def refresh_browser_channel_states() -> None:
         channels = [
             dict(row)
             for row in conn.execute(
-                "SELECT id FROM channels WHERE collection_mode='playwright' OR id IN ('web-rumors','akshare','industry-news')"
+                "SELECT id FROM channels WHERE collection_mode='playwright' OR id IN ('web-rumors','akshare','industry-news','wechat-mp-rss')"
             )
         ]
     for channel in channels:
-        if channel["id"] in ("web-rumors", "akshare", "industry-news") or browser_profile(channel["id"]).exists():
+        if channel["id"] in ("web-rumors", "akshare", "industry-news", "wechat-mp-rss") or browser_profile(channel["id"]).exists():
             try:
                 check_channel(channel["id"])
             except HTTPException as exc:
@@ -1908,7 +2040,7 @@ def refresh_browser_channel_states() -> None:
 @app.post("/api/channels/check-all")
 def check_all_channels() -> dict:
     refresh_browser_channel_states()
-    return {"status": "ok", "message": "已完成浏览器渠道巡检"}
+    return {"status": "ok", "message": "已完成信源渠道巡检"}
 
 
 def iso(value: datetime) -> str:

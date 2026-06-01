@@ -52,6 +52,17 @@ npm.cmd run start:api
 
 评估过 `stock-open-api` 后，没有将其直接加入运行时依赖：该组件最后更新较早，部分包装接口容易受上游改版影响。项目吸收了它的公司资料补证思路，但使用独立、可诊断、可限流的适配器实现。
 
+## 微信公众号 WeRSS 外部组件
+
+内置 `wechat-mp-rss` 渠道用于读取独立部署的 [WeRSS](https://github.com/rachelos/we-mp-rss) 服务。AlphaDesk 仅消费 `/feed/<feed_id>.rss` 输出，不会自动下载、安装、启动或更新第三方抓取器。请先在单独运行的 WeRSS 中完成授权和公众号订阅，再到“信源渠道 -> 微信公众号（WeRSS） -> 配置”填写服务地址和 Feed ID。
+
+- 默认 Feed ID 为 `all`，也可逐行填写多个 Feed ID
+- 可选 AK/SK 只在本机 Fernet 加密保存，接口只回显掩码
+- 文章严格按 RSS 发布时间和任务时间窗过滤，再保存原始快照
+- 上游版本应固定到经过审查的提交或镜像摘要，不建议生产环境跟随 `latest`
+
+安全边界、部署建议和已核对的上游接口见 `docs/wechat-rss-sidecar.md`。
+
 ## HTTP 请求策略
 
 所有自建采集 HTTP 请求统一复用 `backend.http_policy` 中的浏览器 UA。新增 `requests` 采集器应使用 `browser_http_session()` 或 `browser_headers()`，避免各渠道散落不同的请求头。模型供应商 SDK 保留其官方默认请求头。

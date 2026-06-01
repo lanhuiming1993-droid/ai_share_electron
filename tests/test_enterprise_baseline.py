@@ -18,6 +18,8 @@ class EnterpriseBaselineTests(unittest.TestCase):
         sources = {item["id"]: item for item in source_catalog()}
         self.assertIn("market_snapshot", sources["akshare"]["capabilities"])
         self.assertEqual(sources["web-rumors"]["credential_mode"], "encrypted_session_config")
+        self.assertIn("wechat_official_accounts", sources["wechat-mp-rss"]["capabilities"])
+        self.assertEqual(sources["wechat-mp-rss"]["credential_mode"], "optional_access_key")
         self.assertEqual(CANONICAL_CHANNEL_NAMES["146aa28e21"], "TG 小作文频道")
         self.assertEqual([tool["priority"] for tool in tool_catalog()], [1, 2, 3, 4])
 

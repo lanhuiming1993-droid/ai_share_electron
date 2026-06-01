@@ -47,6 +47,16 @@ SOURCES = (
         detail="东方财富行业排名与资讯、个股资料和巨潮公告。",
     ),
     SourceDefinition(
+        id="wechat-mp-rss",
+        display_name="微信公众号（WeRSS）",
+        category="public_wechat_articles",
+        collection_mode="wechat_rss",
+        capabilities=("wechat_official_accounts", "rss_feed", "article_snapshot"),
+        credential_mode="optional_access_key",
+        risk_level="medium",
+        detail="通过独立部署的 WeRSS RSS 服务读取已订阅公众号文章；AlphaDesk 不内嵌第三方抓取器。",
+    ),
+    SourceDefinition(
         id="zsxq",
         display_name="知识星球",
         category="authenticated_community",

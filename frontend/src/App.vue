@@ -25,6 +25,7 @@ const editingProviderId = ref("");
 const providerFormInitialized = ref(false);
 const channelForm = reactive({ name: "", type: "", url: "", collection_mode: "playwright", status: "pending", notes: "", validation_url: "", success_url_contains: "", success_selector: "", group_ids: [], parsing_strategy: "hybrid", normalization_quality_threshold: 60, max_scrolls: 8, research_enabled: false });
 const marketDataForm = reactive({ enable_akshare: true, enable_baostock: true, enable_tushare: true, tushare_token: "", tushare_token_configured: false, clear_tushare_token: false, component_timeout_seconds: 35 });
+const wechatRssForm = reactive({ base_url: "http://127.0.0.1:8001", feed_ids_text: "all", access_key: "", secret_key: "", credentials_configured: false, clear_credentials: false, timeout_seconds: 20, max_items_per_feed: 100 });
 const mxHarFile = ref(null);
 const mxHarImporting = ref(false);
 const inventoryCleanupSubmitting = ref(false);
@@ -64,6 +65,7 @@ const pageSubtitle = computed(() => pageMeta[activePage.value][1]);
 const canonicalChannelNames = {
   akshare: "AkShare 市场数据",
   "industry-news": "产业趋势公开资讯",
+  "wechat-mp-rss": "微信公众号（WeRSS）",
   zsxq: "知识星球",
   "web-rumors": "MX 小作文频道",
   "146aa28e21": "TG 小作文频道",
@@ -76,11 +78,13 @@ function channelDisplayName(channelOrId) {
 }
 function channelStatusDescription(channel) {
   if (channel.status === "online") {
+    if (channel.id === "wechat-mp-rss") return "外部 RSS 服务可用";
     if (channel.collection_mode === "playwright") return "登录态可用";
     if (channel.id === "web-rumors") return "授权会话可用";
     return "公开采集可用";
   }
   if (channel.status === "offline") {
+    if (channel.id === "wechat-mp-rss") return "外部 RSS 服务不可用，请检查独立部署";
     if (channel.collection_mode === "playwright") return "登录态失效，请重新登录";
     if (channel.id === "web-rumors") return "授权会话失效，请重新导入 HAR";
     return "公开采集暂不可用";
@@ -558,6 +562,8 @@ function openChannelModal(channel = null) {
   Object.assign(channelForm, channel ? { ...channel, research_enabled: Boolean(channel.research_enabled), group_ids: [...(channel.group_ids || [])] } : { name: "", type: "", url: "", collection_mode: "playwright", status: "pending", notes: "", validation_url: "", success_url_contains: "", success_selector: "", group_ids: [], parsing_strategy: "hybrid", normalization_quality_threshold: 60, max_scrolls: 8, research_enabled: false });
   Object.assign(marketDataForm, channel?.market_data_config || { enable_akshare: true, enable_baostock: true, enable_tushare: true, tushare_token: "", tushare_token_configured: false, clear_tushare_token: false, component_timeout_seconds: 35 });
   marketDataForm.clear_tushare_token = false;
+  const wechatRssConfig = channel?.wechat_rss_config || { base_url: "http://127.0.0.1:8001", feed_ids: ["all"], access_key: "", secret_key: "", credentials_configured: false, timeout_seconds: 20, max_items_per_feed: 100 };
+  Object.assign(wechatRssForm, { ...wechatRssConfig, feed_ids_text: (wechatRssConfig.feed_ids || ["all"]).join("\n"), clear_credentials: false });
   channelModal.value = true;
 }
 
@@ -578,6 +584,13 @@ async function saveChannel(openLoginAfterSave = false) {
     const saved = await request(path, { method: editingChannel.value ? "PUT" : "POST", body: JSON.stringify(channelForm) });
     if (saved.id === "akshare") {
       await request("/api/channels/akshare/market-data-config", { method: "PUT", body: JSON.stringify(marketDataForm) });
+    }
+    if (saved.id === "wechat-mp-rss") {
+      const { feed_ids_text, ...wechatRssConfig } = wechatRssForm;
+      await request("/api/channels/wechat-mp-rss/config", {
+        method: "PUT",
+        body: JSON.stringify({ ...wechatRssConfig, feed_ids: feed_ids_text.split(/\r?\n|,|，/).map((item) => item.trim()).filter(Boolean) }),
+      });
     }
     notice.value = editingChannel.value ? "渠道配置已更新" : "新渠道已添加";
     closeChannelModal();
@@ -614,7 +627,7 @@ async function checkChannel(channel) {
 }
 
 async function checkAllChannels() {
-  notice.value = "正在巡检已有浏览器登录态...";
+  notice.value = "正在巡检已有信源状态...";
   try {
     const result = await request("/api/channels/check-all", { method: "POST" });
     notice.value = result.message;
@@ -1076,7 +1089,7 @@ onUnmounted(() => {
                 <p class="mt-1 text-xs text-slate-500">公开数据优先，登录态和强反爬页面由持久化浏览器处理</p>
               </div>
               <div class="flex gap-2">
-                <button @click="checkAllChannels" class="secondary">巡检登录态</button>
+                <button @click="checkAllChannels" class="secondary">巡检状态</button>
                 <button @click="openChannelModal()" class="primary">添加渠道</button>
               </div>
             </div>
@@ -1086,6 +1099,7 @@ onUnmounted(() => {
                 <small>{{ channel.type }} · {{ channelStatusDescription(channel) }}</small>
                 <small v-if="channel.group_ids?.length">星球 ID：{{ channel.group_ids.join('、') }}</small>
                 <small v-if="channel.id==='akshare'">组件：AkShare · BaoStock · TuShare{{ channel.market_data_config?.tushare_token_configured ? '（token 已加密保存）' : '（等待 token）' }}</small>
+                <small v-if="channel.id==='wechat-mp-rss'">Sidecar：{{ channel.wechat_rss_config?.base_url }} · Feed：{{ channel.wechat_rss_config?.feed_ids?.join('、') }}{{ channel.wechat_rss_config?.credentials_configured ? '（AK/SK 已加密保存）' : '' }}</small>
                 <small>整理策略：{{ channel.parsing_strategy }} · 质量阈值 {{ channel.normalization_quality_threshold }} · 最大滚动 {{ channel.max_scrolls }}</small>
                 <small>个股补证：{{ channel.research_enabled ? '允许' : '关闭' }}</small>
                 <small v-if="channel.last_check">上次检查：{{ channel.last_check }}</small>
@@ -1093,7 +1107,7 @@ onUnmounted(() => {
               <div class="flex items-center gap-3">
                 <span :class="channel.status==='online'?'status-good':'status-warn'">{{ channel.status }}</span>
                 <button @click="normalizeExistingChannel(channel)" class="secondary">整理已有快照</button>
-                <button v-if="channel.collection_mode==='playwright' || ['web-rumors','akshare','industry-news'].includes(channel.id)" @click="checkChannel(channel)" class="secondary">检查状态</button>
+                <button v-if="channel.collection_mode==='playwright' || ['web-rumors','akshare','industry-news','wechat-mp-rss'].includes(channel.id)" @click="checkChannel(channel)" class="secondary">检查状态</button>
                 <button @click="openChannelModal(channel)" class="secondary">配置</button>
               </div>
             </div>
@@ -1411,6 +1425,7 @@ onUnmounted(() => {
             <select v-model="channelForm.collection_mode" class="field mt-2 w-full">
               <option value="akshare">AkShare 模块</option>
               <option value="industry_news">产业趋势公开资讯</option>
+              <option value="wechat_rss">微信公众号 WeRSS RSS</option>
               <option value="requests">HTTP requests</option>
               <option value="playwright">Playwright 持久化浏览器</option>
               <option value="manual">人工补充</option>
@@ -1454,6 +1469,41 @@ onUnmounted(() => {
               <label class="flex items-center gap-2 text-xs text-slate-400">单组件超时
                 <input v-model.number="marketDataForm.component_timeout_seconds" type="number" min="5" max="120" class="field w-20" />
                 秒
+              </label>
+            </div>
+          </div>
+          <div v-if="editingChannel?.id==='wechat-mp-rss'" class="col-span-2 rounded-2xl border border-teal-400/20 bg-teal-400/[.04] p-4">
+            <span class="form-label">微信公众号 WeRSS 外部组件</span>
+            <p class="mt-1 text-xs leading-5 text-slate-500">AlphaDesk 只读取你独立部署并授权的 WeRSS RSS 服务，不会下载或运行第三方抓取器。请先在 WeRSS 中完成公众号订阅。</p>
+            <label class="mt-3 block">
+              <span class="form-label">WeRSS 服务地址</span>
+              <input v-model="wechatRssForm.base_url" placeholder="http://127.0.0.1:8001" class="field mt-2 w-full" />
+            </label>
+            <label class="mt-3 block">
+              <span class="form-label">Feed ID 列表</span>
+              <textarea v-model="wechatRssForm.feed_ids_text" rows="3" placeholder="all&#10;或每行填写一个 Feed ID" class="field mt-2 w-full"></textarea>
+              <small class="mt-1 block text-xs leading-5 text-slate-600">每行一个或使用逗号分隔；默认 <code>all</code> 读取 WeRSS 中全部已订阅公众号。</small>
+            </label>
+            <div class="mt-3 grid grid-cols-2 gap-3">
+              <label>
+                <span class="form-label">Access Key（可选）</span>
+                <input v-model="wechatRssForm.access_key" type="password" :placeholder="wechatRssForm.credentials_configured ? '已加密保存；保留密文即可' : 'WeRSS AK'" class="field mt-2 w-full" />
+              </label>
+              <label>
+                <span class="form-label">Secret Key（可选）</span>
+                <input v-model="wechatRssForm.secret_key" type="password" :placeholder="wechatRssForm.credentials_configured ? '已加密保存；保留密文即可' : 'WeRSS SK'" class="field mt-2 w-full" />
+              </label>
+            </div>
+            <small class="mt-2 block text-xs leading-5 text-slate-600">AK/SK 必须同时填写或同时留空。凭据只在本机加密保存，页面接口只回显掩码。</small>
+            <div class="mt-3 flex flex-wrap items-center gap-4">
+              <label class="text-xs text-slate-400"><input v-model="wechatRssForm.clear_credentials" type="checkbox" class="mr-2" />清除已保存 AK/SK</label>
+              <label class="flex items-center gap-2 text-xs text-slate-400">请求超时
+                <input v-model.number="wechatRssForm.timeout_seconds" type="number" min="3" max="120" class="field w-20" />
+                秒
+              </label>
+              <label class="flex items-center gap-2 text-xs text-slate-400">单 Feed 上限
+                <input v-model.number="wechatRssForm.max_items_per_feed" type="number" min="1" max="500" class="field w-20" />
+                条
               </label>
             </div>
           </div>
