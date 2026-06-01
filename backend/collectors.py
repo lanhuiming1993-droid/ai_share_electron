@@ -15,6 +15,7 @@ from urllib.parse import quote_plus, urljoin
 import requests
 from bs4 import BeautifulSoup
 
+from backend.http_policy import browser_headers, browser_http_session
 from backend.industry_news_sources import collect_public_industry_news
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -212,10 +213,9 @@ def collect_mx(channel: dict[str, Any], window: dict[str, str], query: str = "")
     if not room_ids:
         raise RuntimeError("MX room whitelist is empty")
 
-    session = requests.Session()
+    session = browser_http_session()
     session.headers.update(
         {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
             "Content-Type": "application/json",
             "token": token,
             "AD": str(config.get("ad") or "1"),
@@ -327,7 +327,7 @@ def collect_http(channel: dict[str, Any], window: dict[str, str], query: str = "
     if not channel["url"]:
         raise ValueError("HTTP channel URL is empty")
     request_url = render_query_url(channel["url"], query)
-    response = requests.get(request_url, timeout=30, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"})
+    response = requests.get(request_url, timeout=30, headers=browser_headers())
     response.raise_for_status()
     content_type = response.headers.get("content-type", "")
     response_text = response.text
@@ -404,7 +404,7 @@ def collect_http(channel: dict[str, Any], window: dict[str, str], query: str = "
             older_response = requests.get(
                 f"{page_url}?before={oldest_post_id}",
                 timeout=30,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"},
+                headers=browser_headers(),
             )
             older_response.raise_for_status()
             page_text = older_response.text

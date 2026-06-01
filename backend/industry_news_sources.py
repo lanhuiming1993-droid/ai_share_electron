@@ -14,7 +14,8 @@ from urllib.parse import quote
 
 import requests
 
-UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AlphaDesk/0.1"
+from backend.http_policy import browser_headers, browser_http_session
+
 EASTMONEY_INDUSTRY_URL = "https://push2.eastmoney.com/api/qt/clist/get"
 EASTMONEY_GLOBAL_NEWS_URL = "https://np-weblist.eastmoney.com/comm/web/getFastNewsList"
 EASTMONEY_STOCK_INFO_URL = "https://push2.eastmoney.com/api/qt/stock/get"
@@ -92,8 +93,8 @@ class ThrottledSession:
         sleep: Callable[[float], None] = time.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
-        self.session = session or requests.Session()
-        self.session.headers.update({"User-Agent": UA})
+        self.session = session or browser_http_session()
+        self.session.headers.update(browser_headers())
         self.min_interval_seconds = max(0.0, min_interval_seconds)
         self.jitter_seconds = max(0.0, jitter_seconds)
         self.sleep = sleep
@@ -126,8 +127,8 @@ class PublicIndustryNewsCollector:
         eastmoney: ThrottledSession | None = None,
         session: requests.Session | None = None,
     ) -> None:
-        self.session = session or requests.Session()
-        self.session.headers.update({"User-Agent": UA})
+        self.session = session or browser_http_session()
+        self.session.headers.update(browser_headers())
         self.eastmoney = eastmoney or ThrottledSession(session=self.session)
         self.cninfo = ThrottledSession(session=self.session)
 

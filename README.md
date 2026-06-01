@@ -52,6 +52,10 @@ npm.cmd run start:api
 
 评估过 `stock-open-api` 后，没有将其直接加入运行时依赖：该组件最后更新较早，部分包装接口容易受上游改版影响。项目吸收了它的公司资料补证思路，但使用独立、可诊断、可限流的适配器实现。
 
+## HTTP 请求策略
+
+所有自建采集 HTTP 请求统一复用 `backend.http_policy` 中的浏览器 UA。新增 `requests` 采集器应使用 `browser_http_session()` 或 `browser_headers()`，避免各渠道散落不同的请求头。模型供应商 SDK 保留其官方默认请求头。
+
 ## 诊断日志
 
 后端、模型网关、采集 worker、前端交互和 Electron 主进程都会写入 `data/logs/`。日志采用 JSONL 格式并在写入前脱敏；API key、token、cookie、密码和 HAR 原文不会进入日志。
