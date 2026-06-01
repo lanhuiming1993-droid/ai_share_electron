@@ -1,0 +1,52 @@
+# A股成长猎手工作台
+
+Electron + Vue 3 + FastAPI 的本地研究工作台。模型供应商由用户在界面中配置，API Key 只加密保存在本机。
+
+## 本地运行
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+npm.cmd install
+npm.cmd run dev
+```
+
+仅启动后端：
+
+```powershell
+npm.cmd run start:api
+```
+
+## 当前能力
+
+- 用户配置 OpenAI-compatible 模型供应商并在本地加密保存密钥
+- 查看采集工具优先级：AkShare -> requests -> Playwright -> 其他
+- 查看信息差渠道可用状态和已加载 skills
+- 创建研究任务并由模型生成采集计划与初步分析框架
+- 创建带精确时间窗口的信源采集任务，最多回溯 30 天
+- 记录信源采集水位并阻止 15 分钟内的重复采集
+- 支持仅采集、采集并生成报告、仅基于本地快照生成报告
+
+浏览器登录态已使用独立 Playwright profile 管理。后续迭代会将真实 AkShare 和各渠道爬虫执行器接入已经存在的采集任务与快照接口。
+
+## 核心红线
+
+`config/research-red-lines.toml` 是强制策略文件。服务启动和每次模型调用都会校验：
+
+- 禁止程序在本地执行分析，本地只做聚合、去重、时间窗口控制和证据传递
+- 分析必须由模型完成
+- 证据升级顺序固定为：本地全量信源快照 -> AkShare -> HTTP requests -> Playwright -> 模型知识库
+- 模型知识库仅可作为最后手段，且必须标记为低置信推断
+
+## Codex 项目配置
+
+全局备份中可项目化的配置已整理到 `config/codex-policy.toml`，工具约束已写入仓库根目录 `AGENTS.md`。机器级 marketplace 路径和旧项目 trust 记录不会复制到项目内。
+
+## 市场数据聚合
+
+内置 `akshare` 渠道实际使用 AkShare、BaoStock 和 TuShare 三个 Python 组件。组件并行执行且独立限时：单个上游失败或超时不会丢弃其他组件已经取得的数据。TuShare token 在“信源渠道 -> A股市场数据 -> 配置”中填写，仅加密保存在本机，接口只回显掩码。
+
+## 产业趋势公开资讯
+
+内置 `industry-news` 渠道用于报告类研究，不提供技术面、交易策略或买卖点。通用采集会获取东方财富行业板块排名和 7x24 公开资讯；个股研究在 `http_requests` 补证阶段会按需获取公司资料、个股新闻和巨潮公告。东方财富请求串行限流并加入轻微抖动，单一公开接口失败时保留其他已经取得的证据。
+
+评估过 `stock-open-api` 后，没有将其直接加入运行时依赖：该组件最后更新较早，部分包装接口容易受上游改版影响。项目吸收了它的公司资料补证思路，但使用独立、可诊断、可限流的适配器实现。

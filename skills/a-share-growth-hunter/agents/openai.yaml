@@ -1,0 +1,5 @@
+﻿interface:
+  display_name: "A股成长股猎手"
+  short_description: "A股成长股猎手：专注100-350亿市值戴维斯双击标的的分析"
+  brand_color: "#DC2626"
+  default_prompt: "使用 $a-share-growth-hunter 分析[股票代码/名称]的成长股投资价值"

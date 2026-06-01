@@ -1,0 +1,1297 @@
+<script setup>
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
+
+const API = "http://127.0.0.1:8765";
+const data = reactive({ tools: [], channels: [], skills: [], tasks: [], source_jobs: [], provider: null, providers: [], codex_policy: null, research_red_lines: null, audit: { jobs: [], watermarks: [], snapshots: [], normalized: [], events: [], inventory: { snapshot_count: 0, normalized_item_count: 0, source_report_count: 0, research_report_count: 0 } } });
+const provider = reactive({ name: "", base_url: "", model: "", api_key: "", protocol: "openai_chat_completions", enabled: true, extra_body_text: "{}" });
+const task = reactive({ title: "成长股六维研究", target: "", objective: "识别财务拐点、赛道卡位、客户订单、产能交付、机构变化和未来催化", skill_name: "a-share-growth-hunter", lookback_days: 30 });
+const sourceJob = reactive({ action: "collect", channel_ids: [], lookback_days: 30, report_title: "近 30 天信源聚合报告", skill_name: "a-share-growth-hunter" });
+const activePage = ref("dashboard");
+const notice = ref("");
+const selectedReport = ref("");
+const reportModal = ref(false);
+const sourceJobSubmitting = ref(false);
+const sourceJobFeedback = ref("");
+const sourceJobFeedbackType = ref("info");
+const snapshotModal = ref(false);
+const snapshotDetail = reactive({ job: null, snapshots: [] });
+const normalizedModal = ref(false);
+const normalizedDetail = reactive({ title: "", items: [] });
+const saving = ref(false);
+const channelModal = ref(false);
+const editingChannel = ref(null);
+const editingProviderId = ref("");
+const providerFormInitialized = ref(false);
+const channelForm = reactive({ name: "", type: "", url: "", collection_mode: "playwright", status: "pending", notes: "", validation_url: "", success_url_contains: "", success_selector: "", group_ids: [], parsing_strategy: "hybrid", normalization_quality_threshold: 60, max_scrolls: 8, research_enabled: false });
+const marketDataForm = reactive({ enable_akshare: true, enable_baostock: true, enable_tushare: true, tushare_token: "", tushare_token_configured: false, clear_tushare_token: false, component_timeout_seconds: 35 });
+const mxHarFile = ref(null);
+const mxHarImporting = ref(false);
+const inventoryCleanupSubmitting = ref(false);
+const taskListCleanupSubmitting = ref(false);
+
+const navItems = [
+  { id: "dashboard", label: "仪表盘", hint: "Dashboard", icon: "grid" },
+  { id: "tasks", label: "任务与报告", hint: "Research", icon: "file" },
+  { id: "providers", label: "模型供应商", hint: "Providers", icon: "cpu" },
+  { id: "channels", label: "信源渠道", hint: "Sources", icon: "radio" },
+  { id: "audit", label: "采集审计", hint: "Audit", icon: "audit" },
+  { id: "skills", label: "Skill 管理", hint: "Skills", icon: "spark" },
+  { id: "settings", label: "系统设置", hint: "Settings", icon: "settings" },
+];
+
+const pageMeta = {
+  dashboard: ["仪表盘", "模型服务、信源状态和研究任务概览"],
+  tasks: ["任务与报告", "检查采集任务状态，审阅模型生成的研究计划和报告"],
+  providers: ["模型供应商", "配置用于 Agent 编排和分析的 OpenAI-compatible 模型服务"],
+  channels: ["信源渠道", "维护公开数据、登录态渠道和浏览器采集能力"],
+  audit: ["采集审计", "检查采集窗口、水位、快照数量和 Agent 证据推进记录"],
+  skills: ["Skill 管理", "管理 Agent 可加载的领域能力和研究方法"],
+  settings: ["系统设置", "检查核心红线、本地服务和开发环境信息"],
+};
+
+const readyTools = computed(() => data.tools.filter((x) => x.status === "ready").length);
+const pendingChannels = computed(() => data.channels.filter((x) => x.status === "pending").length);
+const pageTitle = computed(() => pageMeta[activePage.value][0]);
+const pageSubtitle = computed(() => pageMeta[activePage.value][1]);
+const canonicalChannelNames = {
+  akshare: "AkShare 市场数据",
+  "industry-news": "产业趋势公开资讯",
+  zsxq: "知识星球",
+  "web-rumors": "MX 小作文频道",
+  "146aa28e21": "TG 小作文频道",
+};
+function channelDisplayName(channelOrId) {
+  const channelId = typeof channelOrId === "string" ? channelOrId : channelOrId?.id || channelOrId?.channel_id;
+  const channel = typeof channelOrId === "object" ? channelOrId : data.channels.find((item) => item.id === channelId);
+  if (channelId === "akshare") return "A股市场数据（AkShare / BaoStock / TuShare）";
+  return canonicalChannelNames[channelId] || channel?.name || channelId || "未知信源";
+}
+function channelStatusDescription(channel) {
+  if (channel.status === "online") {
+    if (channel.collection_mode === "playwright") return "登录态可用";
+    if (channel.id === "web-rumors") return "授权会话可用";
+    return "公开采集可用";
+  }
+  if (channel.status === "offline") {
+    if (channel.collection_mode === "playwright") return "登录态失效，请重新登录";
+    if (channel.id === "web-rumors") return "授权会话失效，请重新导入 HAR";
+    return "公开采集暂不可用";
+  }
+  return channel.collection_mode === "playwright" ? "等待登录配置" : "等待渠道配置";
+}
+function jobChannelNames(job) {
+  return job.channel_names?.length ? job.channel_names : (job.channel_ids || []).map(channelDisplayName);
+}
+const sourceActionOptions = [
+  { value: "collect", label: "仅采集数据", hint: "保存原始快照，按渠道策略整理，不生成分析报告" },
+  { value: "collect_report", label: "采集并生成报告", hint: "采集完成后交给 AI 分析" },
+  { value: "report", label: "仅生成报告", hint: "只分析已有本地快照" },
+];
+const sourceJobSubmitLabel = computed(() => {
+  if (sourceJobSubmitting.value) {
+    return sourceJob.action === "report" ? "正在生成 HTML 报告..." : "正在提交任务...";
+  }
+  return {
+    collect: "发起采集任务",
+    collect_report: "发起采集并生成报告",
+    report: "立即生成报告",
+  }[sourceJob.action];
+});
+const reportPreviewDocument = computed(() => buildReportPreviewDocument(selectedReport.value));
+
+watch(() => sourceJob.lookback_days, (days, previousDays) => {
+  if (Number.isInteger(days) && sourceJob.report_title === `近 ${previousDays} 天信源聚合报告`) {
+    sourceJob.report_title = `近 ${days} 天信源聚合报告`;
+  }
+});
+
+async function request(path, options = {}) {
+  const response = await fetch(API + path, { headers: { "Content-Type": "application/json" }, ...options });
+  const body = await response.json();
+  if (!response.ok) throw new Error(body.detail || "请求失败");
+  return body;
+}
+
+async function refresh() {
+  const [dashboard, audit] = await Promise.all([request("/api/dashboard"), request("/api/audit")]);
+  Object.assign(data, dashboard, { audit });
+  if (!providerFormInitialized.value && data.provider) {
+    editProvider(data.provider);
+    providerFormInitialized.value = true;
+  }
+}
+
+async function saveProvider() {
+  saving.value = true;
+  try {
+    const payload = { ...provider, extra_body: JSON.parse(provider.extra_body_text || "{}") };
+    delete payload.extra_body_text;
+    const path = editingProviderId.value ? `/api/providers/${editingProviderId.value}` : "/api/providers";
+    await request(path, { method: editingProviderId.value ? "PUT" : "POST", body: JSON.stringify(payload) });
+    notice.value = "模型通道已加密保存";
+    resetProviderForm();
+    await refresh();
+  } catch (error) { notice.value = error instanceof SyntaxError ? "额外参数必须是合法 JSON" : error.message; }
+  saving.value = false;
+}
+
+async function testProvider(id) {
+  notice.value = "正在测试模型通道...";
+  try {
+    const result = await request(`/api/providers/${id}/test`, { method: "POST" });
+    notice.value = `${result.message} · ${result.latency_ms} ms`;
+    await refresh();
+  } catch (error) { notice.value = error.message; }
+}
+
+function resetProviderForm() {
+  providerFormInitialized.value = true;
+  editingProviderId.value = "";
+  Object.assign(provider, { name: "", base_url: "", model: "", api_key: "", protocol: "openai_chat_completions", enabled: true, extra_body_text: "{}" });
+}
+
+function editProvider(item) {
+  providerFormInitialized.value = true;
+  editingProviderId.value = item.id;
+  Object.assign(provider, { ...item, extra_body_text: JSON.stringify(item.extra_body || {}, null, 2) });
+}
+
+async function activateProvider(id) {
+  try {
+    await request(`/api/providers/${id}/activate`, { method: "POST" });
+    notice.value = "默认研究模型已切换";
+    await refresh();
+  } catch (error) { notice.value = error.message; }
+}
+
+async function toggleProvider(item) {
+  try {
+    const payload = { ...item, enabled: !item.enabled, extra_body: item.extra_body || {} };
+    await request(`/api/providers/${item.id}`, { method: "PUT", body: JSON.stringify(payload) });
+    notice.value = payload.enabled ? "模型通道已启用" : "模型通道已停用";
+    await refresh();
+  } catch (error) { notice.value = error.message; }
+}
+
+async function deleteProvider(item) {
+  if (!window.confirm(`确认删除模型通道“${item.name}”吗？`)) return;
+  try {
+    await request(`/api/providers/${item.id}`, { method: "DELETE" });
+    if (editingProviderId.value === item.id) resetProviderForm();
+    notice.value = "模型通道已删除";
+    await refresh();
+  } catch (error) { notice.value = error.message; }
+}
+
+async function createTask() {
+  if (!task.target.trim()) return notice.value = "请先填写股票代码或标的名称";
+  if (!Number.isInteger(task.lookback_days) || task.lookback_days < 1 || task.lookback_days > 30) {
+    return notice.value = "个股研究时间窗口必须是 1-30 之间的整数";
+  }
+  try {
+    await request("/api/tasks", { method: "POST", body: JSON.stringify(task) });
+    notice.value = "研究任务已进入队列";
+    task.target = "";
+    await refresh();
+  } catch (error) { notice.value = error.message; }
+}
+
+async function createSourceJob() {
+  if (sourceJobSubmitting.value) return;
+  if (!sourceJob.channel_ids.length) return notice.value = "请至少选择一个信源渠道";
+  if (!Number.isInteger(sourceJob.lookback_days) || sourceJob.lookback_days < 1 || sourceJob.lookback_days > 30) {
+    return notice.value = "信源时间窗口必须是 1-30 之间的整数";
+  }
+  sourceJobSubmitting.value = true;
+  sourceJobFeedbackType.value = "info";
+  sourceJobFeedback.value = sourceJob.action === "report"
+    ? "报告任务已提交，AI 正在生成 HTML 报告。请稍候，不需要重复点击。"
+    : "任务正在提交，请稍候。";
+  notice.value = sourceJobFeedback.value;
+  try {
+    const result = await request("/api/source-jobs", { method: "POST", body: JSON.stringify(sourceJob) });
+    const message = result.deduplicated && result.action === "report"
+      ? result.status === "generating"
+        ? "相同参数的报告任务正在生成中，已阻止重复提交。"
+        : "已复用最近生成的同参数报告，没有重复创建任务。"
+      : result.status === "deduplicated"
+        ? "所选信源已存在覆盖当前时间段的采集水位或排队任务，本次未重复采集。"
+        : result.action === "report"
+          ? `HTML 报告已生成，数据锚点：${result.report_anchor}`
+          : "信源采集任务已按精确时间窗口进入队列。";
+    notice.value = message;
+    sourceJobFeedback.value = message;
+    sourceJobFeedbackType.value = result.status === "deduplicated" || result.deduplicated ? "warn" : "success";
+    if (result.report) openReport(result.report);
+    await refresh();
+  } catch (error) {
+    notice.value = error.message;
+    sourceJobFeedback.value = error.message;
+    sourceJobFeedbackType.value = "error";
+  } finally {
+    sourceJobSubmitting.value = false;
+  }
+}
+
+async function retrySourceJob(job) {
+  notice.value = "正在重新排队失败的信源任务...";
+  try {
+    const result = await request(`/api/source-jobs/${job.id}/retry`, { method: "POST" });
+    notice.value = result.status === "review" ? "报告已重新生成，等待审查" : "信源任务已重新进入采集队列";
+    if (result.report) openReport(result.report);
+    await refresh();
+  } catch (error) { notice.value = error.message; }
+}
+
+async function openSnapshots(job) {
+  try {
+    const result = await request(`/api/source-jobs/${job.id}/snapshots`);
+    Object.assign(snapshotDetail, result);
+    snapshotModal.value = true;
+  } catch (error) { notice.value = error.message; }
+}
+
+function closeSnapshots() {
+  snapshotModal.value = false;
+  Object.assign(snapshotDetail, { job: null, snapshots: [] });
+}
+
+async function openNormalizedItems({ channelId = "", snapshotId = "", title = "结构化条目" } = {}) {
+  try {
+    const params = new URLSearchParams();
+    if (channelId) params.set("channel_id", channelId);
+    if (snapshotId) params.set("snapshot_id", snapshotId);
+    const result = await request(`/api/normalized-items?${params.toString()}`);
+    Object.assign(normalizedDetail, { title, items: result.items });
+    normalizedModal.value = true;
+  } catch (error) { notice.value = error.message; }
+}
+
+function closeNormalizedItems() {
+  normalizedModal.value = false;
+  Object.assign(normalizedDetail, { title: "", items: [] });
+}
+
+async function normalizeSnapshot(item) {
+  notice.value = "正在整理已有原始快照，不会访问远端信源...";
+  try {
+    const result = await request(`/api/snapshots/${item.id}/normalize`, { method: "POST" });
+    notice.value = `整理完成：${result.stored_item_count} 条结构化内容，状态 ${result.status}`;
+    if (snapshotDetail.job) await openSnapshots(snapshotDetail.job);
+    await refresh();
+  } catch (error) { notice.value = error.message; }
+}
+
+async function normalizeExistingChannel(channel) {
+  notice.value = `正在整理 ${channelDisplayName(channel)} 的最近原始快照，不会重新采集...`;
+  try {
+    const result = await request(`/api/channels/${channel.id}/normalize-existing`, { method: "POST" });
+    notice.value = `${channelDisplayName(channel)} 已整理 ${result.snapshot_count} 份原始快照`;
+    await refresh();
+  } catch (error) { notice.value = error.message; }
+}
+
+function formatSnapshotContent(content) {
+  try { return JSON.stringify(JSON.parse(content), null, 2); }
+  catch { return content; }
+}
+
+function toggleSourceChannel(channelId) {
+  const index = sourceJob.channel_ids.indexOf(channelId);
+  if (index >= 0) sourceJob.channel_ids.splice(index, 1);
+  else sourceJob.channel_ids.push(channelId);
+}
+
+async function runTask(id) {
+  notice.value = "模型正在编排研究计划...";
+  try {
+    const result = await request(`/api/tasks/${id}/analyze`, { method: "POST" });
+    if (result.report) openReport(result.report);
+    notice.value = result.status === "review"
+      ? "AI 研究报告已生成，等待审查"
+      : `Agent 已请求 ${result.evidence_layer} 证据，采集器正在执行`;
+    await refresh();
+  } catch (error) { notice.value = error.message; }
+}
+
+function canRunTask(item) {
+  return ["queued", "evidence_ready", "agent_failed"].includes(item.status);
+}
+
+function taskActionLabel(item) {
+  if (item.status === "agent_failed") return "重试编排";
+  if (item.status === "evidence_ready") return "继续分析";
+  if (item.status === "evidence_queued" || item.status === "analyzing") return "处理中";
+  return "启动编排";
+}
+
+function sourceJobActionLabel(action) {
+  return {
+    collect: "仅采集",
+    collect_report: "采集并生成报告",
+    report: "仅生成报告",
+  }[action] || action;
+}
+
+function sourceJobSnapshotLabel(job) {
+  return job.action === "report" ? "使用已有本地快照" : `${job.snapshot_count} 条新增快照`;
+}
+
+function sourceJobStatusLabel(job) {
+  return {
+    queued: "排队中",
+    running: "正在采集",
+    generating_report: "正在生成 HTML 报告",
+    completed: job.action === "collect_report" ? "采集完成，报告待恢复" : "采集完成",
+    deduplicated: job.action === "collect_report" ? "无需重复采集，报告待生成" : "已跳过重复采集",
+    snapshot_deleted: "快照已删除",
+    report_deleted: "报告已删除",
+    review: "待审查",
+    report_failed: "报告生成失败",
+    failed: "采集失败",
+    cancelled: "已取消",
+  }[job.status] || job.status;
+}
+
+function canRetrySourceJob(job) {
+  return ["failed", "report_failed", "cancelled"].includes(job.status)
+    || (["completed", "deduplicated"].includes(job.status) && job.action === "collect_report")
+    || (job.status === "report_deleted" && ["report", "collect_report"].includes(job.action));
+}
+
+function retrySourceJobLabel(job) {
+  return (["completed", "deduplicated"].includes(job.status) && job.action === "collect_report")
+    || (job.status === "report_deleted" && ["report", "collect_report"].includes(job.action))
+    ? "生成报告"
+    : "重试";
+}
+
+async function clearAuditInventory(scope) {
+  if (inventoryCleanupSubmitting.value) return;
+  const descriptions = {
+    snapshots: "全部原始快照、结构化条目和采集水位",
+    reports: "全部 HTML 报告",
+    all: "全部快照、结构化条目、采集水位和 HTML 报告",
+  };
+  if (!window.confirm(`确认删除${descriptions[scope]}吗？任务流水和审计记录会保留，此操作不可撤销。`)) return;
+  inventoryCleanupSubmitting.value = true;
+  try {
+    const result = await request(`/api/audit/inventory/${scope}`, { method: "DELETE" });
+    notice.value = `库存清理完成：删除 ${result.deleted.snapshot_count} 份快照、${result.deleted.normalized_item_count} 条结构化内容、${result.deleted.source_report_count + result.deleted.research_report_count} 份报告`;
+    await refresh();
+  } catch (error) {
+    notice.value = error.message;
+  } finally {
+    inventoryCleanupSubmitting.value = false;
+  }
+}
+
+async function clearTaskList(scope) {
+  if (taskListCleanupSubmitting.value) return;
+  const descriptions = {
+    research: "全部个股研究任务",
+    "source-jobs": "全部信源采集与报告任务",
+  };
+  if (!window.confirm(`确认永久删除${descriptions[scope]}吗？任务记录、内嵌报告和关联映射会直接删除，此操作不可撤销。原始快照库存不受影响。`)) return;
+  taskListCleanupSubmitting.value = true;
+  try {
+    const result = await request(`/api/task-lists/${scope}`, { method: "DELETE" });
+    notice.value = `任务列表已清理：删除 ${result.deleted_research_tasks} 个研究任务、${result.deleted_source_jobs} 个信源任务`;
+    await refresh();
+  } catch (error) {
+    notice.value = error.message;
+  } finally {
+    taskListCleanupSubmitting.value = false;
+  }
+}
+
+async function resetTask(item) {
+  if (!window.confirm(`确认重置“${item.target} · ${item.title}”吗？已有报告和 Agent 进度会清空。`)) return;
+  try {
+    const result = await request(`/api/tasks/${item.id}/reset`, { method: "POST" });
+    closeReport();
+    notice.value = result.cancelled_jobs
+      ? `任务已重置，并取消 ${result.cancelled_jobs} 个尚未执行的采集任务`
+      : "任务已重置，可以重新启动编排";
+    await refresh();
+  } catch (error) { notice.value = error.message; }
+}
+
+async function deleteTask(item) {
+  if (!window.confirm(`确认永久删除“${item.target} · ${item.title}”吗？关联子任务、内嵌报告和映射会直接删除，原始快照库存不受影响。`)) return;
+  try {
+    const result = await request(`/api/tasks/${item.id}`, { method: "DELETE" });
+    closeReport();
+    notice.value = result.deleted_source_jobs
+      ? `任务已删除，同时删除 ${result.deleted_source_jobs} 个关联信源任务`
+      : "任务已删除";
+    await refresh();
+  } catch (error) { notice.value = error.message; }
+}
+
+function openChannelModal(channel = null) {
+  editingChannel.value = channel;
+  Object.assign(channelForm, channel ? { ...channel, research_enabled: Boolean(channel.research_enabled), group_ids: [...(channel.group_ids || [])] } : { name: "", type: "", url: "", collection_mode: "playwright", status: "pending", notes: "", validation_url: "", success_url_contains: "", success_selector: "", group_ids: [], parsing_strategy: "hybrid", normalization_quality_threshold: 60, max_scrolls: 8, research_enabled: false });
+  Object.assign(marketDataForm, channel?.market_data_config || { enable_akshare: true, enable_baostock: true, enable_tushare: true, tushare_token: "", tushare_token_configured: false, clear_tushare_token: false, component_timeout_seconds: 35 });
+  marketDataForm.clear_tushare_token = false;
+  channelModal.value = true;
+}
+
+function closeChannelModal() {
+  channelModal.value = false;
+  editingChannel.value = null;
+  mxHarFile.value = null;
+}
+
+async function saveChannel(openLoginAfterSave = false) {
+  if (!channelForm.name.trim() || !channelForm.type.trim()) {
+    notice.value = "请填写渠道名称和渠道类型";
+    return;
+  }
+  try {
+    normalizeChannelForm();
+    const path = editingChannel.value ? `/api/channels/${editingChannel.value.id}` : "/api/channels";
+    const saved = await request(path, { method: editingChannel.value ? "PUT" : "POST", body: JSON.stringify(channelForm) });
+    if (saved.id === "akshare") {
+      await request("/api/channels/akshare/market-data-config", { method: "PUT", body: JSON.stringify(marketDataForm) });
+    }
+    notice.value = editingChannel.value ? "渠道配置已更新" : "新渠道已添加";
+    closeChannelModal();
+    await refresh();
+    if (openLoginAfterSave) {
+      const result = await request(`/api/channels/${saved.id}/login`, { method: "POST" });
+      notice.value = result.message;
+    }
+  } catch (error) { notice.value = error.message; }
+}
+
+async function deleteChannel() {
+  if (!editingChannel.value || editingChannel.value.builtin) return;
+  try {
+    await request(`/api/channels/${editingChannel.value.id}`, { method: "DELETE" });
+    notice.value = "渠道已删除";
+    closeChannelModal();
+    await refresh();
+  } catch (error) { notice.value = error.message; }
+}
+
+async function openChannelLogin() {
+  await saveChannel(true);
+}
+
+async function checkChannel(channel) {
+  notice.value = `正在检查 ${channelDisplayName(channel)} 登录状态...`;
+  try {
+    const result = await request(`/api/channels/${channel.id}/check`, { method: "POST" });
+    notice.value = `${channelDisplayName(channel)}: ${result.message}`;
+    await refresh();
+  } catch (error) { notice.value = error.message; }
+}
+
+async function checkAllChannels() {
+  notice.value = "正在巡检已有浏览器登录态...";
+  try {
+    const result = await request("/api/channels/check-all", { method: "POST" });
+    notice.value = result.message;
+    await refresh();
+  } catch (error) { notice.value = error.message; }
+}
+
+function selectMxHar(event) {
+  mxHarFile.value = event.target.files?.[0] || null;
+}
+
+async function importMxHar() {
+  if (!editingChannel.value || editingChannel.value.id !== "web-rumors") return;
+  if (!mxHarFile.value) return notice.value = "请先选择登录后导出的 MX HAR 文件";
+  if (mxHarFile.value.size > 32 * 1024 * 1024) return notice.value = "HAR 文件过大，请只保留 MX 登录和消息请求";
+  mxHarImporting.value = true;
+  notice.value = "正在验证 MX HAR 并加密更新会话...";
+  try {
+    const result = await request(`/api/channels/${editingChannel.value.id}/import-mx-har`, {
+      method: "POST",
+      body: JSON.stringify({ har_text: await mxHarFile.value.text() }),
+    });
+    notice.value = `MX 会话已更新并通过验活，抽样读取 ${result.validated_snapshot_count} 条消息`;
+    closeChannelModal();
+    await refresh();
+  } catch (error) {
+    notice.value = `MX HAR 导入失败：${error.message}`;
+  } finally {
+    mxHarImporting.value = false;
+  }
+}
+
+function addGroupId() {
+  channelForm.group_ids.push("");
+}
+
+function removeGroupId(index) {
+  channelForm.group_ids.splice(index, 1);
+}
+
+function normalizeChannelForm() {
+  const groupMatch = channelForm.url.match(/\/group\/(\d+)/);
+  if (groupMatch && !channelForm.group_ids.includes(groupMatch[1])) channelForm.group_ids.push(groupMatch[1]);
+  channelForm.group_ids = channelForm.group_ids.map((id) => id.trim()).filter(Boolean);
+  channelForm.normalization_quality_threshold = Number(channelForm.normalization_quality_threshold);
+  channelForm.max_scrolls = Number(channelForm.max_scrolls);
+}
+
+function openReport(report) {
+  selectedReport.value = report;
+  reportModal.value = true;
+}
+
+function closeReport() {
+  reportModal.value = false;
+  selectedReport.value = "";
+}
+
+function escapeHtml(value) {
+  return value.replace(/[&<>"']/g, (character) => ({
+    "&": "&amp;",
+    "<": "&lt;",
+    ">": "&gt;",
+    '"': "&quot;",
+    "'": "&#039;",
+  }[character]));
+}
+
+function buildReportPreviewDocument(report) {
+  const text = (report || "").trim();
+  const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:; base-uri 'none'; form-action 'none';">`;
+  if (/<html(?:\s|>)/i.test(text) && /<body(?:\s|>)/i.test(text)) {
+    return /<head(?:\s|>)/i.test(text)
+      ? text.replace(/<head([^>]*)>/i, `<head$1>${csp}`)
+      : text.replace(/<html([^>]*)>/i, `<html$1><head>${csp}</head>`);
+  }
+  return `<!DOCTYPE html><html><head>${csp}<style>body{margin:0;padding:32px;background:#f8fafc;color:#1e293b;font-family:Inter,"Microsoft YaHei",sans-serif}.notice{margin-bottom:20px;padding:12px 14px;border:1px solid #f59e0b;border-radius:10px;background:#fffbeb;color:#92400e;font-size:13px}pre{white-space:pre-wrap;word-break:break-word;line-height:1.75;font-size:14px}</style></head><body><div class="notice">历史报告：生成于 HTML-only 红线启用之前，暂以纯文本兼容预览。重新生成后将使用 HTML 格式。</div><pre>${escapeHtml(text)}</pre></body></html>`;
+}
+
+function closeTopmostModal(event) {
+  if (event.key !== "Escape" || event.defaultPrevented) return;
+  if (reportModal.value) closeReport();
+  else if (normalizedModal.value) closeNormalizedItems();
+  else if (snapshotModal.value) closeSnapshots();
+  else if (channelModal.value) closeChannelModal();
+  else return;
+  event.preventDefault();
+}
+
+let refreshTimer;
+onMounted(async () => {
+  window.addEventListener("keydown", closeTopmostModal);
+  await refresh();
+  refreshTimer = setInterval(() => refresh().catch(() => {}), 5000);
+});
+onUnmounted(() => {
+  window.removeEventListener("keydown", closeTopmostModal);
+  clearInterval(refreshTimer);
+});
+</script>
+
+<template>
+  <div class="flex min-h-screen bg-[#080d16] text-slate-200">
+    <aside class="fixed inset-y-0 left-0 z-20 flex w-64 flex-col border-r border-white/[.06] bg-[#0b111c]/95 px-3 py-5 backdrop-blur-2xl">
+      <div class="flex items-center gap-3 px-3 pb-7">
+        <div class="flex h-11 w-11 items-center justify-center rounded-2xl bg-gradient-to-br from-teal-300 to-cyan-500 text-lg font-bold text-slate-950 shadow-[0_0_28px_rgba(45,212,191,.22)]">A</div>
+        <div>
+          <p class="font-semibold tracking-wide text-white">AlphaDesk</p>
+          <p class="mt-0.5 text-xs text-teal-300">A-Share Agent</p>
+        </div>
+      </div>
+
+      <nav class="space-y-1">
+        <button v-for="item in navItems" :key="item.id" @click="activePage=item.id" class="group flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left transition" :class="activePage===item.id?'bg-white/[.08] text-white shadow-inner shadow-white/[.025]':'text-slate-500 hover:bg-white/[.035] hover:text-slate-300'">
+          <svg class="h-5 w-5 shrink-0" :class="activePage===item.id?'text-teal-300':'text-slate-500 group-hover:text-slate-300'" fill="none" stroke="currentColor" stroke-width="1.7" viewBox="0 0 24 24">
+            <path v-if="item.icon==='grid'" d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/>
+            <path v-else-if="item.icon==='file'" d="M6 3h9l3 3v15H6zM9 11h6M9 15h6"/>
+            <path v-else-if="item.icon==='cpu'" d="M8 8h8v8H8zM9 1v3m6-3v3M9 20v3m6-3v3M20 9h3m-3 6h3M1 9h3m-3 6h3"/>
+            <path v-else-if="item.icon==='radio'" d="M12 12h.01M8.5 8.5a5 5 0 0 0 0 7m7-7a5 5 0 0 1 0 7M5 5a10 10 0 0 0 0 14m14-14a10 10 0 0 1 0 14"/>
+            <path v-else-if="item.icon==='audit'" d="M5 4h14v16H5zM8 8h8M8 12h8M8 16h5"/>
+            <path v-else-if="item.icon==='spark'" d="m12 2 1.8 6.2L20 10l-6.2 1.8L12 18l-1.8-6.2L4 10l6.2-1.8zM19 17l.7 2.3L22 20l-2.3.7L19 23l-.7-2.3L16 20l2.3-.7z"/>
+            <path v-else d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7zM19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1-2.8 2.8-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5v.1h-4v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.9.3l-.1.1L4.2 17l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3v-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.9L4.2 7 7 4.2l.1.1a1.7 1.7 0 0 0 1.9.3 1.7 1.7 0 0 0 1-1.5V3h4v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1L19.8 7l-.1.1a1.7 1.7 0 0 0-.3 1.9 1.7 1.7 0 0 0 1.5 1h.1v4h-.1a1.7 1.7 0 0 0-1.5 1z"/>
+          </svg>
+          <div>
+            <p class="text-sm font-medium">{{ item.label }}</p>
+            <p class="mt-0.5 text-[10px] uppercase tracking-[.14em] text-slate-600">{{ item.hint }}</p>
+          </div>
+        </button>
+      </nav>
+
+      <div class="mt-auto rounded-2xl border border-white/[.06] bg-white/[.025] p-3">
+        <div class="flex items-center gap-2">
+          <span class="h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_12px_#34d399]"></span>
+          <p class="text-xs text-slate-300">本地服务运行中</p>
+        </div>
+        <p class="mt-2 text-[10px] tracking-wide text-slate-600">127.0.0.1:8765</p>
+      </div>
+    </aside>
+
+    <main class="ml-64 min-h-screen flex-1">
+      <header class="sticky top-0 z-10 flex h-[82px] items-center justify-between border-b border-white/[.06] bg-[#080d16]/80 px-8 backdrop-blur-2xl">
+        <div>
+          <h1 class="text-xl font-semibold text-white">{{ pageTitle }}</h1>
+          <p class="mt-1 text-xs text-slate-500">{{ pageSubtitle }}</p>
+        </div>
+        <div class="flex items-center gap-3">
+          <span class="rounded-full border border-teal-400/15 bg-teal-400/[.06] px-3 py-1.5 text-xs text-teal-200">Agent Ready</span>
+          <div class="flex h-9 w-9 items-center justify-center rounded-full bg-gradient-to-br from-slate-700 to-slate-800 text-xs font-semibold text-white">AD</div>
+        </div>
+      </header>
+
+      <div class="mx-auto max-w-[1480px] p-8">
+        <div v-if="notice" class="mb-5 rounded-2xl border border-teal-400/20 bg-teal-400/[.08] px-4 py-3 text-sm text-teal-100">{{ notice }}</div>
+
+        <template v-if="activePage==='dashboard'">
+          <section class="mb-5 grid grid-cols-4 gap-4">
+            <div v-for="[label,value,detail] in [['工具就绪', readyTools + '/' + data.tools.length, '按采集优先级编排'],['待配置渠道', pendingChannels, '浏览器登录态渠道'],['已加载 Skills', data.skills.length, '领域能力可持续扩展'],['审查队列', data.tasks.filter(x=>x.status==='review').length, '等待人工复核']]" :key="label" class="panel p-5">
+              <p class="text-sm text-slate-500">{{ label }}</p>
+              <p class="mt-3 text-3xl font-semibold text-white">{{ value }}</p>
+              <p class="mt-2 text-xs text-slate-600">{{ detail }}</p>
+            </div>
+          </section>
+
+          <section class="grid grid-cols-[1.3fr_.7fr] gap-5">
+            <div class="space-y-5">
+              <div class="panel p-5">
+                <div class="mb-4">
+                  <h2 class="section-title">个股研究任务</h2>
+                  <p class="mt-1 text-xs text-slate-500">实时交给大模型分析。本地端只聚合最近信源快照，不执行本地分析。</p>
+                </div>
+                <div class="grid grid-cols-[1fr_1.2fr] gap-3">
+                  <input v-model="task.target" placeholder="股票代码 / 公司名称，例如 300308 中际旭创" class="field" />
+                  <input v-model="task.title" class="field" />
+                </div>
+                <textarea v-model="task.objective" rows="3" class="field mt-3 w-full"></textarea>
+                <div class="mt-3 grid grid-cols-2 gap-3">
+                  <select v-model="task.skill_name" class="field">
+                    <option v-for="skill in data.skills" :key="skill.name" :value="skill.name">{{ skill.name }}</option>
+                  </select>
+                  <label class="relative">
+                    <input v-model.number="task.lookback_days" type="number" min="1" max="30" step="1" class="field pr-12" />
+                    <span class="pointer-events-none absolute right-4 top-1/2 -translate-y-1/2 text-xs text-slate-500">天</span>
+                  </label>
+                </div>
+                <button @click="createTask" class="primary mt-3">加入研究队列</button>
+              </div>
+
+              <div class="panel p-5">
+                <div class="mb-4 flex items-center justify-between">
+                  <h2 class="section-title">最近任务</h2>
+                  <button @click="activePage='tasks'" class="text-xs text-teal-300 hover:text-teal-200">查看全部</button>
+                </div>
+                <div v-if="!data.tasks.length" class="empty">还没有研究任务</div>
+                <div v-for="item in data.tasks.slice(0,4)" :key="item.id" class="list-row">
+                  <div>
+                    <p class="text-sm font-medium text-white">{{ item.target }} · {{ item.title }}</p>
+                    <p class="mt-1 text-xs text-slate-600">{{ item.created_at }} · {{ item.status }}</p>
+                  </div>
+                  <button v-if="item.report" @click="openReport(item.report)" class="report-action">查看报告</button>
+                  <button v-else-if="canRunTask(item)" @click="runTask(item.id)" class="secondary">{{ taskActionLabel(item) }}</button>
+                  <span v-else class="status-warn">{{ taskActionLabel(item) }}</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="space-y-5">
+              <div class="panel p-5">
+                <div class="mb-4 flex items-center justify-between">
+                  <h2 class="section-title">系统状态</h2>
+                  <span class="status-good">运行中</span>
+                </div>
+                <div class="space-y-3">
+                  <div class="metric"><span>模型供应商</span><strong :class="data.provider?.configured?'text-emerald-300':'text-amber-300'">{{ data.provider?.configured ? data.provider.name + ' · 已配置' : '待配置' }}</strong></div>
+                  <div class="metric"><span>Browser 插件</span><strong>{{ data.codex_policy?.browser_enabled ? 'enabled' : 'disabled' }}</strong></div>
+                  <div class="metric"><span>本地分析</span><strong class="text-emerald-300">{{ data.research_red_lines?.analysis?.local_analysis_enabled ? 'enabled' : 'disabled · AI only' }}</strong></div>
+                  <div class="metric"><span>在线信源</span><strong>{{ data.channels.filter(x=>x.status==='online').length }}/{{ data.channels.length }}</strong></div>
+                  <div class="metric"><span>Python 工具箱</span><strong>{{ data.codex_policy?.python_toolbox || '-' }}</strong></div>
+                  <div class="metric"><span>默认推理模型</span><strong>{{ data.codex_policy?.model || '-' }}</strong></div>
+                </div>
+              </div>
+              <div class="panel p-5">
+                <h2 class="section-title mb-4">采集优先级</h2>
+                <div v-for="tool in data.tools" :key="tool.id" class="mb-3 flex items-center gap-3 last:mb-0">
+                  <div class="flex h-7 w-7 items-center justify-center rounded-lg bg-white/[.05] text-xs text-teal-300">{{ tool.priority }}</div>
+                  <div class="min-w-0">
+                    <p class="text-sm text-slate-200">{{ tool.name }}</p>
+                    <p class="truncate text-xs text-slate-600">{{ tool.detail }}</p>
+                  </div>
+                </div>
+              </div>
+              <div class="panel p-5">
+                <div class="mb-4 flex items-center justify-between">
+                  <h2 class="section-title">信源状态</h2>
+                  <button @click="activePage='channels'" class="text-xs text-teal-300 hover:text-teal-200">管理渠道</button>
+                </div>
+                <div v-for="channel in data.channels" :key="channel.id" class="mb-3 flex items-center justify-between text-xs last:mb-0">
+                  <span class="text-slate-400">{{ channelDisplayName(channel) }}</span>
+                  <span :class="channel.status==='online'?'status-good':'status-warn'">{{ channel.status }}</span>
+                </div>
+              </div>
+            </div>
+          </section>
+        </template>
+
+        <template v-else-if="activePage==='tasks'">
+          <section class="panel p-5">
+            <div class="mb-5 flex items-center justify-between">
+              <h2 class="section-title">研究任务队列</h2>
+              <div class="flex items-center gap-2">
+                <button v-if="data.tasks.length" @click="clearTaskList('research')" :disabled="taskListCleanupSubmitting" class="rounded-xl border border-rose-400/35 bg-rose-400/[.08] px-3 py-2 text-xs font-semibold text-rose-200 transition hover:bg-rose-400/[.16] disabled:cursor-wait disabled:opacity-60">清空研究任务</button>
+                <button @click="activePage='dashboard'" class="primary">新建研究任务</button>
+              </div>
+            </div>
+            <div v-if="!data.tasks.length" class="empty">还没有研究任务</div>
+            <div v-for="item in data.tasks" :key="item.id" class="list-row">
+              <div>
+                <p class="font-medium text-white">{{ item.target }} · {{ item.title }}</p>
+                <p class="mt-1 text-xs text-slate-600">{{ item.created_at }} · {{ item.status }}</p>
+                <p class="mt-2 text-xs text-slate-500">{{ item.objective }}</p>
+                <p v-if="item.agent_error" class="mt-2 text-xs text-rose-300">{{ item.agent_error }}</p>
+              </div>
+              <div class="flex shrink-0 items-center gap-2">
+                <button v-if="item.report" @click="openReport(item.report)" class="report-action">查看报告</button>
+                <button v-if="canRunTask(item)" @click="runTask(item.id)" class="secondary">{{ taskActionLabel(item) }}</button>
+                <span v-else-if="!item.report" class="status-warn">{{ taskActionLabel(item) }}</span>
+                <button @click="resetTask(item)" class="secondary">重置</button>
+                <button @click="deleteTask(item)" class="rounded-xl px-3 py-2 text-xs font-semibold text-rose-300 transition hover:bg-rose-400/10">删除</button>
+              </div>
+            </div>
+          </section>
+          <section class="panel mt-5 p-5">
+            <div class="mb-4">
+              <h2 class="section-title">信源数据采集与报告</h2>
+              <p class="mt-1 text-xs text-slate-500">严格按信源时间戳创建采集窗口。仅生成报告不会触碰远端信源。</p>
+            </div>
+            <div class="mb-3 grid grid-cols-3 gap-2">
+              <button v-for="option in sourceActionOptions" :key="option.value" @click="sourceJob.action=option.value" :disabled="sourceJobSubmitting" class="rounded-2xl border px-4 py-3 text-left transition disabled:cursor-wait disabled:opacity-60" :class="sourceJob.action===option.value?'border-teal-400/50 bg-teal-400/10 text-teal-100':'border-white/[.08] bg-black/10 text-slate-400 hover:border-white/[.16] hover:text-slate-200'">
+                <span class="block text-sm font-semibold">{{ option.label }}</span>
+                <span class="mt-1 block text-xs opacity-70">{{ option.hint }}</span>
+              </button>
+            </div>
+            <div class="flex items-center gap-4">
+              <label class="flex shrink-0 items-center gap-2">
+                <span class="text-xs text-slate-500">窗口天数</span>
+                <input v-model.number="sourceJob.lookback_days" :disabled="sourceJobSubmitting" type="number" min="1" max="30" step="1" class="field w-20 disabled:cursor-wait disabled:opacity-60" placeholder="1-30" />
+                <span class="text-xs text-slate-500">天</span>
+              </label>
+              <div class="min-w-0 flex-1 rounded-xl border border-teal-400/15 bg-teal-400/[.05] px-4 py-2">
+                <p class="text-xs font-semibold text-teal-200">独立信源聚合</p>
+                <p class="mt-1 text-xs text-slate-500">仅使用通用信源快照，不继承个股研究目标、Skill 或临时补采证据。</p>
+              </div>
+            </div>
+            <input v-model="sourceJob.report_title" :disabled="sourceJobSubmitting" class="field mt-3 w-full disabled:cursor-wait disabled:opacity-60" placeholder="报告标题" />
+            <div class="mt-4 flex flex-wrap gap-2">
+              <button v-for="channel in data.channels" :key="channel.id" @click="toggleSourceChannel(channel.id)" :disabled="sourceJobSubmitting" class="rounded-xl border px-3 py-2 text-xs transition disabled:cursor-wait disabled:opacity-60" :class="sourceJob.channel_ids.includes(channel.id)?'border-teal-400/50 bg-teal-400/10 text-teal-200':'border-white/[.08] text-slate-500 hover:text-slate-300'">
+                {{ channelDisplayName(channel) }} · {{ channel.status }}
+              </button>
+            </div>
+            <div class="mt-4 flex items-center gap-3">
+              <button @click="createSourceJob" :disabled="sourceJobSubmitting" class="primary flex items-center gap-2">
+                <span v-if="sourceJobSubmitting" class="h-3.5 w-3.5 animate-spin rounded-full border-2 border-teal-950/30 border-t-teal-950"></span>
+                {{ sourceJobSubmitLabel }}
+              </button>
+              <p v-if="sourceJobSubmitting" class="text-xs text-teal-200">请求处理中，请勿重复点击</p>
+            </div>
+            <div v-if="sourceJobFeedback" class="mt-3 rounded-xl border px-3 py-2 text-xs leading-5" :class="sourceJobFeedbackType==='error'?'border-rose-400/25 bg-rose-400/[.08] text-rose-200':sourceJobFeedbackType==='warn'?'border-amber-400/25 bg-amber-400/[.08] text-amber-200':sourceJobFeedbackType==='success'?'border-emerald-400/25 bg-emerald-400/[.08] text-emerald-200':'border-teal-400/20 bg-teal-400/[.08] text-teal-100'">
+              {{ sourceJobFeedback }}
+            </div>
+          </section>
+          <section class="panel mt-5 p-5">
+            <div class="mb-4 flex items-center justify-between">
+              <h2 class="section-title">信源采集与报告任务队列</h2>
+              <button v-if="data.source_jobs.length" @click="clearTaskList('source-jobs')" :disabled="taskListCleanupSubmitting" class="rounded-xl border border-rose-400/35 bg-rose-400/[.08] px-3 py-2 text-xs font-semibold text-rose-200 transition hover:bg-rose-400/[.16] disabled:cursor-wait disabled:opacity-60">清空信源任务</button>
+            </div>
+            <div v-if="!data.source_jobs.length" class="empty">还没有信源采集任务</div>
+            <div v-for="job in data.source_jobs" :key="job.id" class="list-row items-start">
+              <div class="min-w-0">
+                <p class="text-sm font-medium text-white">{{ job.report_title }}</p>
+                <p class="mt-1 text-xs text-slate-600">{{ job.created_at }} · {{ sourceJobActionLabel(job.action) }} · {{ sourceJobStatusLabel(job) }} · {{ sourceJobSnapshotLabel(job) }}</p>
+                <p class="mt-1 text-xs text-slate-600">信源：{{ jobChannelNames(job).join('、') }} · 窗口：{{ job.lookback_days }} 天</p>
+                <p v-if="job.report_anchor" class="mt-1 text-xs text-slate-600">报告数据锚点：{{ job.report_anchor }}</p>
+                <p v-if="job.error" class="mt-2 max-w-4xl break-all text-xs leading-5 text-rose-300">{{ job.error }}</p>
+              </div>
+              <div class="flex shrink-0 gap-2">
+                <button v-if="job.snapshot_count" @click="openSnapshots(job)" class="snapshot-action">查看快照</button>
+                <button v-if="job.report" @click="openReport(job.report)" class="report-action">查看报告</button>
+                <span v-if="job.status==='generating_report'" class="status-warn">报告生成中</span>
+                <button v-if="canRetrySourceJob(job)" @click="retrySourceJob(job)" class="secondary">{{ retrySourceJobLabel(job) }}</button>
+              </div>
+            </div>
+          </section>
+        </template>
+
+        <template v-else-if="activePage==='providers'">
+          <section class="grid grid-cols-[1.25fr_.75fr] gap-5">
+            <div class="panel overflow-hidden">
+              <div class="flex items-center justify-between border-b border-white/[.06] p-5">
+                <div>
+                  <h2 class="section-title">模型通道</h2>
+                  <p class="mt-1 text-xs text-slate-500">支持多个 OpenAI-compatible 模型。默认通道用于 Agent 编排与报告分析。</p>
+                </div>
+                <button @click="resetProviderForm" class="primary">添加模型</button>
+              </div>
+              <div v-if="!data.providers.length" class="empty m-5">尚未配置模型通道</div>
+              <div v-for="item in data.providers" :key="item.id" class="setting-row px-5 py-4">
+                <span class="min-w-0">
+                  <span class="flex items-center gap-2">
+                    <strong>{{ item.name }}</strong>
+                    <b v-if="item.is_default" class="status-good">默认</b>
+                    <b :class="item.status==='online'?'status-good':item.status==='failed'?'status-warn':'text-slate-600'" class="text-xs">{{ item.status }}</b>
+                    <b v-if="item.latency_ms" class="text-xs text-amber-300">{{ item.latency_ms }} ms</b>
+                  </span>
+                  <small class="truncate">{{ item.base_url }} · {{ item.model }}</small>
+                </span>
+                <div class="flex shrink-0 items-center gap-2">
+                  <button v-if="!item.is_default" @click="activateProvider(item.id)" class="secondary">设为默认</button>
+                  <button @click="testProvider(item.id)" class="secondary">测试</button>
+                  <button @click="editProvider(item)" class="secondary">编辑</button>
+                  <button @click="deleteProvider(item)" class="rounded-xl px-3 py-2 text-xs font-semibold text-rose-300 transition hover:bg-rose-400/10">删除</button>
+                  <button @click="toggleProvider(item)" class="relative h-6 w-11 rounded-full transition" :class="item.enabled?'bg-teal-400':'bg-white/[.1]'">
+                    <span class="absolute top-1 h-4 w-4 rounded-full bg-slate-950 transition" :class="item.enabled?'left-6':'left-1'"></span>
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div class="panel overflow-hidden">
+              <div class="border-b border-white/[.06] p-5">
+                <h2 class="section-title">{{ editingProviderId ? '编辑模型通道' : '添加模型通道' }}</h2>
+                <p class="mt-1 text-xs text-slate-500">API Key 仅在本地加密保存，读取时始终显示密文占位。</p>
+              </div>
+              <div class="space-y-4 p-5">
+                <label class="block"><span class="form-label">名称</span><input v-model="provider.name" placeholder="例如 DeepSeek" class="field mt-2 w-full" /></label>
+                <label class="block"><span class="form-label">Base URL</span><input v-model="provider.base_url" placeholder="https://api.deepseek.com" class="field mt-2 w-full" /></label>
+                <label class="block"><span class="form-label">API Key（密文占位）</span><input v-model="provider.api_key" placeholder="输入新的 API Key" class="field mt-2 w-full" /></label>
+                <label class="block"><span class="form-label">模型名称</span><input v-model="provider.model" placeholder="例如 deepseek-chat" class="field mt-2 w-full" /></label>
+                <label class="block"><span class="form-label">协议</span>
+                  <select v-model="provider.protocol" class="field mt-2 w-full">
+                    <option value="openai_chat_completions">OpenAI Chat Completions</option>
+                  </select>
+                </label>
+                <label class="block"><span class="form-label">额外参数 JSON</span><textarea v-model="provider.extra_body_text" rows="4" class="field mt-2 w-full"></textarea></label>
+                <label class="flex items-center gap-2 text-xs text-slate-400"><input v-model="provider.enabled" type="checkbox" /> 启用该模型通道</label>
+              </div>
+              <div class="flex gap-3 border-t border-white/[.06] p-5">
+                <button @click="saveProvider" :disabled="saving" class="primary">加密保存</button>
+                <button @click="resetProviderForm" class="secondary">清空</button>
+              </div>
+            </div>
+          </section>
+        </template>
+
+        <template v-else-if="activePage==='channels'">
+          <section class="panel overflow-hidden">
+            <div class="flex items-center justify-between border-b border-white/[.06] p-5">
+              <div>
+                <h2 class="section-title">信源渠道配置</h2>
+                <p class="mt-1 text-xs text-slate-500">公开数据优先，登录态和强反爬页面由持久化浏览器处理</p>
+              </div>
+              <div class="flex gap-2">
+                <button @click="checkAllChannels" class="secondary">巡检登录态</button>
+                <button @click="openChannelModal()" class="primary">添加渠道</button>
+              </div>
+            </div>
+            <div v-for="channel in data.channels" :key="channel.id" class="setting-row px-5 py-4">
+              <span>
+                <strong>{{ channelDisplayName(channel) }}</strong>
+                <small>{{ channel.type }} · {{ channelStatusDescription(channel) }}</small>
+                <small v-if="channel.group_ids?.length">星球 ID：{{ channel.group_ids.join('、') }}</small>
+                <small v-if="channel.id==='akshare'">组件：AkShare · BaoStock · TuShare{{ channel.market_data_config?.tushare_token_configured ? '（token 已加密保存）' : '（等待 token）' }}</small>
+                <small>整理策略：{{ channel.parsing_strategy }} · 质量阈值 {{ channel.normalization_quality_threshold }} · 最大滚动 {{ channel.max_scrolls }}</small>
+                <small>个股补证：{{ channel.research_enabled ? '允许' : '关闭' }}</small>
+                <small v-if="channel.last_check">上次检查：{{ channel.last_check }}</small>
+              </span>
+              <div class="flex items-center gap-3">
+                <span :class="channel.status==='online'?'status-good':'status-warn'">{{ channel.status }}</span>
+                <button @click="normalizeExistingChannel(channel)" class="secondary">整理已有快照</button>
+                <button v-if="channel.collection_mode==='playwright' || channel.id==='web-rumors' || channel.id==='akshare'" @click="checkChannel(channel)" class="secondary">检查状态</button>
+                <button @click="openChannelModal(channel)" class="secondary">配置</button>
+              </div>
+            </div>
+          </section>
+          <section class="panel mt-5 p-5">
+            <h2 class="section-title mb-4">采集工具注册表</h2>
+            <div class="grid grid-cols-2 gap-3">
+              <div v-for="tool in data.tools" :key="tool.id" class="rounded-2xl border border-white/[.06] bg-black/10 p-4">
+                <div class="flex items-center justify-between">
+                  <p class="font-medium text-slate-100">{{ tool.priority }}. {{ tool.name }}</p>
+                  <span :class="tool.status==='ready'?'status-good':'status-warn'">{{ tool.status }}</span>
+                </div>
+                <p class="mt-2 text-xs leading-5 text-slate-500">{{ tool.detail }}</p>
+              </div>
+            </div>
+          </section>
+        </template>
+
+        <template v-else-if="activePage==='audit'">
+          <section class="panel mb-5 p-5">
+            <div class="flex items-start justify-between gap-6">
+              <div>
+                <h2 class="section-title">库存管理</h2>
+                <p class="mt-1 text-xs leading-5 text-slate-500">集中管理本地快照和 HTML 报告。清空快照会同步删除结构化内容并重置采集水位，任务流水和审计记录仍会保留。</p>
+              </div>
+              <div class="flex shrink-0 gap-2">
+                <button @click="clearAuditInventory('snapshots')" :disabled="inventoryCleanupSubmitting" class="snapshot-action disabled:cursor-wait disabled:opacity-60">清空全部快照</button>
+                <button @click="clearAuditInventory('reports')" :disabled="inventoryCleanupSubmitting" class="report-action disabled:cursor-wait disabled:opacity-60">清空全部报告</button>
+                <button @click="clearAuditInventory('all')" :disabled="inventoryCleanupSubmitting" class="rounded-xl border border-rose-400/35 bg-rose-400/[.08] px-3 py-2 text-xs font-semibold text-rose-200 transition hover:bg-rose-400/[.16] disabled:cursor-wait disabled:opacity-60">清空快照与报告</button>
+              </div>
+            </div>
+            <div class="mt-4 grid grid-cols-4 gap-3">
+              <div class="rounded-xl border border-blue-400/15 bg-blue-400/[.05] px-4 py-3"><p class="text-xs text-slate-500">原始快照</p><p class="mt-1 text-xl font-semibold text-blue-200">{{ data.audit.inventory?.snapshot_count || 0 }}</p></div>
+              <div class="rounded-xl border border-teal-400/15 bg-teal-400/[.05] px-4 py-3"><p class="text-xs text-slate-500">结构化内容</p><p class="mt-1 text-xl font-semibold text-teal-200">{{ data.audit.inventory?.normalized_item_count || 0 }}</p></div>
+              <div class="rounded-xl border border-violet-400/15 bg-violet-400/[.05] px-4 py-3"><p class="text-xs text-slate-500">信源报告</p><p class="mt-1 text-xl font-semibold text-violet-200">{{ data.audit.inventory?.source_report_count || 0 }}</p></div>
+              <div class="rounded-xl border border-fuchsia-400/15 bg-fuchsia-400/[.05] px-4 py-3"><p class="text-xs text-slate-500">个股研究报告</p><p class="mt-1 text-xl font-semibold text-fuchsia-200">{{ data.audit.inventory?.research_report_count || 0 }}</p></div>
+            </div>
+          </section>
+          <section class="grid grid-cols-3 gap-5">
+            <div class="panel p-5">
+              <h2 class="section-title mb-4">信源水位</h2>
+              <div v-if="!data.audit.watermarks.length" class="empty">尚无成功采集水位</div>
+              <div v-for="item in data.audit.watermarks" :key="item.channel_id" class="list-row">
+                <div>
+                  <p class="text-sm font-medium text-white">{{ channelDisplayName(item) }}</p>
+                  <p v-if="item.scope_key" class="mt-1 text-xs text-slate-600">范围：{{ item.scope_key }}</p>
+                </div>
+                <p class="text-xs text-slate-400">{{ item.last_success_at }}</p>
+              </div>
+            </div>
+            <div class="panel p-5">
+              <h2 class="section-title mb-4">快照库存</h2>
+              <div v-if="!data.audit.snapshots.length" class="empty">尚无本地信源快照</div>
+              <div v-for="item in data.audit.snapshots" :key="item.channel_id" class="list-row">
+                <div>
+                  <p class="text-sm font-medium text-white">{{ channelDisplayName(item) }}</p>
+                  <p class="mt-1 text-xs text-slate-600">最近聚合：{{ item.last_collected_at }}</p>
+                </div>
+                <span class="status-good">{{ item.snapshot_count }} 条</span>
+              </div>
+            </div>
+            <div class="panel p-5">
+              <h2 class="section-title mb-4">结构化库存</h2>
+              <div v-if="!data.audit.normalized.length" class="empty">尚无整理后的结构化条目</div>
+              <div v-for="item in data.audit.normalized" :key="item.channel_id" class="list-row">
+                <div>
+                  <p class="text-sm font-medium text-white">{{ channelDisplayName(item) }}</p>
+                  <p class="mt-1 text-xs text-slate-600">平均质量：{{ item.average_quality ?? '-' }} · {{ item.last_normalized_at }}</p>
+                </div>
+                <button @click="openNormalizedItems({ channelId: item.channel_id, title: `${channelDisplayName(item)} · 结构化条目` })" class="secondary">{{ item.item_count }} 条</button>
+              </div>
+            </div>
+          </section>
+          <section class="panel mt-5 p-5">
+            <h2 class="section-title mb-4">采集任务流水</h2>
+            <div v-if="!data.audit.jobs.length" class="empty">尚无采集任务</div>
+            <div v-for="job in data.audit.jobs" :key="job.id" class="list-row items-start">
+              <div class="min-w-0">
+                <p class="text-sm font-medium text-white">{{ job.report_title }}</p>
+                <p class="mt-1 text-xs text-slate-600">{{ job.created_at }} · {{ job.action }} · {{ sourceJobStatusLabel(job) }} · {{ job.snapshot_count }} 条快照</p>
+                <p class="mt-1 text-xs text-slate-600">信源：{{ jobChannelNames(job).join('、') }}<span v-if="job.evidence_layer"> · Agent 层：{{ job.evidence_layer }}</span></p>
+                <p v-if="job.error" class="mt-2 text-xs text-rose-300">{{ job.error }}</p>
+              </div>
+              <div class="flex shrink-0 gap-2">
+                <button v-if="job.snapshot_count" @click="openSnapshots(job)" class="snapshot-action">查看快照</button>
+                <button v-if="job.report" @click="openReport(job.report)" class="report-action">查看报告</button>
+                <span v-if="job.status==='generating_report'" class="status-warn">报告生成中</span>
+                <button v-if="canRetrySourceJob(job)" @click="retrySourceJob(job)" class="secondary">{{ retrySourceJobLabel(job) }}</button>
+              </div>
+            </div>
+          </section>
+          <section class="panel mt-5 p-5">
+            <h2 class="section-title mb-4">Agent 证据推进</h2>
+            <div v-if="!data.audit.events.length" class="empty">尚无 Agent 证据事件</div>
+            <div v-for="event in data.audit.events" :key="event.id" class="list-row">
+              <div>
+                <p class="text-sm font-medium text-white">{{ event.event_type }} · {{ event.task_id }}</p>
+                <p class="mt-1 max-w-5xl break-all text-xs leading-5 text-slate-600">{{ event.detail }}</p>
+              </div>
+              <p class="whitespace-nowrap text-xs text-slate-500">{{ event.created_at }}</p>
+            </div>
+          </section>
+        </template>
+
+        <template v-else-if="activePage==='skills'">
+          <section class="panel overflow-hidden">
+            <div class="flex items-center justify-between border-b border-white/[.06] p-5">
+              <div>
+                <h2 class="section-title">已加载 Skills</h2>
+                <p class="mt-1 text-xs text-slate-500">领域能力从项目 skills 目录加载，后续可持续扩展</p>
+              </div>
+              <button class="primary">导入 Skill</button>
+            </div>
+            <div v-for="skill in data.skills" :key="skill.path" class="setting-row px-5 py-4">
+              <span>
+                <strong>{{ skill.name }}</strong>
+                <small>{{ skill.path }}</small>
+              </span>
+              <div class="flex items-center gap-3">
+                <span class="status-good">{{ skill.status }}</span>
+                <button class="secondary">查看详情</button>
+              </div>
+            </div>
+          </section>
+        </template>
+
+        <template v-else>
+          <section class="mb-5">
+            <h2 class="mb-3 text-sm font-semibold text-rose-300">核心红线</h2>
+            <div class="panel overflow-hidden border-rose-400/15">
+              <div class="setting-row px-5 py-4"><span><strong>禁止本地分析</strong><small>本地程序仅执行聚合、去重、时间窗口控制和证据传递。所有分析必须交给大模型。</small></span><b class="text-emerald-300">{{ data.research_red_lines?.analysis?.local_analysis_enabled ? '未生效' : '已强制生效' }}</b></div>
+              <div class="setting-row px-5 py-4"><span><strong>采集阶段 AI 仅允许整理</strong><small>原始快照先落库。模型仅可提取、拆分、去重、标注和评分，严禁在采集阶段分析，也严禁触发新的网络访问。</small></span><b class="text-emerald-300">{{ data.research_red_lines?.collection_normalization?.analysis_forbidden && data.research_red_lines?.collection_normalization?.preserve_raw_snapshot ? '已强制生效' : '未生效' }}</b></div>
+              <div class="setting-row px-5 py-4"><span><strong>信源报告与个股研究隔离</strong><small>通用信源报告仅读取 general 快照，不继承股票代码、个股研究目标、Skill 或临时补采证据。个股研究仍可读取通用快照并按证据链补采。</small></span><b class="text-emerald-300">{{ data.research_red_lines?.workflow_isolation?.source_reports_use_general_snapshots_only && data.research_red_lines?.workflow_isolation?.source_reports_forbid_research_task_context ? '已强制生效' : '未生效' }}</b></div>
+              <div class="setting-row px-5 py-4"><span><strong>模型知识库最后使用</strong><small>仅当外部证据链无法确认时允许使用，并强制标记为低置信推断。</small></span><b class="text-emerald-300">{{ data.research_red_lines?.analysis?.model_knowledge_last_resort ? '已强制生效' : '未生效' }}</b></div>
+              <div class="setting-row px-5 py-4"><span><strong>报告必须使用 HTML</strong><small>模型必须生成完整 HTML 文档。严禁 Markdown；非 HTML 报告会被服务端拒绝保存。</small></span><b class="text-emerald-300">{{ data.research_red_lines?.report_output?.format === 'html' && !data.research_red_lines?.report_output?.markdown_allowed ? '已强制生效' : '未生效' }}</b></div>
+              <div class="px-5 py-4">
+                <strong class="block text-sm text-slate-200">固定证据升级顺序</strong>
+                <div class="mt-3 flex flex-wrap items-center gap-2 text-xs">
+                  <template v-for="(source,index) in data.research_red_lines?.evidence_escalation?.ordered_sources || []" :key="source">
+                    <span class="rounded-lg border border-white/[.08] bg-black/10 px-3 py-2 text-slate-300">{{ source }}</span>
+                    <span v-if="index < data.research_red_lines.evidence_escalation.ordered_sources.length-1" class="text-slate-600">→</span>
+                  </template>
+                </div>
+              </div>
+            </div>
+          </section>
+          <section class="mb-5">
+            <div class="mb-3">
+              <h2 class="text-sm font-semibold text-slate-500">开发环境信息（只读）</h2>
+              <p class="mt-1 text-xs text-slate-600">来自项目配置，仅说明本地开发和工具环境，不参与研究 Agent 的供应商配置或分析决策。</p>
+            </div>
+            <div class="panel overflow-hidden">
+              <div class="setting-row px-5 py-4"><span><strong>Codex 开发辅助模型</strong><small>仅用于开发本工作台，不是业务研究模型。研究模型请在“模型供应商”中配置。</small></span><b>{{ data.codex_policy?.model || '-' }}</b></div>
+              <div class="setting-row px-5 py-4"><span><strong>Codex 推理强度</strong><small>仅影响开发辅助过程，不影响业务报告分析。</small></span><b>{{ data.codex_policy?.reasoning_effort || '-' }}</b></div>
+              <div class="setting-row px-5 py-4"><span><strong>Browser 开发插件</strong><small>用于开发调试和页面验证；业务登录态采集由本地 Playwright 渠道配置控制。</small></span><b class="text-emerald-300">{{ data.codex_policy?.browser_enabled ? 'enabled' : 'disabled' }}</b></div>
+              <div class="setting-row px-5 py-4"><span><strong>Python 工具箱</strong><small>辅助采集和结构化数据处理使用项目本地环境</small></span><b>{{ data.codex_policy?.python_toolbox || '-' }}</b></div>
+              <div class="setting-row px-5 py-4"><span><strong>Windows sandbox</strong><small>开发辅助过程的本地执行偏好</small></span><b>{{ data.codex_policy?.sandbox_preference || '-' }}</b></div>
+            </div>
+          </section>
+          <section>
+            <h2 class="mb-3 text-sm font-semibold text-slate-500">关于</h2>
+            <div class="panel overflow-hidden">
+              <div class="setting-row px-5 py-4"><span><strong>应用版本</strong><small>AShareHunter</small></span><b>0.1.0</b></div>
+              <div class="setting-row px-5 py-4"><span><strong>本地服务</strong><small>FastAPI Agent 编排服务</small></span><b class="text-emerald-300">127.0.0.1:8765</b></div>
+            </div>
+          </section>
+        </template>
+      </div>
+    </main>
+
+    <div v-if="reportModal" class="fixed inset-0 z-[60] flex items-center justify-center bg-black/75 p-6 backdrop-blur-sm" @click.self="closeReport">
+      <section class="flex max-h-[94vh] w-full max-w-6xl flex-col overflow-hidden rounded-3xl border border-white/[.12] bg-[#101a2a] shadow-2xl shadow-black/50">
+        <header class="flex items-center justify-between border-b border-white/[.08] px-6 py-5">
+          <div>
+            <h2 class="text-lg font-semibold text-white">HTML 报告预览</h2>
+            <p class="mt-1 text-xs text-slate-500">隔离预览 · 禁止脚本执行 · 新生成报告严禁 Markdown</p>
+          </div>
+          <button @click="closeReport" class="flex h-8 w-8 items-center justify-center rounded-full text-lg text-slate-500 transition hover:bg-white/[.06] hover:text-white">×</button>
+        </header>
+        <div class="bg-slate-100 p-3">
+          <iframe :srcdoc="reportPreviewDocument" sandbox="" referrerpolicy="no-referrer" title="HTML 报告预览" class="h-[78vh] w-full rounded-xl border-0 bg-white"></iframe>
+        </div>
+      </section>
+    </div>
+
+    <div v-if="snapshotModal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-6 backdrop-blur-sm" @click.self="closeSnapshots">
+      <section class="flex max-h-[90vh] w-full max-w-5xl flex-col overflow-hidden rounded-3xl border border-white/[.12] bg-[#101a2a] shadow-2xl shadow-black/40">
+        <header class="flex items-center justify-between border-b border-white/[.08] px-6 py-5">
+          <div>
+            <h2 class="text-lg font-semibold text-white">信源快照内容</h2>
+            <p class="mt-1 text-xs text-slate-500">{{ snapshotDetail.job?.report_title }} · {{ snapshotDetail.snapshots.length }} 条快照</p>
+          </div>
+          <button @click="closeSnapshots" class="flex h-8 w-8 items-center justify-center rounded-full text-lg text-slate-500 transition hover:bg-white/[.06] hover:text-white">×</button>
+        </header>
+        <div class="space-y-4 overflow-y-auto p-6">
+          <div v-if="!snapshotDetail.snapshots.length" class="empty">该任务没有关联到可查看的本地快照</div>
+          <article v-for="item in snapshotDetail.snapshots" :key="item.id" class="rounded-2xl border border-white/[.08] bg-black/15 p-4">
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p class="text-sm font-semibold text-teal-200">{{ channelDisplayName({ id: item.channel_id, name: item.channel_name }) }}</p>
+                <p class="mt-1 text-xs text-slate-500">发生时间：{{ item.occurred_at }} · 聚合时间：{{ item.collected_at }}</p>
+                <p class="mt-1 text-xs text-slate-500">整理状态：{{ item.normalization_status }} · {{ item.normalized_item_count }} 条结构化内容</p>
+              </div>
+              <a :href="item.source_url" target="_blank" class="max-w-xl break-all text-right text-xs text-teal-300 hover:text-teal-200">{{ item.source_url }}</a>
+            </div>
+            <div class="mt-3 flex gap-2">
+              <button @click="normalizeSnapshot(item)" class="secondary">重新整理</button>
+              <button v-if="item.normalized_item_count" @click="openNormalizedItems({ snapshotId: item.id, title: `${channelDisplayName({ id: item.channel_id, name: item.channel_name })} · 结构化条目` })" class="secondary">查看结构化内容</button>
+            </div>
+            <p v-if="item.normalization_error" class="mt-3 break-all text-xs leading-5 text-amber-300">{{ item.normalization_error }}</p>
+            <pre class="mt-4 max-h-[440px] overflow-auto whitespace-pre-wrap break-words rounded-xl bg-black/25 p-4 text-xs leading-6 text-slate-300">{{ formatSnapshotContent(item.content) }}</pre>
+          </article>
+        </div>
+      </section>
+    </div>
+
+    <div v-if="normalizedModal" class="fixed inset-0 z-[55] flex items-center justify-center bg-black/70 p-6 backdrop-blur-sm" @click.self="closeNormalizedItems">
+      <section class="flex max-h-[90vh] w-full max-w-5xl flex-col overflow-hidden rounded-3xl border border-white/[.12] bg-[#101a2a] shadow-2xl shadow-black/40">
+        <header class="flex items-center justify-between border-b border-white/[.08] px-6 py-5">
+          <div>
+            <h2 class="text-lg font-semibold text-white">{{ normalizedDetail.title }}</h2>
+            <p class="mt-1 text-xs text-slate-500">{{ normalizedDetail.items.length }} 条 · 仅展示字段提取和原文拆分结果，不包含本地分析</p>
+          </div>
+          <button @click="closeNormalizedItems" class="flex h-8 w-8 items-center justify-center rounded-full text-lg text-slate-500 transition hover:bg-white/[.06] hover:text-white">×</button>
+        </header>
+        <div class="space-y-4 overflow-y-auto p-6">
+          <div v-if="!normalizedDetail.items.length" class="empty">尚无结构化条目</div>
+          <article v-for="item in normalizedDetail.items" :key="item.id" class="rounded-2xl border border-white/[.08] bg-black/15 p-4">
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p class="text-sm font-semibold text-teal-200">{{ item.title || channelDisplayName({ id: item.channel_id, name: item.channel_name }) }}</p>
+                <p class="mt-1 text-xs text-slate-500">{{ item.occurred_at }} · {{ item.author || '未标注作者' }} · {{ item.normalization_mode }}</p>
+              </div>
+              <span class="status-good">质量 {{ item.quality_score }}</span>
+            </div>
+            <a v-if="item.source_url" :href="item.source_url" target="_blank" class="mt-3 block break-all text-xs text-teal-300 hover:text-teal-200">{{ item.source_url }}</a>
+            <pre class="mt-4 max-h-[360px] overflow-auto whitespace-pre-wrap break-words rounded-xl bg-black/25 p-4 text-xs leading-6 text-slate-300">{{ item.content }}</pre>
+          </article>
+        </div>
+      </section>
+    </div>
+
+    <div v-if="channelModal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6 backdrop-blur-sm" @click.self="closeChannelModal">
+      <section class="flex max-h-[94vh] w-full max-w-2xl flex-col overflow-hidden rounded-3xl border border-white/[.12] bg-[#101a2a] shadow-2xl shadow-black/40">
+        <header class="flex items-center justify-between border-b border-white/[.08] px-6 py-5">
+          <div>
+            <h2 class="text-lg font-semibold text-white">{{ editingChannel ? '配置渠道' : '添加渠道' }}</h2>
+            <p class="mt-1 text-xs text-slate-500">保存渠道入口、采集方式和当前可用状态</p>
+          </div>
+          <button @click="closeChannelModal" class="flex h-8 w-8 items-center justify-center rounded-full text-lg text-slate-500 transition hover:bg-white/[.06] hover:text-white">×</button>
+        </header>
+
+        <div class="grid grid-cols-2 gap-4 overflow-y-auto p-6">
+          <label>
+            <span class="form-label">渠道名称</span>
+            <input v-model="channelForm.name" placeholder="例如 知识星球" class="field mt-2 w-full" />
+          </label>
+          <label>
+            <span class="form-label">渠道类型</span>
+            <input v-model="channelForm.type" placeholder="例如 登录态信息差" class="field mt-2 w-full" />
+          </label>
+          <label class="col-span-2">
+            <span class="form-label">入口 URL</span>
+            <input v-model="channelForm.url" placeholder="https://...；个股补证入口可使用 {query}" class="field mt-2 w-full" />
+            <small class="mt-1 block text-xs leading-5 text-slate-600">需要按股票动态检索时，可在 URL 中使用 <code>{query}</code>。HTTP requests 和 Playwright 都会在个股补证时替换为股票代码或名称。</small>
+          </label>
+          <label v-if="channelForm.collection_mode==='playwright'" class="col-span-2">
+            <span class="form-label">登录态检查 URL</span>
+            <input v-model="channelForm.validation_url" placeholder="留空时使用入口 URL" class="field mt-2 w-full" />
+          </label>
+          <label>
+            <span class="form-label">采集方式</span>
+            <select v-model="channelForm.collection_mode" class="field mt-2 w-full">
+              <option value="akshare">AkShare 模块</option>
+              <option value="industry_news">产业趋势公开资讯</option>
+              <option value="requests">HTTP requests</option>
+              <option value="playwright">Playwright 持久化浏览器</option>
+              <option value="manual">人工补充</option>
+            </select>
+          </label>
+          <label>
+            <span class="form-label">渠道状态</span>
+            <select v-model="channelForm.status" class="field mt-2 w-full">
+              <option value="online">可用 online</option>
+              <option value="pending">待配置 pending</option>
+              <option value="offline">离线 offline</option>
+            </select>
+          </label>
+          <label>
+            <span class="form-label">快照整理策略</span>
+            <select v-model="channelForm.parsing_strategy" class="field mt-2 w-full">
+              <option value="fixed">固定规则 fixed</option>
+              <option value="hybrid">AI 整理失败时降级 hybrid</option>
+              <option value="ai">仅 AI 整理 ai</option>
+            </select>
+          </label>
+          <label>
+            <span class="form-label">整理质量阈值</span>
+            <input v-model.number="channelForm.normalization_quality_threshold" type="number" min="0" max="100" class="field mt-2 w-full" />
+          </label>
+          <div v-if="editingChannel?.id==='akshare'" class="col-span-2 rounded-2xl border border-teal-400/20 bg-teal-400/[.04] p-4">
+            <span class="form-label">市场数据组件</span>
+            <p class="mt-1 text-xs leading-5 text-slate-500">AkShare 优先，BaoStock 和 TuShare 作为补充来源。组件并行执行且独立限时，单个上游异常不会阻塞全部市场数据。</p>
+            <div class="mt-3 grid grid-cols-3 gap-3">
+              <label class="rounded-xl border border-white/[.07] bg-black/10 px-3 py-3 text-xs text-slate-300"><input v-model="marketDataForm.enable_akshare" type="checkbox" class="mr-2" />AkShare</label>
+              <label class="rounded-xl border border-white/[.07] bg-black/10 px-3 py-3 text-xs text-slate-300"><input v-model="marketDataForm.enable_baostock" type="checkbox" class="mr-2" />BaoStock</label>
+              <label class="rounded-xl border border-white/[.07] bg-black/10 px-3 py-3 text-xs text-slate-300"><input v-model="marketDataForm.enable_tushare" type="checkbox" class="mr-2" />TuShare</label>
+            </div>
+            <label class="mt-3 block">
+              <span class="form-label">TuShare token</span>
+              <input v-model="marketDataForm.tushare_token" type="password" :placeholder="marketDataForm.tushare_token_configured ? '已加密保存；保留密文即可' : '填写 TuShare token；仅在本机加密保存'" class="field mt-2 w-full" />
+              <small class="mt-1 block text-xs leading-5 text-slate-600">接口只回显掩码，不会把 token 明文发送回页面。未配置 token 时，TuShare 自动跳过。</small>
+            </label>
+            <div class="mt-3 flex items-center gap-4">
+              <label class="text-xs text-slate-400"><input v-model="marketDataForm.clear_tushare_token" type="checkbox" class="mr-2" />清除已保存 token</label>
+              <label class="flex items-center gap-2 text-xs text-slate-400">单组件超时
+                <input v-model.number="marketDataForm.component_timeout_seconds" type="number" min="5" max="120" class="field w-20" />
+                秒
+              </label>
+            </div>
+          </div>
+          <label class="flex items-center gap-3 rounded-2xl border border-white/[.07] bg-black/10 px-4 py-3">
+            <input v-model="channelForm.research_enabled" type="checkbox" />
+            <span>
+              <strong class="block text-sm text-slate-200">允许用于个股补证</strong>
+              <small class="mt-1 block text-xs leading-5 text-slate-600">仅对个股研究 Agent 生效。通用 TG、MX、知识星球渠道通常保持关闭，避免重复采集。</small>
+            </span>
+          </label>
+          <label v-if="channelForm.collection_mode==='playwright'">
+            <span class="form-label">最大滚动次数</span>
+            <input v-model.number="channelForm.max_scrolls" type="number" min="1" max="30" class="field mt-2 w-full" />
+          </label>
+          <div class="rounded-2xl border border-white/[.07] bg-black/10 p-3 text-xs leading-5 text-slate-500">
+            原始快照始终先落库。AI 仅整理字段和拆分条目，不允许分析，也不会触发新的远端采集。
+          </div>
+          <label v-if="channelForm.collection_mode==='playwright'" class="col-span-2">
+            <span class="form-label">登录后 URL 包含</span>
+            <input v-model="channelForm.success_url_contains" placeholder="例如 /group/ 或 dashboard" class="field mt-2 w-full" />
+          </label>
+          <label v-if="channelForm.collection_mode==='playwright'" class="col-span-2">
+            <span class="form-label">登录后页面选择器（可选，优先级更高）</span>
+            <input v-model="channelForm.success_selector" placeholder="例如 .user-avatar 或 [data-testid=user-menu]" class="field mt-2 w-full" />
+          </label>
+          <div v-if="editingChannel?.id==='zsxq' || channelForm.name.includes('知识星球')" class="col-span-2 rounded-2xl border border-white/[.07] bg-black/10 p-4">
+            <div class="flex items-center justify-between">
+              <div>
+                <span class="form-label">星球 ID 列表</span>
+                <p class="mt-1 text-xs text-slate-600">支持配置一个或多个星球，采集器将逐个访问对应 `/group/&lt;id&gt;` 页面。</p>
+              </div>
+              <button @click="addGroupId" type="button" class="secondary">添加 ID</button>
+            </div>
+            <div v-if="!channelForm.group_ids.length" class="mt-3 rounded-xl border border-dashed border-white/[.1] px-3 py-4 text-center text-xs text-slate-600">尚未配置星球 ID</div>
+            <div v-for="(_, index) in channelForm.group_ids" :key="index" class="mt-3 flex gap-2">
+              <input v-model="channelForm.group_ids[index]" placeholder="例如 28888222124181" class="field flex-1" />
+              <button @click="removeGroupId(index)" type="button" class="rounded-xl px-3 text-xs font-semibold text-rose-300 transition hover:bg-rose-400/10">移除</button>
+            </div>
+          </div>
+          <div v-if="editingChannel?.id==='web-rumors'" class="col-span-2 rounded-2xl border border-teal-400/20 bg-teal-400/[.04] p-4">
+            <span class="form-label">MX 登录会话 HAR 导入</span>
+            <p class="mt-1 text-xs leading-5 text-slate-500">MX 掉线后，在浏览器重新登录并导出 HAR。这里会先实时验活，再加密替换本地会话；失败文件不会覆盖当前配置。</p>
+            <div class="mt-3 flex flex-wrap items-center gap-3">
+              <label class="secondary cursor-pointer">
+                <input type="file" accept=".har,application/json" class="hidden" @change="selectMxHar" />
+                选择 HAR 文件
+              </label>
+              <span class="max-w-sm truncate text-xs text-slate-400">{{ mxHarFile?.name || '尚未选择文件' }}</span>
+              <button type="button" class="primary" :disabled="mxHarImporting" @click="importMxHar">{{ mxHarImporting ? '正在验证...' : '验证并导入 HAR' }}</button>
+            </div>
+          </div>
+          <label class="col-span-2">
+            <span class="form-label">备注</span>
+            <textarea v-model="channelForm.notes" rows="3" placeholder="登录状态、采集规则、待处理事项..." class="field mt-2 w-full"></textarea>
+          </label>
+        </div>
+
+        <footer class="flex items-center justify-between border-t border-white/[.08] px-6 py-4">
+          <button v-if="editingChannel && !editingChannel.builtin" @click="deleteChannel" class="rounded-xl px-3 py-2 text-xs font-semibold text-rose-300 transition hover:bg-rose-400/10">删除渠道</button>
+          <span v-else class="text-xs text-slate-600">{{ editingChannel?.builtin ? '内置渠道不可删除' : '' }}</span>
+          <div class="flex gap-3">
+            <button v-if="editingChannel && channelForm.collection_mode==='playwright'" @click="openChannelLogin" class="secondary">保存并打开登录窗口</button>
+            <button @click="closeChannelModal" class="secondary">取消</button>
+            <button @click="saveChannel()" class="primary">保存配置</button>
+          </div>
+        </footer>
+      </section>
+    </div>
+  </div>
+</template>

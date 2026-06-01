@@ -1,0 +1,17 @@
+# Project-local projection of the Codex backup configuration.
+# Machine-specific marketplace paths and trust entries intentionally stay global.
+
+[model_defaults]
+model = "gpt-5.5"
+reasoning_effort = "medium"
+
+[plugins]
+browser_enabled = true
+
+[windows]
+sandbox_preference = "elevated"
+
+[tooling]
+python_toolbox = ".venv"
+market_data_priority = ["akshare", "requests", "playwright", "other"]
+
