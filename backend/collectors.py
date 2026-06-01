@@ -179,8 +179,6 @@ def collect_akshare(channel: dict[str, Any], window: dict[str, str], query: str 
             diagnostics[component] = {key: value for key, value in outcome.items() if key != "payload"}
             if outcome["status"] == "ok":
                 results[component] = outcome["payload"]
-    if not results:
-        raise RuntimeError(f"Market data aggregate returned no usable components: {json.dumps(diagnostics, ensure_ascii=False)}")
     content = json.dumps(
         {
             "adapter": "market_data_aggregate",
@@ -189,6 +187,7 @@ def collect_akshare(channel: dict[str, Any], window: dict[str, str], query: str 
             "component_priority": ["akshare", "baostock", "tushare"],
             "component_diagnostics": diagnostics,
             "components": results,
+            "collection_warning": "" if results else "No market data component returned usable datasets",
         },
         ensure_ascii=False,
         default=str,
@@ -333,50 +332,82 @@ def collect_http(channel: dict[str, Any], window: dict[str, str], query: str = "
     content_type = response.headers.get("content-type", "")
     response_text = response.text
     if "t.me/s/" in response.url:
-        soup = BeautifulSoup(response_text, "html.parser")
         snapshots: list[dict[str, str]] = []
-        for item in soup.select(".tgme_widget_message[data-post]"):
-            post_ref = str(item.get("data-post") or "").strip()
-            time_tag = item.select_one("time[datetime]")
-            occurred_at = str(time_tag.get("datetime") if time_tag else "").strip()
-            if not post_ref or not occurred_at:
-                continue
-            links = sorted(
-                {
-                    urljoin(response.url, href)
-                    for href in (tag.get("href") for tag in item.select("a[href]"))
-                    if href and not href.startswith("javascript:")
-                }
-            )
-            media = sorted(
-                {
-                    urljoin(response.url, source)
-                    for source in (tag.get("src") for tag in item.select("[src]"))
-                    if source and not source.startswith("data:")
-                }
-            )
-            payload = {
-                "platform": "telegram_public_preview",
-                "channel": post_ref.split("/", 1)[0],
-                "post_id": post_ref,
-                "collection_window": window,
-                "query": query,
-                "occurred_at": occurred_at,
-                "text": re.sub(r"\s+", " ", item.get_text(" ", strip=True)),
-                "links": links,
-                "media": media,
-                "raw_html": str(item)[:80_000],
-            }
-            snapshots.append(
-                snapshot(
-                    channel["id"],
-                    f"https://t.me/{post_ref}",
-                    json.dumps(payload, ensure_ascii=False, default=str),
-                    occurred_at,
+        window_start = datetime.fromisoformat(window["window_start"])
+        window_end = datetime.fromisoformat(window["window_end"])
+        page_url = response.url.split("?", 1)[0]
+        page_text = response_text
+        seen_posts: set[str] = set()
+        reached_window_start = False
+        for page_number in range(30):
+            soup = BeautifulSoup(page_text, "html.parser")
+            oldest_post_id: int | None = None
+            timestamped_posts = 0
+            for item in soup.select(".tgme_widget_message[data-post]"):
+                post_ref = str(item.get("data-post") or "").strip()
+                time_tag = item.select_one("time[datetime]")
+                occurred_at = str(time_tag.get("datetime") if time_tag else "").strip()
+                if not post_ref or not occurred_at or post_ref in seen_posts:
+                    continue
+                seen_posts.add(post_ref)
+                try:
+                    post_number = int(post_ref.rsplit("/", 1)[-1])
+                    oldest_post_id = min(oldest_post_id, post_number) if oldest_post_id else post_number
+                    occurred = datetime.fromisoformat(occurred_at.replace("Z", "+00:00")).astimezone(window_start.tzinfo)
+                except (TypeError, ValueError):
+                    continue
+                timestamped_posts += 1
+                if occurred < window_start:
+                    reached_window_start = True
+                    continue
+                if occurred > window_end:
+                    continue
+                links = sorted(
+                    {
+                        urljoin(page_url, href)
+                        for href in (tag.get("href") for tag in item.select("a[href]"))
+                        if href and not href.startswith("javascript:")
+                    }
                 )
+                media = sorted(
+                    {
+                        urljoin(page_url, source)
+                        for source in (tag.get("src") for tag in item.select("[src]"))
+                        if source and not source.startswith("data:")
+                    }
+                )
+                payload = {
+                    "platform": "telegram_public_preview",
+                    "channel": post_ref.split("/", 1)[0],
+                    "post_id": post_ref,
+                    "collection_window": window,
+                    "query": query,
+                    "occurred_at": occurred.isoformat(timespec="seconds"),
+                    "text": re.sub(r"\s+", " ", item.get_text(" ", strip=True)),
+                    "links": links,
+                    "media": media,
+                    "raw_html": str(item)[:80_000],
+                }
+                snapshots.append(
+                    snapshot(
+                        channel["id"],
+                        f"https://t.me/{post_ref}",
+                        json.dumps(payload, ensure_ascii=False, default=str),
+                        occurred.isoformat(timespec="seconds"),
+                    )
+                )
+            if reached_window_start or not oldest_post_id or not timestamped_posts:
+                break
+            if page_number == 29:
+                raise RuntimeError("Telegram pagination limit reached before the requested window start")
+            time.sleep(0.8)
+            older_response = requests.get(
+                f"{page_url}?before={oldest_post_id}",
+                timeout=30,
+                headers={"User-Agent": "AlphaDesk/0.1"},
             )
-        if not snapshots:
-            raise RuntimeError("Telegram public preview returned no timestamped posts")
+            older_response.raise_for_status()
+            page_text = older_response.text
         return snapshots
     payload: dict[str, Any] = {
         "collection_window": window,

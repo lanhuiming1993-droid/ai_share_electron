@@ -82,6 +82,11 @@ function channelStatusDescription(channel) {
 function jobChannelNames(job) {
   return job.channel_names?.length ? job.channel_names : (job.channel_ids || []).map(channelDisplayName);
 }
+function sourceRunSummary(job) {
+  return (job.runs || [])
+    .map((run) => `${channelDisplayName(run.channel_id)}：${sourceJobStatusLabel(run)}`)
+    .join(" · ");
+}
 const sourceActionOptions = [
   { value: "collect", label: "仅采集数据", hint: "保存原始快照，按渠道策略整理，不生成分析报告" },
   { value: "collect_report", label: "采集并生成报告", hint: "采集完成后交给 AI 分析" },
@@ -211,13 +216,13 @@ async function createSourceJob() {
   try {
     const result = await request("/api/source-jobs", { method: "POST", body: JSON.stringify(sourceJob) });
     const message = result.deduplicated && result.action === "report"
-      ? result.status === "generating"
+      ? result.status === "generating_report"
         ? "相同参数的报告任务正在生成中，已阻止重复提交。"
         : "已复用最近生成的同参数报告，没有重复创建任务。"
       : result.status === "deduplicated"
         ? "所选信源已存在覆盖当前时间段的采集水位或排队任务，本次未重复采集。"
         : result.action === "report"
-          ? `HTML 报告已生成，数据锚点：${result.report_anchor}`
+          ? "HTML 报告任务已进入队列，生成完成后可在任务列表中查看。"
           : "信源采集任务已按精确时间窗口进入队列。";
     notice.value = message;
     sourceJobFeedback.value = message;
@@ -248,6 +253,13 @@ async function openSnapshots(job) {
     const result = await request(`/api/source-jobs/${job.id}/snapshots`);
     Object.assign(snapshotDetail, result);
     snapshotModal.value = true;
+  } catch (error) { notice.value = error.message; }
+}
+
+async function openJobReport(job) {
+  try {
+    const result = await request(`/api/source-jobs/${job.id}/report`);
+    openReport(result.report);
   } catch (error) { notice.value = error.message; }
 }
 
@@ -342,6 +354,9 @@ function sourceJobStatusLabel(job) {
     queued: "排队中",
     running: "正在采集",
     generating_report: "正在生成 HTML 报告",
+    partial_completed: "部分信源采集完成",
+    partial_review: "部分信源可用，报告待审查",
+    partial_coverage: "时间窗口覆盖不完整",
     completed: job.action === "collect_report" ? "采集完成，报告待恢复" : "采集完成",
     deduplicated: job.action === "collect_report" ? "无需重复采集，报告待生成" : "已跳过重复采集",
     snapshot_deleted: "快照已删除",
@@ -810,12 +825,13 @@ onUnmounted(() => {
                 <p class="text-sm font-medium text-white">{{ job.report_title }}</p>
                 <p class="mt-1 text-xs text-slate-600">{{ job.created_at }} · {{ sourceJobActionLabel(job.action) }} · {{ sourceJobStatusLabel(job) }} · {{ sourceJobSnapshotLabel(job) }}</p>
                 <p class="mt-1 text-xs text-slate-600">信源：{{ jobChannelNames(job).join('、') }} · 窗口：{{ job.lookback_days }} 天</p>
+                <p v-if="job.runs?.length" class="mt-1 text-xs text-slate-600">逐信源：{{ sourceRunSummary(job) }}</p>
                 <p v-if="job.report_anchor" class="mt-1 text-xs text-slate-600">报告数据锚点：{{ job.report_anchor }}</p>
                 <p v-if="job.error" class="mt-2 max-w-4xl break-all text-xs leading-5 text-rose-300">{{ job.error }}</p>
               </div>
               <div class="flex shrink-0 gap-2">
                 <button v-if="job.snapshot_count" @click="openSnapshots(job)" class="snapshot-action">查看快照</button>
-                <button v-if="job.report" @click="openReport(job.report)" class="report-action">查看报告</button>
+                <button v-if="job.has_report || job.report" @click="openJobReport(job)" class="report-action">查看报告</button>
                 <span v-if="job.status==='generating_report'" class="status-warn">报告生成中</span>
                 <button v-if="canRetrySourceJob(job)" @click="retrySourceJob(job)" class="secondary">{{ retrySourceJobLabel(job) }}</button>
               </div>
@@ -906,7 +922,7 @@ onUnmounted(() => {
               <div class="flex items-center gap-3">
                 <span :class="channel.status==='online'?'status-good':'status-warn'">{{ channel.status }}</span>
                 <button @click="normalizeExistingChannel(channel)" class="secondary">整理已有快照</button>
-                <button v-if="channel.collection_mode==='playwright' || channel.id==='web-rumors' || channel.id==='akshare'" @click="checkChannel(channel)" class="secondary">检查状态</button>
+                <button v-if="channel.collection_mode==='playwright' || ['web-rumors','akshare','industry-news'].includes(channel.id)" @click="checkChannel(channel)" class="secondary">检查状态</button>
                 <button @click="openChannelModal(channel)" class="secondary">配置</button>
               </div>
             </div>
@@ -988,11 +1004,12 @@ onUnmounted(() => {
                 <p class="text-sm font-medium text-white">{{ job.report_title }}</p>
                 <p class="mt-1 text-xs text-slate-600">{{ job.created_at }} · {{ job.action }} · {{ sourceJobStatusLabel(job) }} · {{ job.snapshot_count }} 条快照</p>
                 <p class="mt-1 text-xs text-slate-600">信源：{{ jobChannelNames(job).join('、') }}<span v-if="job.evidence_layer"> · Agent 层：{{ job.evidence_layer }}</span></p>
+                <p v-if="job.runs?.length" class="mt-1 text-xs text-slate-600">逐信源：{{ sourceRunSummary(job) }}</p>
                 <p v-if="job.error" class="mt-2 text-xs text-rose-300">{{ job.error }}</p>
               </div>
               <div class="flex shrink-0 gap-2">
                 <button v-if="job.snapshot_count" @click="openSnapshots(job)" class="snapshot-action">查看快照</button>
-                <button v-if="job.report" @click="openReport(job.report)" class="report-action">查看报告</button>
+                <button v-if="job.has_report || job.report" @click="openJobReport(job)" class="report-action">查看报告</button>
                 <span v-if="job.status==='generating_report'" class="status-warn">报告生成中</span>
                 <button v-if="canRetrySourceJob(job)" @click="retrySourceJob(job)" class="secondary">{{ retrySourceJobLabel(job) }}</button>
               </div>

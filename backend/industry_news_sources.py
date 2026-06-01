@@ -101,16 +101,22 @@ class ThrottledSession:
         self._last_request_at = 0.0
         self._lock = threading.Lock()
 
-    def get(self, url: str, **kwargs) -> requests.Response:
+    def request(self, method: str, url: str, **kwargs) -> requests.Response:
         with self._lock:
             current = self.monotonic()
             wait_for = self._last_request_at + self.min_interval_seconds - current
             if self._last_request_at and wait_for > 0:
                 self.sleep(wait_for + random.uniform(0, self.jitter_seconds))
-            response = self.session.get(url, **kwargs)
+            response = self.session.request(method, url, **kwargs)
             self._last_request_at = self.monotonic()
         response.raise_for_status()
         return response
+
+    def get(self, url: str, **kwargs) -> requests.Response:
+        return self.request("GET", url, **kwargs)
+
+    def post(self, url: str, **kwargs) -> requests.Response:
+        return self.request("POST", url, **kwargs)
 
 
 class PublicIndustryNewsCollector:
@@ -123,6 +129,7 @@ class PublicIndustryNewsCollector:
         self.session = session or requests.Session()
         self.session.headers.update({"User-Agent": UA})
         self.eastmoney = eastmoney or ThrottledSession(session=self.session)
+        self.cninfo = ThrottledSession(session=self.session)
 
     def industry_rankings(self) -> dict[str, Any]:
         response = self.eastmoney.get(
@@ -157,14 +164,14 @@ class PublicIndustryNewsCollector:
             raise RuntimeError("Eastmoney industry ranking returned no rows")
         return {"total": len(rows), "top": rows[:20], "bottom": rows[-20:]}
 
-    def global_news(self, page_size: int = 50) -> list[dict[str, Any]]:
+    def global_news(self, page_size: int = 50, sort_end: str = "") -> list[dict[str, Any]]:
         response = self.eastmoney.get(
             EASTMONEY_GLOBAL_NEWS_URL,
             params={
                 "client": "web",
                 "biz": "web_724",
                 "fastColumn": "102",
-                "sortEnd": "",
+                "sortEnd": sort_end,
                 "pageSize": str(page_size),
                 "req_trace": str(uuid.uuid4()),
             },
@@ -200,7 +207,7 @@ class PublicIndustryNewsCollector:
             "price": data.get("f43", 0),
         }
 
-    def stock_news(self, code: str, page_size: int = 30) -> list[dict[str, Any]]:
+    def stock_news(self, code: str, page_size: int = 30, page_index: int = 1) -> list[dict[str, Any]]:
         callback = "jQuery_alphadesk"
         inner = json.dumps(
             {
@@ -214,7 +221,7 @@ class PublicIndustryNewsCollector:
                     "cmsArticleWebOld": {
                         "searchScope": "default",
                         "sort": "default",
-                        "pageIndex": 1,
+                        "pageIndex": page_index,
                         "pageSize": page_size,
                         "preTag": "",
                         "postTag": "",
@@ -236,20 +243,20 @@ class PublicIndustryNewsCollector:
         data = json.loads(text[text.index("(") + 1 : text.rindex(")")])
         return data.get("result", {}).get("cmsArticleWebOld", []) or []
 
-    def announcements(self, code: str, page_size: int = 30) -> list[dict[str, Any]]:
+    def announcements(self, code: str, page_size: int = 30, page_num: int = 1) -> list[dict[str, Any]]:
         if code.startswith("6"):
             org_id = f"gssh0{code}"
         elif code.startswith(("8", "4")):
             org_id = f"gsbj0{code}"
         else:
             org_id = f"gssz0{code}"
-        response = self.session.post(
+        response = self.cninfo.post(
             CNINFO_ANNOUNCEMENT_URL,
             data={
                 "stock": f"{code},{org_id}",
                 "tabName": "fulltext",
                 "pageSize": str(page_size),
-                "pageNum": "1",
+                "pageNum": str(page_num),
                 "column": "",
                 "category": "",
                 "plate": "",
@@ -269,6 +276,23 @@ class PublicIndustryNewsCollector:
         )
         response.raise_for_status()
         return response.json().get("announcements", []) or []
+
+
+def check_public_industry_news() -> dict[str, Any]:
+    checked_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    try:
+        ranking = PublicIndustryNewsCollector().industry_rankings()
+        return {
+            "status": "online",
+            "message": f"产业趋势公开资讯可用，抽样读取 {ranking['total']} 个行业",
+            "checked_at": checked_at,
+        }
+    except Exception as exc:
+        return {
+            "status": "offline",
+            "message": f"产业趋势公开资讯不可用: {str(exc)[:300]}",
+            "checked_at": checked_at,
+        }
 
 
 def _diagnostics_snapshot(
@@ -336,60 +360,77 @@ def collect_public_industry_news(
         except Exception as exc:
             record_error("eastmoney_stock_info", exc)
         try:
-            for item in collector.stock_news(code):
-                occurred_at = _in_window(item.get("date"), window_start, window_end)
-                if not occurred_at:
-                    continue
-                source_url = str(item.get("url") or "").strip()
-                if not source_url:
-                    source_url = f"https://so.eastmoney.com/news/s?keyword={quote(code)}"
-                snapshots.append(
-                    _snapshot(
-                        channel_id,
-                        source_url,
-                        {
-                            "platform": "eastmoney_public",
-                            "category": "company_news",
-                            "title": _clean_text(item.get("title"), 500),
-                            "content": _clean_text(item.get("content"), 4_000),
-                            "source": _clean_text(item.get("mediaName"), 255) or "eastmoney",
-                            "collection_window": window,
-                            "query": query,
-                            "metadata": {"stock_code": code},
-                        },
-                        occurred_at,
+            for page_index in range(1, 41):
+                items = collector.stock_news(code, page_index=page_index)
+                parsed_dates = [_parse_datetime(item.get("date"), window_start.tzinfo) for item in items]
+                for item, parsed_at in zip(items, parsed_dates):
+                    occurred_at = parsed_at if parsed_at and window_start <= parsed_at <= window_end else None
+                    if not occurred_at:
+                        continue
+                    source_url = str(item.get("url") or "").strip()
+                    if not source_url:
+                        source_url = f"https://so.eastmoney.com/news/s?keyword={quote(code)}"
+                    snapshots.append(
+                        _snapshot(
+                            channel_id,
+                            source_url,
+                            {
+                                "platform": "eastmoney_public",
+                                "category": "company_news",
+                                "title": _clean_text(item.get("title"), 500),
+                                "content": _clean_text(item.get("content"), 4_000),
+                                "source": _clean_text(item.get("mediaName"), 255) or "eastmoney",
+                                "collection_window": window,
+                                "query": query,
+                                "metadata": {"stock_code": code, "page_index": page_index},
+                            },
+                            occurred_at,
+                        )
                     )
-                )
+                valid_dates = [value for value in parsed_dates if value]
+                if not items or len(items) < 30 or (valid_dates and min(valid_dates) < window_start):
+                    break
+            else:
+                errors["eastmoney_stock_news_coverage"] = "pagination limit reached before the requested window start"
         except Exception as exc:
             record_error("eastmoney_stock_news", exc)
         try:
-            for item in collector.announcements(code):
-                occurred_at = _in_window(item.get("announcementTime"), window_start, window_end)
-                if not occurred_at:
-                    continue
-                announcement_id = str(item.get("announcementId") or "").strip()
-                source_url = f"https://www.cninfo.com.cn/new/disclosure/detail?annoId={quote(announcement_id)}"
-                snapshots.append(
-                    _snapshot(
-                        channel_id,
-                        source_url,
-                        {
-                            "platform": "cninfo_public",
-                            "category": "company_announcement",
-                            "title": _clean_text(item.get("announcementTitle"), 500),
-                            "content": _clean_text(item.get("announcementTitle"), 4_000),
-                            "source": "cninfo",
-                            "collection_window": window,
-                            "query": query,
-                            "metadata": {
-                                "stock_code": code,
-                                "announcement_id": announcement_id,
-                                "announcement_type": item.get("announcementTypeName", ""),
+            for page_num in range(1, 41):
+                items = collector.announcements(code, page_num=page_num)
+                parsed_dates = [_parse_datetime(item.get("announcementTime"), window_start.tzinfo) for item in items]
+                for item, parsed_at in zip(items, parsed_dates):
+                    occurred_at = parsed_at if parsed_at and window_start <= parsed_at <= window_end else None
+                    if not occurred_at:
+                        continue
+                    announcement_id = str(item.get("announcementId") or "").strip()
+                    source_url = f"https://www.cninfo.com.cn/new/disclosure/detail?annoId={quote(announcement_id)}"
+                    snapshots.append(
+                        _snapshot(
+                            channel_id,
+                            source_url,
+                            {
+                                "platform": "cninfo_public",
+                                "category": "company_announcement",
+                                "title": _clean_text(item.get("announcementTitle"), 500),
+                                "content": _clean_text(item.get("announcementTitle"), 4_000),
+                                "source": "cninfo",
+                                "collection_window": window,
+                                "query": query,
+                                "metadata": {
+                                    "stock_code": code,
+                                    "announcement_id": announcement_id,
+                                    "announcement_type": item.get("announcementTypeName", ""),
+                                    "page_num": page_num,
+                                },
                             },
-                        },
-                        occurred_at,
+                            occurred_at,
+                        )
                     )
-                )
+                valid_dates = [value for value in parsed_dates if value]
+                if not items or len(items) < 30 or (valid_dates and min(valid_dates) < window_start):
+                    break
+            else:
+                errors["cninfo_announcements_coverage"] = "pagination limit reached before the requested window start"
         except Exception as exc:
             record_error("cninfo_announcements", exc)
     else:
@@ -415,32 +456,51 @@ def collect_public_industry_news(
         except Exception as exc:
             record_error("eastmoney_industry_rankings", exc)
         try:
-            for item in collector.global_news():
-                occurred_at = _in_window(item.get("showTime"), window_start, window_end)
-                if not occurred_at:
-                    continue
-                item_id = _event_id(item, "infoCode", "code", "id", "newsId")
-                source_url = (
-                    str(item.get("url") or item.get("shareUrl") or item.get("articleUrl") or "").strip()
-                    or f"https://kuaixun.eastmoney.com/?id={quote(item_id)}"
-                )
-                snapshots.append(
-                    _snapshot(
-                        channel_id,
-                        source_url,
-                        {
-                            "platform": "eastmoney_public",
-                            "category": "industry_news",
-                            "title": _clean_text(item.get("title"), 500),
-                            "content": _clean_text(item.get("summary") or item.get("title"), 4_000),
-                            "source": "eastmoney_7x24",
-                            "collection_window": window,
-                            "query": query,
-                            "metadata": {"event_id": item_id},
-                        },
-                        occurred_at,
+            sort_end = ""
+            seen_ids: set[str] = set()
+            for page_number in range(1, 41):
+                items = collector.global_news(sort_end=sort_end)
+                parsed_dates = [_parse_datetime(item.get("showTime"), window_start.tzinfo) for item in items]
+                new_ids = {_event_id(item, "infoCode", "code", "id", "newsId") for item in items} - seen_ids
+                if items and not new_ids:
+                    errors["eastmoney_global_news_coverage"] = "pagination cursor repeated before the requested window start"
+                    break
+                for item, parsed_at in zip(items, parsed_dates):
+                    item_id = _event_id(item, "infoCode", "code", "id", "newsId")
+                    seen_ids.add(item_id)
+                    occurred_at = parsed_at if parsed_at and window_start <= parsed_at <= window_end else None
+                    if not occurred_at:
+                        continue
+                    source_url = (
+                        str(item.get("url") or item.get("shareUrl") or item.get("articleUrl") or "").strip()
+                        or f"https://kuaixun.eastmoney.com/?id={quote(item_id)}"
                     )
-                )
+                    snapshots.append(
+                        _snapshot(
+                            channel_id,
+                            source_url,
+                            {
+                                "platform": "eastmoney_public",
+                                "category": "industry_news",
+                                "title": _clean_text(item.get("title"), 500),
+                                "content": _clean_text(item.get("summary") or item.get("title"), 4_000),
+                                "source": "eastmoney_7x24",
+                                "collection_window": window,
+                                "query": query,
+                                "metadata": {"event_id": item_id, "page_number": page_number},
+                            },
+                            occurred_at,
+                        )
+                    )
+                valid_dates = [value for value in parsed_dates if value]
+                if not items or len(items) < 50 or (valid_dates and min(valid_dates) < window_start):
+                    break
+                sort_end = str(items[-1].get("showTime") or "").strip()
+                if not sort_end:
+                    errors["eastmoney_global_news_coverage"] = "pagination cursor missing before the requested window start"
+                    break
+            else:
+                errors["eastmoney_global_news_coverage"] = "pagination limit reached before the requested window start"
         except Exception as exc:
             record_error("eastmoney_global_news", exc)
 

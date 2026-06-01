@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import tomllib
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
@@ -134,10 +135,107 @@ def now() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
-def db() -> sqlite3.Connection:
+@contextmanager
+def db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
-    return conn
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def canonical_scope_key(query: str) -> str:
+    value = str(query or "").strip()
+    code_match = re.search(r"(?<!\d)(\d{6})(?!\d)", value)
+    return code_match.group(1) if code_match else value.casefold()
+
+
+def ensure_scope_aware_storage(conn: sqlite3.Connection) -> None:
+    snapshot_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='source_snapshots'"
+    ).fetchone()["sql"]
+    if "UNIQUE(channel_id, source_url, occurred_at, scope_type, scope_key)" not in snapshot_sql:
+        conn.executescript(
+            """
+            ALTER TABLE source_snapshots RENAME TO source_snapshots_legacy;
+            CREATE TABLE source_snapshots (
+              id TEXT PRIMARY KEY,
+              channel_id TEXT NOT NULL,
+              occurred_at TEXT NOT NULL,
+              collected_at TEXT NOT NULL,
+              source_url TEXT NOT NULL,
+              content TEXT NOT NULL,
+              normalization_status TEXT NOT NULL DEFAULT 'pending',
+              normalized_at TEXT NOT NULL DEFAULT '',
+              normalization_error TEXT NOT NULL DEFAULT '',
+              normalized_item_count INTEGER NOT NULL DEFAULT 0,
+              scope_type TEXT NOT NULL DEFAULT 'general',
+              scope_key TEXT NOT NULL DEFAULT '',
+              UNIQUE(channel_id, source_url, occurred_at, scope_type, scope_key)
+            );
+            INSERT INTO source_snapshots(
+              id,channel_id,occurred_at,collected_at,source_url,content,normalization_status,
+              normalized_at,normalization_error,normalized_item_count,scope_type,scope_key
+            )
+            SELECT id,channel_id,occurred_at,collected_at,source_url,content,normalization_status,
+                   normalized_at,normalization_error,normalized_item_count,scope_type,scope_key
+            FROM source_snapshots_legacy;
+            DROP TABLE source_snapshots_legacy;
+            """
+        )
+    normalized_sql = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='normalized_source_items'"
+    ).fetchone()["sql"]
+    if "UNIQUE(channel_id,item_key,scope_type,scope_key)" not in normalized_sql:
+        conn.executescript(
+            """
+            ALTER TABLE normalized_source_items RENAME TO normalized_source_items_legacy;
+            CREATE TABLE normalized_source_items (
+              id TEXT PRIMARY KEY,
+              snapshot_id TEXT NOT NULL,
+              channel_id TEXT NOT NULL,
+              item_key TEXT NOT NULL,
+              occurred_at TEXT NOT NULL,
+              author TEXT NOT NULL DEFAULT '',
+              title TEXT NOT NULL DEFAULT '',
+              content TEXT NOT NULL,
+              source_url TEXT NOT NULL DEFAULT '',
+              attachments TEXT NOT NULL DEFAULT '[]',
+              metadata TEXT NOT NULL DEFAULT '{}',
+              quality_score INTEGER NOT NULL DEFAULT 0,
+              normalization_mode TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              scope_type TEXT NOT NULL DEFAULT 'general',
+              scope_key TEXT NOT NULL DEFAULT '',
+              UNIQUE(channel_id,item_key,scope_type,scope_key)
+            );
+            INSERT INTO normalized_source_items(
+              id,snapshot_id,channel_id,item_key,occurred_at,author,title,content,source_url,
+              attachments,metadata,quality_score,normalization_mode,created_at,scope_type,scope_key
+            )
+            SELECT n.id,n.snapshot_id,n.channel_id,n.item_key,n.occurred_at,n.author,n.title,n.content,n.source_url,
+                   n.attachments,n.metadata,n.quality_score,n.normalization_mode,n.created_at,
+                   COALESCE(s.scope_type,'general'),COALESCE(s.scope_key,'')
+            FROM normalized_source_items_legacy n
+            LEFT JOIN source_snapshots s ON s.id=n.snapshot_id;
+            DROP TABLE normalized_source_items_legacy;
+            """
+        )
+    conn.executescript(
+        """
+        CREATE INDEX IF NOT EXISTS idx_source_snapshots_channel_scope_time
+          ON source_snapshots(channel_id,scope_type,scope_key,occurred_at);
+        CREATE INDEX IF NOT EXISTS idx_normalized_items_channel_scope_time
+          ON normalized_source_items(channel_id,scope_type,scope_key,occurred_at);
+        CREATE INDEX IF NOT EXISTS idx_source_jobs_status_created
+          ON source_collection_jobs(status,created_at);
+        """
+    )
 
 
 def cipher() -> Fernet:
@@ -291,7 +389,7 @@ def init_db() -> None:
               normalized_item_count INTEGER NOT NULL DEFAULT 0,
               scope_type TEXT NOT NULL DEFAULT 'general',
               scope_key TEXT NOT NULL DEFAULT '',
-              UNIQUE(channel_id, source_url, occurred_at)
+              UNIQUE(channel_id, source_url, occurred_at, scope_type, scope_key)
             );
             CREATE TABLE IF NOT EXISTS normalized_source_items (
               id TEXT PRIMARY KEY,
@@ -308,12 +406,26 @@ def init_db() -> None:
               quality_score INTEGER NOT NULL DEFAULT 0,
               normalization_mode TEXT NOT NULL,
               created_at TEXT NOT NULL,
-              UNIQUE(channel_id,item_key)
+              scope_type TEXT NOT NULL DEFAULT 'general',
+              scope_key TEXT NOT NULL DEFAULT '',
+              UNIQUE(channel_id,item_key,scope_type,scope_key)
             );
             CREATE TABLE IF NOT EXISTS source_job_snapshots (
               job_id TEXT NOT NULL,
               snapshot_id TEXT NOT NULL,
               PRIMARY KEY(job_id,snapshot_id)
+            );
+            CREATE TABLE IF NOT EXISTS source_collection_runs (
+              job_id TEXT NOT NULL,
+              channel_id TEXT NOT NULL,
+              status TEXT NOT NULL,
+              started_at TEXT NOT NULL DEFAULT '',
+              completed_at TEXT NOT NULL DEFAULT '',
+              snapshot_count INTEGER NOT NULL DEFAULT 0,
+              duplicate_count INTEGER NOT NULL DEFAULT 0,
+              error TEXT NOT NULL DEFAULT '',
+              coverage_complete INTEGER NOT NULL DEFAULT 1,
+              PRIMARY KEY(job_id,channel_id)
             );
             CREATE TABLE IF NOT EXISTS agent_events (
               id TEXT PRIMARY KEY,
@@ -406,6 +518,8 @@ def init_db() -> None:
                 )
                 """
             )
+        ensure_scope_aware_storage(conn)
+        conn.execute("UPDATE source_collection_jobs SET status='generating_report' WHERE status='generating'")
         channel_count = conn.execute("SELECT COUNT(*) AS count FROM channels").fetchone()["count"]
         if not channel_count:
             conn.executemany(
@@ -432,7 +546,7 @@ def init_db() -> None:
                 "行业资讯、公司资料与公告补证",
                 "",
                 "industry_news",
-                "online",
+                "pending",
                 "东方财富行业排名与资讯、个股资料和巨潮公告；按时间窗采集并保留证据来源",
                 "fixed",
                 70,
@@ -445,7 +559,7 @@ def init_db() -> None:
         conn.execute(
             """
             UPDATE channels
-            SET name=?,type=?,collection_mode='industry_news',status='online',notes=?,
+            SET name=?,type=?,collection_mode='industry_news',notes=?,
                 parsing_strategy='fixed',normalization_quality_threshold=70,max_scrolls=1,
                 research_enabled=1,builtin=1
             WHERE id='industry-news'
@@ -790,6 +904,95 @@ def fixed_normalized_items(snapshot: sqlite3.Row, mode: str = "fixed") -> tuple[
                 "normalization_mode": mode,
             }
         ], ""
+    if isinstance(payload, dict) and payload.get("platform") == "mx_authorized_request_replay":
+        room = payload.get("room") if isinstance(payload.get("room"), dict) else {}
+        message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+        parts = message.get("parts") if isinstance(message.get("parts"), list) else []
+        texts = [
+            str(part.get("msg") or "").strip()
+            for part in parts
+            if isinstance(part, dict) and str(part.get("msg") or "").strip()
+        ]
+        attachments = [
+            str(part.get("url") or "").strip()
+            for part in parts
+            if isinstance(part, dict) and str(part.get("url") or "").strip()
+        ]
+        item_content = "\n".join(texts).strip() or json.dumps(parts, ensure_ascii=False)
+        title = str(room.get("title") or "MX channel message").strip()
+        return [
+            {
+                "item_key": stable_item_key(snapshot["channel_id"], source_url, occurred_at, title, item_content),
+                "occurred_at": occurred_at,
+                "author": str(message.get("author") or "")[:255],
+                "title": title[:500],
+                "content": item_content,
+                "source_url": source_url,
+                "attachments": attachments,
+                "metadata": {"platform": payload["platform"], "room": room, "message_id": message.get("id", "")},
+                "quality_score": 90,
+                "normalization_mode": mode,
+            }
+        ], ""
+    if isinstance(payload, dict) and payload.get("platform") == "telegram_public_preview":
+        item_content = str(payload.get("text") or "").strip()
+        links = payload.get("links") if isinstance(payload.get("links"), list) else []
+        media = payload.get("media") if isinstance(payload.get("media"), list) else []
+        attachments = [str(item) for item in [*links, *media] if str(item).strip()]
+        return [
+            {
+                "item_key": stable_item_key(snapshot["channel_id"], source_url, occurred_at, "", item_content),
+                "occurred_at": occurred_at,
+                "author": str(payload.get("channel") or "")[:255],
+                "title": str(payload.get("post_id") or "")[:500],
+                "content": item_content,
+                "source_url": source_url,
+                "attachments": attachments,
+                "metadata": {"platform": payload["platform"], "post_id": payload.get("post_id", "")},
+                "quality_score": 88,
+                "normalization_mode": mode,
+            }
+        ], ""
+    if isinstance(payload, dict) and payload.get("adapter") == "market_data_aggregate":
+        return [
+            {
+                "item_key": stable_item_key(snapshot["channel_id"], source_url, occurred_at, "Market data aggregate", content),
+                "occurred_at": occurred_at,
+                "author": "local_market_data",
+                "title": "Market data aggregate",
+                "content": content,
+                "source_url": source_url,
+                "attachments": [],
+                "metadata": {
+                    "adapter": payload["adapter"],
+                    "query": payload.get("query", ""),
+                    "component_diagnostics": payload.get("component_diagnostics", {}),
+                },
+                "quality_score": 86 if payload.get("components") else 60,
+                "normalization_mode": mode,
+            }
+        ], ""
+    if isinstance(payload, dict) and payload.get("platform") in {"zsxq", "web"}:
+        item_content = str(payload.get("visible_text") or "").strip()
+        if item_content:
+            return [
+                {
+                    "item_key": stable_item_key(snapshot["channel_id"], source_url, occurred_at, "", item_content),
+                    "occurred_at": occurred_at,
+                    "author": "",
+                    "title": f"{payload['platform']} page snapshot",
+                    "content": item_content,
+                    "source_url": source_url,
+                    "attachments": [],
+                    "metadata": {
+                        "platform": payload["platform"],
+                        "group_id": payload.get("group_id", ""),
+                        "captured_at": payload.get("captured_at", ""),
+                    },
+                    "quality_score": 68,
+                    "normalization_mode": mode,
+                }
+            ], ""
     return [
         {
             "item_key": stable_item_key(snapshot["channel_id"], source_url, occurred_at, "", content),
@@ -902,8 +1105,10 @@ def normalize_snapshot_record(snapshot_id: str, force: bool = False) -> dict:
     status = "complete"
     error = ""
     try:
-        if strategy == "fixed":
-            items, notes = fixed_normalized_items(snapshot)
+        fixed_items, fixed_notes = fixed_normalized_items(snapshot)
+        fixed_parser_matched = bool(fixed_items) and not any(item.get("metadata", {}).get("raw_snapshot") for item in fixed_items)
+        if strategy == "fixed" or fixed_parser_matched:
+            items, notes = fixed_items, fixed_notes
         else:
             items, notes = ai_normalized_items(snapshot, snapshot, f"{strategy}_ai")
     except Exception as exc:
@@ -930,8 +1135,8 @@ def normalize_snapshot_record(snapshot_id: str, force: bool = False) -> dict:
                 """
                 INSERT OR IGNORE INTO normalized_source_items(
                   id,snapshot_id,channel_id,item_key,occurred_at,author,title,content,source_url,
-                  attachments,metadata,quality_score,normalization_mode,created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                  attachments,metadata,quality_score,normalization_mode,created_at,scope_type,scope_key
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     uuid4().hex,
@@ -948,6 +1153,8 @@ def normalize_snapshot_record(snapshot_id: str, force: bool = False) -> dict:
                     item["quality_score"],
                     item["normalization_mode"],
                     created_at,
+                    snapshot["scope_type"],
+                    snapshot["scope_key"],
                 ),
             )
         stored_count = conn.execute(
@@ -994,18 +1201,16 @@ def channel_names_for_ids(channel_ids: list[str], names: dict[str, str] | None =
 def dashboard() -> dict:
     with db() as conn:
         tasks = [dict(row) for row in conn.execute("SELECT * FROM tasks ORDER BY created_at DESC LIMIT 8")]
-        source_jobs = [dict(row) for row in conn.execute("SELECT * FROM source_collection_jobs ORDER BY created_at DESC LIMIT 80")]
+        source_jobs = source_job_list_response(
+            conn,
+            [dict(row) for row in conn.execute("SELECT * FROM source_collection_jobs ORDER BY created_at DESC LIMIT 80")],
+        )
         channels = [dict(row) for row in conn.execute("SELECT * FROM channels ORDER BY builtin DESC, updated_at")]
     for channel in channels:
         channel["group_ids"] = json.loads(channel.get("group_ids") or "[]")
         channel["profile_exists"] = browser_profile(channel["id"]).exists()
         if channel["id"] == "akshare":
             channel["market_data_config"] = market_data_config_public()
-    channel_names = {channel["id"]: channel["name"] for channel in channels}
-    for job in source_jobs:
-        job["channel_ids"] = json.loads(job["channel_ids"])
-        job["channel_names"] = channel_names_for_ids(job["channel_ids"], channel_names)
-        job["windows"] = json.loads(job["windows"])
     skills = [
         {"name": item.name, "path": str(item.relative_to(ROOT)), "status": "loaded"}
         for item in SKILLS_DIR.iterdir()
@@ -1053,8 +1258,10 @@ def ensure_inventory_cleanup_idle(conn: sqlite3.Connection) -> None:
 @app.get("/api/audit")
 def audit() -> dict:
     with db() as conn:
-        jobs = [dict(row) for row in conn.execute("SELECT * FROM source_collection_jobs ORDER BY created_at DESC LIMIT 80")]
-        channel_names = {row["id"]: row["name"] for row in conn.execute("SELECT id,name FROM channels")}
+        jobs = source_job_list_response(
+            conn,
+            [dict(row) for row in conn.execute("SELECT * FROM source_collection_jobs ORDER BY created_at DESC LIMIT 80")],
+        )
         watermarks = [
             dict(row)
             for row in conn.execute(
@@ -1096,10 +1303,6 @@ def audit() -> dict:
         ]
         events = [dict(row) for row in conn.execute("SELECT * FROM agent_events ORDER BY created_at DESC LIMIT 80")]
         inventory = inventory_summary(conn)
-    for job in jobs:
-        job["channel_ids"] = json.loads(job["channel_ids"])
-        job["channel_names"] = channel_names_for_ids(job["channel_ids"], channel_names)
-        job["windows"] = json.loads(job["windows"])
     return {"jobs": jobs, "watermarks": watermarks, "snapshots": snapshots, "normalized": normalized, "events": events, "inventory": inventory}
 
 
@@ -1175,6 +1378,7 @@ def clear_task_list(scope: Literal["research", "source-jobs", "all"]) -> dict:
                 if child_job_ids:
                     child_marks = ",".join("?" for _ in child_job_ids)
                     conn.execute(f"DELETE FROM source_job_snapshots WHERE job_id IN ({child_marks})", child_job_ids)
+                    conn.execute(f"DELETE FROM source_collection_runs WHERE job_id IN ({child_marks})", child_job_ids)
                     cursor = conn.execute(f"DELETE FROM source_collection_jobs WHERE id IN ({child_marks})", child_job_ids)
                     deleted_source_jobs += cursor.rowcount
                 conn.execute(f"DELETE FROM agent_events WHERE task_id IN ({task_marks})", task_ids)
@@ -1182,6 +1386,7 @@ def clear_task_list(scope: Literal["research", "source-jobs", "all"]) -> dict:
                 deleted_research_tasks = cursor.rowcount
         if scope in ("source-jobs", "all"):
             conn.execute("DELETE FROM source_job_snapshots")
+            conn.execute("DELETE FROM source_collection_runs")
             cursor = conn.execute("DELETE FROM source_collection_jobs")
             deleted_source_jobs += cursor.rowcount
     return {
@@ -1383,6 +1588,16 @@ def check_channel(channel_id: str) -> dict:
                 (result["status"], result["checked_at"], result["checked_at"], channel_id),
             )
         return result
+    if channel_id == "industry-news" and channel:
+        from backend.industry_news_sources import check_public_industry_news
+
+        result = check_public_industry_news()
+        with db() as conn:
+            conn.execute(
+                "UPDATE channels SET status=?,last_check=?,updated_at=? WHERE id=?",
+                (result["status"], result["checked_at"], result["checked_at"], channel_id),
+            )
+        return result
     if channel:
         request_config = channel_request_config(channel_id)
         if request_config.get("adapter") == "mx_authorized_request_replay":
@@ -1426,9 +1641,14 @@ def check_channel(channel_id: str) -> dict:
 
 def refresh_browser_channel_states() -> None:
     with db() as conn:
-        channels = [dict(row) for row in conn.execute("SELECT id FROM channels WHERE collection_mode='playwright' OR id IN ('web-rumors','akshare')")]
+        channels = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT id FROM channels WHERE collection_mode='playwright' OR id IN ('web-rumors','akshare','industry-news')"
+            )
+        ]
     for channel in channels:
-        if channel["id"] in ("web-rumors", "akshare") or browser_profile(channel["id"]).exists():
+        if channel["id"] in ("web-rumors", "akshare", "industry-news") or browser_profile(channel["id"]).exists():
             try:
                 check_channel(channel["id"])
             except HTTPException:
@@ -1453,6 +1673,7 @@ def iso(value: datetime) -> str:
 
 
 def latest_reserved_at(conn: sqlite3.Connection, channel_id: str, scope_key: str = "") -> datetime | None:
+    scope_key = canonical_scope_key(scope_key)
     values: list[str] = []
     watermark = conn.execute(
         "SELECT last_success_at FROM source_collection_watermarks_v2 WHERE channel_id=? AND scope_key=?",
@@ -1464,7 +1685,7 @@ def latest_reserved_at(conn: sqlite3.Connection, channel_id: str, scope_key: str
     for row in conn.execute(
         "SELECT windows,status,started_at,completed_at,query FROM source_collection_jobs WHERE status IN ('queued','running','failed','report_failed')"
     ):
-        if (row["query"] or "") != scope_key:
+        if canonical_scope_key(row["query"] or "") != scope_key:
             continue
         if row["status"] in ("failed", "report_failed"):
             attempted_at = row["completed_at"] or row["started_at"]
@@ -1481,14 +1702,26 @@ def local_snapshot_context(
     lookback_days: int,
     *,
     general_snapshots_only: bool = False,
+    research_scope_key: str = "",
 ) -> tuple[str, str, str]:
     placeholders = ",".join("?" for _ in channel_ids)
-    general_filter = " AND scope_type='general'" if general_snapshots_only else ""
-    normalized_general_filter = " AND s.scope_type='general'" if general_snapshots_only else ""
+    scoped_key = canonical_scope_key(research_scope_key)
+    if general_snapshots_only:
+        general_filter = " AND scope_type='general'"
+        normalized_general_filter = " AND s.scope_type='general'"
+        scope_params: list[str] = []
+    elif scoped_key:
+        general_filter = " AND (scope_type='general' OR (scope_type='research' AND scope_key=?))"
+        normalized_general_filter = " AND (s.scope_type='general' OR (s.scope_type='research' AND s.scope_key=?))"
+        scope_params = [scoped_key]
+    else:
+        general_filter = " AND scope_type='general'"
+        normalized_general_filter = " AND s.scope_type='general'"
+        scope_params = []
     with db() as conn:
         anchor_row = conn.execute(
             f"SELECT MAX(collected_at) AS anchor FROM source_snapshots WHERE channel_id IN ({placeholders}){general_filter}",
-            channel_ids,
+            [*channel_ids, *scope_params],
         ).fetchone()
         anchor = anchor_row["anchor"]
         if not anchor:
@@ -1505,7 +1738,7 @@ def local_snapshot_context(
                 WHERE n.channel_id IN ({placeholders}) AND n.occurred_at BETWEEN ? AND ?{normalized_general_filter}
                 ORDER BY n.occurred_at DESC LIMIT 500
                 """,
-                [*channel_ids, window_start, anchor],
+                [*channel_ids, window_start, anchor, *scope_params],
             )
         ]
         snapshots = [
@@ -1517,7 +1750,7 @@ def local_snapshot_context(
                 WHERE channel_id IN ({placeholders}) AND occurred_at BETWEEN ? AND ?{general_filter}
                 ORDER BY occurred_at DESC LIMIT 200
                 """,
-                [*channel_ids, window_start, anchor],
+                [*channel_ids, window_start, anchor, *scope_params],
             )
         ]
     if not normalized_items and not snapshots:
@@ -1631,20 +1864,47 @@ def insert_source_job(conn: sqlite3.Connection, job: dict) -> None:
     )
 
 
-def source_job_response(job: dict, **extra: object) -> dict:
+def source_job_response(job: dict, *, channel_names: dict[str, str] | None = None, **extra: object) -> dict:
     result = {**job}
     if isinstance(result.get("channel_ids"), str):
         result["channel_ids"] = json.loads(result["channel_ids"])
     if isinstance(result.get("windows"), str):
         result["windows"] = json.loads(result["windows"])
-    result["channel_names"] = channel_names_for_ids(result.get("channel_ids") or [])
+    result["channel_names"] = channel_names_for_ids(result.get("channel_ids") or [], channel_names)
+    result["has_report"] = bool(result.get("report"))
     return {**result, **extra}
+
+
+def source_job_list_response(conn: sqlite3.Connection, rows: list[dict]) -> list[dict]:
+    if not rows:
+        return []
+    job_ids = [row["id"] for row in rows]
+    job_marks = ",".join("?" for _ in job_ids)
+    run_rows = [
+        dict(row)
+        for row in conn.execute(
+            f"SELECT * FROM source_collection_runs WHERE job_id IN ({job_marks}) ORDER BY started_at,channel_id",
+            job_ids,
+        )
+    ]
+    channel_names = {row["id"]: row["name"] for row in conn.execute("SELECT id,name FROM channels")}
+    runs_by_job: dict[str, list[dict]] = {}
+    for run in run_rows:
+        runs_by_job.setdefault(run["job_id"], []).append(run)
+    results = []
+    for row in rows:
+        item = source_job_response(row, channel_names=channel_names)
+        item["runs"] = runs_by_job.get(item["id"], [])
+        item["report"] = None
+        results.append(item)
+    return results
 
 
 @app.post("/api/source-jobs")
 def create_source_job(payload: SourceJobInput) -> dict:
     if payload.action in ("collect_report", "report"):
         ensure_general_source_report(payload)
+    scope_key = canonical_scope_key(payload.query)
     if payload.action == "report":
         channel_ids = sorted(set(payload.channel_ids))
         channel_ids_json = json.dumps(channel_ids, ensure_ascii=False)
@@ -1652,9 +1912,9 @@ def create_source_job(payload: SourceJobInput) -> dict:
         job = {
             "id": uuid4().hex[:10], "action": payload.action, "channel_ids": channel_ids_json,
             "windows": "[]", "lookback_days": payload.lookback_days, "skill_name": payload.skill_name,
-            "report_title": payload.report_title, "status": "generating", "created_at": created_at,
+            "report_title": payload.report_title, "status": "generating_report", "created_at": created_at,
             "report": None, "report_anchor": "", "parent_task_id": payload.parent_task_id,
-            "query": payload.query, "evidence_layer": payload.evidence_layer,
+            "query": scope_key, "evidence_layer": payload.evidence_layer,
         }
         cutoff = iso(datetime.fromisoformat(created_at) - REPORT_DEDUP_INTERVAL)
         with db() as conn:
@@ -1664,7 +1924,7 @@ def create_source_job(payload: SourceJobInput) -> dict:
                 SELECT * FROM source_collection_jobs
                 WHERE action='report' AND channel_ids=? AND lookback_days=? AND skill_name=? AND report_title=?
                   AND parent_task_id=? AND query=? AND evidence_layer=? AND created_at>=?
-                  AND status IN ('generating','review')
+                  AND status IN ('generating_report','review','partial_review')
                 ORDER BY created_at DESC LIMIT 1
                 """,
                 (
@@ -1673,7 +1933,7 @@ def create_source_job(payload: SourceJobInput) -> dict:
                     payload.skill_name,
                     payload.report_title,
                     payload.parent_task_id,
-                    payload.query,
+                    scope_key,
                     payload.evidence_layer,
                     cutoff,
                 ),
@@ -1681,23 +1941,6 @@ def create_source_job(payload: SourceJobInput) -> dict:
             if existing:
                 return source_job_response(dict(existing), deduplicated=True)
             insert_source_job(conn, job)
-        try:
-            report, anchor = generate_source_report(payload)
-        except Exception as exc:
-            error = exc.detail if isinstance(exc, HTTPException) else str(exc)
-            with db() as conn:
-                conn.execute(
-                    "UPDATE source_collection_jobs SET status='report_failed',error=?,completed_at=? WHERE id=?",
-                    (error[:1200], now(), job["id"]),
-                )
-            raise
-        completed_at = now()
-        with db() as conn:
-            conn.execute(
-                "UPDATE source_collection_jobs SET status='review',report=?,report_anchor=?,completed_at=? WHERE id=?",
-                (report, anchor, completed_at, job["id"]),
-            )
-        job.update({"status": "review", "report": report, "report_anchor": anchor, "completed_at": completed_at})
         return source_job_response(job)
     else:
         current = datetime.now(timezone.utc).astimezone().replace(microsecond=0)
@@ -1708,7 +1951,7 @@ def create_source_job(payload: SourceJobInput) -> dict:
             for channel_id in payload.channel_ids:
                 if channel_id not in known:
                     raise HTTPException(404, f"信源不存在: {channel_id}")
-                reserved = latest_reserved_at(conn, channel_id, payload.query)
+                reserved = latest_reserved_at(conn, channel_id, scope_key)
                 if reserved and current - reserved < MIN_COLLECTION_INTERVAL:
                     continue
                 window_start = max(lower_bound, reserved) if reserved else lower_bound
@@ -1719,30 +1962,10 @@ def create_source_job(payload: SourceJobInput) -> dict:
             "windows": json.dumps(windows), "lookback_days": payload.lookback_days, "skill_name": payload.skill_name,
             "report_title": payload.report_title, "status": "queued" if windows else "deduplicated",
             "created_at": now(), "report": None, "report_anchor": "", "parent_task_id": payload.parent_task_id,
-            "query": payload.query, "evidence_layer": payload.evidence_layer,
+            "query": scope_key, "evidence_layer": payload.evidence_layer,
         }
     with db() as conn:
         insert_source_job(conn, job)
-    if job["action"] == "collect_report" and job["status"] == "deduplicated":
-        try:
-            report, anchor = report_after_collection(job)
-        except Exception as exc:
-            error = exc.detail if isinstance(exc, HTTPException) else str(exc)
-            completed_at = now()
-            with db() as conn:
-                conn.execute(
-                    "UPDATE source_collection_jobs SET status='report_failed',error=?,completed_at=? WHERE id=?",
-                    (error[:1200], completed_at, job["id"]),
-                )
-            job.update({"status": "report_failed", "error": error[:1200], "completed_at": completed_at})
-            return source_job_response(job)
-        completed_at = now()
-        with db() as conn:
-            conn.execute(
-                "UPDATE source_collection_jobs SET status='review',report=?,report_anchor=?,completed_at=? WHERE id=?",
-                (report, anchor, completed_at, job["id"]),
-            )
-        job.update({"status": "review", "report": report, "report_anchor": anchor, "completed_at": completed_at})
     return source_job_response(job)
 
 
@@ -1761,9 +1984,6 @@ def complete_source_job(job_id: str, payload: CompleteSourceJobInput) -> dict:
             raise HTTPException(409, "没有真实快照，不能推进采集水位")
         if not submitted_channels.issubset(allowed_channels):
             raise HTTPException(409, "快照包含不属于当前任务窗口的信源")
-        missing_channels = allowed_channels - submitted_channels
-        if missing_channels:
-            raise HTTPException(409, f"以下信源没有真实快照，不能推进水位: {', '.join(sorted(missing_channels))}")
         channel_windows = {window["channel_id"]: window for window in windows}
         for item in payload.snapshots:
             window = channel_windows[item.channel_id]
@@ -1771,11 +1991,13 @@ def complete_source_job(job_id: str, payload: CompleteSourceJobInput) -> dict:
                 raise HTTPException(409, f"快照时间戳不属于当前采集窗口: {item.channel_id}")
         collected_at = now()
         scope_type = "research" if job["parent_task_id"] or job["query"] or job["evidence_layer"] else "general"
-        scope_key = job["query"] if scope_type == "research" else ""
+        scope_key = canonical_scope_key(job["query"]) if scope_type == "research" else ""
         inserted = 0
-        inserted_channels: set[str] = set()
         inserted_snapshot_ids: list[str] = []
+        submitted_counts = {channel_id: 0 for channel_id in submitted_channels}
+        inserted_counts = {channel_id: 0 for channel_id in submitted_channels}
         for snapshot in payload.snapshots:
+            submitted_counts[snapshot.channel_id] += 1
             before = conn.total_changes
             snapshot_id = uuid4().hex[:12]
             conn.execute(
@@ -1798,44 +2020,60 @@ def complete_source_job(job_id: str, payload: CompleteSourceJobInput) -> dict:
             delta = conn.total_changes - before
             inserted += delta
             if delta:
-                inserted_channels.add(snapshot.channel_id)
+                inserted_counts[snapshot.channel_id] += 1
                 inserted_snapshot_ids.append(snapshot_id)
-                conn.execute(
-                    "INSERT OR IGNORE INTO source_job_snapshots(job_id,snapshot_id) VALUES(?,?)",
-                    (job_id, snapshot_id),
-                )
-        missing_new_snapshots = allowed_channels - inserted_channels
-        if missing_new_snapshots:
-            raise HTTPException(409, f"以下信源没有新增快照，不能推进水位: {', '.join(sorted(missing_new_snapshots))}")
+            else:
+                existing = conn.execute(
+                    """
+                    SELECT id FROM source_snapshots
+                    WHERE channel_id=? AND source_url=? AND occurred_at=? AND scope_type=? AND scope_key=?
+                    """,
+                    (snapshot.channel_id, snapshot.source_url, iso(snapshot.occurred_at), scope_type, scope_key),
+                ).fetchone()
+                if not existing:
+                    continue
+                snapshot_id = existing["id"]
+            conn.execute(
+                "INSERT OR IGNORE INTO source_job_snapshots(job_id,snapshot_id) VALUES(?,?)",
+                (job_id, snapshot_id),
+            )
         for window in windows:
+            if window["channel_id"] not in submitted_channels:
+                continue
             conn.execute(
                 "INSERT OR REPLACE INTO source_collection_watermarks_v2(channel_id,scope_key,last_success_at) VALUES(?,?,?)",
-                (window["channel_id"], job["query"] or "", window["window_end"]),
+                (window["channel_id"], scope_key, window["window_end"]),
             )
-        next_status = "generating_report" if job["action"] == "collect_report" else "completed"
+            conn.execute(
+                """
+                INSERT INTO source_collection_runs(job_id,channel_id,status,completed_at,snapshot_count,duplicate_count)
+                VALUES(?,?,?,?,?,?)
+                ON CONFLICT(job_id,channel_id) DO UPDATE SET
+                  status=excluded.status,completed_at=excluded.completed_at,
+                  snapshot_count=excluded.snapshot_count,duplicate_count=excluded.duplicate_count
+                """,
+                (
+                    job_id,
+                    window["channel_id"],
+                    "completed" if inserted_counts[window["channel_id"]] else "deduplicated",
+                    collected_at,
+                    inserted_counts[window["channel_id"]],
+                    submitted_counts[window["channel_id"]] - inserted_counts[window["channel_id"]],
+                ),
+            )
+        partial = submitted_channels != allowed_channels
+        next_status = "generating_report" if job["action"] == "collect_report" else "partial_completed" if partial else "completed"
         conn.execute(
             "UPDATE source_collection_jobs SET status=?,snapshot_count=?,completed_at=? WHERE id=?",
             (next_status, inserted, collected_at, job_id),
         )
     for snapshot_id in inserted_snapshot_ids:
         normalize_snapshot_record(snapshot_id)
-    report = None
-    if job["action"] == "collect_report":
-        request = SourceJobInput(
-            action="report",
-            channel_ids=json.loads(job["channel_ids"]),
-            lookback_days=job["lookback_days"],
-            report_title=job["report_title"],
-            skill_name=job["skill_name"],
-        )
-        report, anchor = generate_source_report(request)
-        with db() as conn:
-            conn.execute("UPDATE source_collection_jobs SET status='review',report=?,report_anchor=? WHERE id=?", (report, anchor, job_id))
     if job["parent_task_id"] and collection_worker.on_evidence_ready:
         with db() as conn:
             conn.execute("UPDATE tasks SET status='evidence_ready' WHERE id=?", (job["parent_task_id"],))
         collection_worker.on_evidence_ready(job["parent_task_id"])
-    return {"status": "review" if report else "completed", "snapshot_count": inserted, "report": report}
+    return {"status": next_status, "snapshot_count": inserted, "report": None}
 
 
 @app.post("/api/source-jobs/{job_id}/retry")
@@ -1874,19 +2112,27 @@ def retry_source_job(job_id: str) -> dict:
                 (job_id,),
             )
     if payload:
-        try:
-            report, anchor = generate_source_report(payload)
-        except Exception as exc:
-            with db() as conn:
-                conn.execute("UPDATE source_collection_jobs SET error=? WHERE id=?", (str(exc)[:1200], job_id))
-            raise
         with db() as conn:
             conn.execute(
-                "UPDATE source_collection_jobs SET status='review',report=?,report_anchor=?,error='' WHERE id=?",
-                (report, anchor, job_id),
+                "UPDATE source_collection_jobs SET status='generating_report',error='' WHERE id=?",
+                (job_id,),
             )
-        return {"status": "review", "report": report, "report_anchor": anchor}
+        return {"status": "generating_report"}
     return {"status": "queued"}
+
+
+@app.get("/api/source-jobs/{job_id}/report")
+def source_job_report(job_id: str) -> dict:
+    with db() as conn:
+        job = conn.execute(
+            "SELECT id,report_title,status,report,report_anchor,error FROM source_collection_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+    if not job:
+        raise HTTPException(404, "信源任务不存在")
+    if not job["report"]:
+        raise HTTPException(409, "该任务尚未生成 HTML 报告")
+    return dict(job)
 
 
 @app.get("/api/source-jobs/{job_id}/snapshots")
@@ -2195,13 +2441,13 @@ def channel_ids_for_layer(layer: str) -> list[str]:
         ]
 
 
-def task_snapshot_context(lookback_days: int) -> tuple[str, str, str]:
+def task_snapshot_context(lookback_days: int, scope_key: str) -> tuple[str, str, str]:
     with db() as conn:
         channel_ids = [row["id"] for row in conn.execute("SELECT id FROM channels WHERE status='online'")]
     if not channel_ids:
         return "无在线信源", "无本地快照", "当前没有在线信源，也没有可传递给模型的本地快照。"
     try:
-        return local_snapshot_context(channel_ids, lookback_days)
+        return local_snapshot_context(channel_ids, lookback_days, research_scope_key=scope_key)
     except HTTPException:
         return "无本地快照", "无本地快照", "当前没有可用的本地信源快照。不能形成事实判断，只能请求下一层证据。"
 
@@ -2213,7 +2459,8 @@ def completed_evidence_layers(task_id: str, state: dict) -> set[str]:
         rows = conn.execute(
             """
             SELECT evidence_layer FROM source_collection_jobs
-            WHERE parent_task_id=? AND evidence_layer<>'' AND status IN ('completed','review','deduplicated')
+            WHERE parent_task_id=? AND evidence_layer<>''
+              AND status IN ('completed','partial_completed','review','partial_review','deduplicated')
             """,
             (task_id,),
         )
@@ -2235,7 +2482,7 @@ def advance_analysis_task(task_id: str) -> dict:
         state["completed_layers"] = [layer for layer in EVIDENCE_LAYERS if layer in completed]
         pending = [layer for layer in EVIDENCE_LAYERS[1:] if layer not in completed]
         next_layer = pending[0] if pending else "final_report"
-        anchor, window_start, evidence = task_snapshot_context(task["lookback_days"])
+        anchor, window_start, evidence = task_snapshot_context(task["lookback_days"], task["target"])
         state["steps"] += 1
         prompt = build_agent_step_prompt(
             target=task["target"],
@@ -2376,6 +2623,7 @@ def delete_task(task_id: str) -> dict:
         if child_job_ids:
             child_marks = ",".join("?" for _ in child_job_ids)
             conn.execute(f"DELETE FROM source_job_snapshots WHERE job_id IN ({child_marks})", child_job_ids)
+            conn.execute(f"DELETE FROM source_collection_runs WHERE job_id IN ({child_marks})", child_job_ids)
             conn.execute(f"DELETE FROM source_collection_jobs WHERE id IN ({child_marks})", child_job_ids)
         conn.execute("DELETE FROM agent_events WHERE task_id=?", (task_id,))
         conn.execute("DELETE FROM tasks WHERE id=?", (task_id,))
