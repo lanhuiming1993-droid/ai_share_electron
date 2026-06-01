@@ -56,6 +56,17 @@ npm.cmd run start:api
 
 所有自建采集 HTTP 请求统一复用 `backend.http_policy` 中的浏览器 UA。新增 `requests` 采集器应使用 `browser_http_session()` 或 `browser_headers()`，避免各渠道散落不同的请求头。模型供应商 SDK 保留其官方默认请求头。
 
+## 企业化基础
+
+- `backend.source_registry` 统一维护内置信源的稳定标识、能力、凭据模式和风险等级
+- `schema_migrations` 记录 SQLite 版本迁移账本，后续升级必须登记 revision
+- `GET /health/live` 用于进程存活检查，`GET /health/ready` 用于 SQLite、红线策略、Skills 和采集 worker 就绪检查
+- `.github/workflows/ci.yml` 在提交和 PR 上执行后端测试、Python 编译检查和前端生产构建
+- `.github/dependabot.yml` 每周检查 Python、npm 和 GitHub Actions 依赖更新
+- `requirements-observability.txt` 提供可选 OpenTelemetry OTLP 链路导出，不影响默认本地桌面运行
+
+开源项目调研、已采纳设计和后续路线见 `docs/enterprise-roadmap.md`。
+
 ## 诊断日志
 
 后端、模型网关、采集 worker、前端交互和 Electron 主进程都会写入 `data/logs/`。日志采用 JSONL 格式并在写入前脱敏；API key、token、cookie、密码和 HAR 原文不会进入日志。

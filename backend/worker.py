@@ -79,34 +79,41 @@ class CollectionWorker:
         if self.thread and self.thread.is_alive():
             log_event(logger, "INFO", "worker.start.skipped", reason="already_running")
             return
+        self.stop_event.clear()
         self.thread = threading.Thread(target=self.run, daemon=True, name="source-collection-worker")
         self.thread.start()
         log_event(logger, "INFO", "worker.started", poll_seconds=self.poll_seconds)
 
-    def stop(self) -> None:
+    def stop(self, timeout_seconds: float = 5.0) -> None:
         self.stop_event.set()
-        log_event(logger, "INFO", "worker.stop.requested")
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=max(0.0, timeout_seconds))
+        log_event(logger, "INFO", "worker.stopped", thread_alive=bool(self.thread and self.thread.is_alive()))
 
     def run(self) -> None:
         while not self.stop_event.is_set():
-            job = self.claim_next()
-            if job:
-                log_event(
-                    logger,
-                    "INFO",
-                    "worker.job.claimed",
-                    job_id=job["id"],
-                    action=job["action"],
-                    status=job["status"],
-                    resume_report=bool(job.get("_resume_report")),
-                    parent_task_id=job.get("parent_task_id", ""),
-                    evidence_layer=job.get("evidence_layer", ""),
-                )
-                if job.pop("_resume_report", False):
-                    self.generate_report(job)
+            try:
+                job = self.claim_next()
+                if job:
+                    log_event(
+                        logger,
+                        "INFO",
+                        "worker.job.claimed",
+                        job_id=job["id"],
+                        action=job["action"],
+                        status=job["status"],
+                        resume_report=bool(job.get("_resume_report")),
+                        parent_task_id=job.get("parent_task_id", ""),
+                        evidence_layer=job.get("evidence_layer", ""),
+                    )
+                    if job.pop("_resume_report", False):
+                        self.generate_report(job)
+                    else:
+                        self.execute(job)
                 else:
-                    self.execute(job)
-            else:
+                    self.stop_event.wait(self.poll_seconds)
+            except Exception as exc:
+                log_exception(logger, "worker.loop.failed", exc)
                 self.stop_event.wait(self.poll_seconds)
 
     def claim_next(self) -> dict | None:

@@ -10,7 +10,7 @@ import sys
 import threading
 import time
 import tomllib
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -18,12 +18,13 @@ from uuid import uuid4
 
 import requests
 from cryptography.fernet import Fernet
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from backend.agent_runtime import AgentDecision, build_agent_step_prompt
+from backend.db_migrations import LATEST_SCHEMA_REVISION, ensure_migration_ledger, migration_status
 from backend.logging_config import (
     diagnostics_config,
     export_log_bundle,
@@ -35,6 +36,16 @@ from backend.logging_config import (
     set_request_id,
 )
 from backend.model_gateway import GatewayResult, ModelGateway, ProviderRuntimeConfig
+from backend.observability import configure_optional_telemetry
+from backend.runtime_health import (
+    callable_check,
+    database_check,
+    directory_check,
+    summarize_readiness,
+    telemetry_check,
+    worker_check,
+)
+from backend.source_registry import CANONICAL_CHANNEL_NAMES, source_catalog, tool_catalog
 from backend.worker import CollectionWorker
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -55,18 +66,24 @@ MARKET_DATA_DEFAULT_CONFIG = {
     "tushare_token": "",
     "component_timeout_seconds": 35,
 }
-CANONICAL_CHANNEL_NAMES = {
-    "akshare": "AkShare 市场数据",
-    "industry-news": "产业趋势公开资讯",
-    "zsxq": "知识星球",
-    "web-rumors": "MX 小作文频道",
-    "146aa28e21": "TG 小作文频道",
-}
 DATA_DIR.mkdir(exist_ok=True)
 logger = get_logger("api")
 frontend_logger = get_logger("frontend")
 
-app = FastAPI(title="A股成长猎手本地服务", version="0.1.0")
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    log_event(logger, "INFO", "application.startup.worker")
+    collection_worker.start()
+    log_event(logger, "INFO", "application.startup.channel_check_scheduled")
+    threading.Thread(target=refresh_browser_channel_states, daemon=True, name="channel-state-refresh").start()
+    try:
+        yield
+    finally:
+        log_event(logger, "INFO", "application.shutdown.worker")
+        collection_worker.stop()
+
+
+app = FastAPI(title="A股成长猎手本地服务", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:5173", "http://localhost:5173", "null"],
@@ -74,6 +91,7 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["X-Request-ID"],
 )
+TELEMETRY_STATUS = configure_optional_telemetry(app)
 
 
 @app.middleware("http")
@@ -708,34 +726,20 @@ def init_db() -> None:
             ("A股市场数据（AkShare / BaoStock / TuShare）", "结构化市场数据聚合"),
         )
         conn.execute("UPDATE channels SET name=? WHERE url=?", ("TG 小作文频道", "https://t.me/s/hejrb2333"))
+        ensure_migration_ledger(conn)
 
 
 init_db()
-log_event(logger, "INFO", "application.initialized", database=str(DB_PATH), version=app.version)
+log_event(
+    logger,
+    "INFO",
+    "application.initialized",
+    database=str(DB_PATH),
+    version=app.version,
+    schema_revision=LATEST_SCHEMA_REVISION,
+)
 
-TOOLS = [
-    {"id": "akshare", "name": "AkShare 市场数据", "kind": "python", "priority": 1, "status": "ready", "detail": "行情、财务、股东与公告基础数据"},
-    {"id": "requests", "name": "HTTP 请求采集", "kind": "python", "priority": 2, "status": "ready", "detail": "公开接口与结构化网页请求"},
-    {"id": "playwright", "name": "Playwright 持久化浏览器", "kind": "browser", "priority": 3, "status": "setup", "detail": "登录态渠道、动态网页与强反爬页面"},
-    {"id": "manual", "name": "其他人工补充渠道", "kind": "fallback", "priority": 4, "status": "standby", "detail": "保留来源说明，进入报告审查"},
-]
-
-TOOLS[0] = {
-    "id": "akshare",
-    "name": "A股市场数据聚合",
-    "kind": "python",
-    "priority": 1,
-    "status": "ready",
-    "detail": "AkShare 优先，BaoStock 自动后备，TuShare 配置 token 后参与；组件独立限时，单个上游异常不会阻塞全部市场数据。",
-}
-TOOLS[1] = {
-    "id": "requests",
-    "name": "HTTP 请求与产业资讯采集",
-    "kind": "python",
-    "priority": 2,
-    "status": "ready",
-    "detail": "公开接口、结构化网页与产业趋势公开资讯；东方财富请求串行限流，个股补证可追加公司资料、新闻和巨潮公告。",
-}
+TOOLS = tool_catalog()
 
 MASKED_API_KEY = MASKED_SECRET
 
@@ -1350,9 +1354,35 @@ def normalize_snapshot_record(snapshot_id: str, force: bool = False) -> dict:
     return result
 
 
+@app.get("/health/live")
+def health_live() -> dict:
+    return {"status": "ok", "service": "alphadesk-local-api", "version": app.version, "time": now()}
+
+
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok", "service": "alphadesk-local-api", "version": app.version, "time": now()}
+    return health_live()
+
+
+@app.get("/health/ready")
+def health_ready(response: Response) -> dict:
+    readiness = summarize_readiness(
+        [
+            database_check(DB_PATH),
+            callable_check("research_red_lines", research_red_lines, "Research red-line policy is valid."),
+            directory_check("skills_directory", SKILLS_DIR),
+            worker_check(collection_worker),
+            telemetry_check(TELEMETRY_STATUS),
+        ]
+    )
+    if readiness["status"] != "ready":
+        response.status_code = 503
+    return {
+        **readiness,
+        "service": "alphadesk-local-api",
+        "version": app.version,
+        "time": now(),
+    }
 
 
 @app.post("/api/diagnostics/frontend-logs", status_code=202)
@@ -1404,6 +1434,7 @@ def dashboard() -> dict:
             [dict(row) for row in conn.execute("SELECT * FROM source_collection_jobs ORDER BY created_at DESC LIMIT 80")],
         )
         channels = [dict(row) for row in conn.execute("SELECT * FROM channels ORDER BY builtin DESC, updated_at")]
+        schema = migration_status(conn)
     for channel in channels:
         channel["group_ids"] = json.loads(channel.get("group_ids") or "[]")
         channel["profile_exists"] = browser_profile(channel["id"]).exists()
@@ -1420,6 +1451,8 @@ def dashboard() -> dict:
         "codex_policy": codex_policy(),
         "research_red_lines": research_red_lines(),
         "tools": TOOLS,
+        "source_catalog": source_catalog(),
+        "schema": schema,
         "channels": channels,
         "skills": skills,
         "tasks": tasks,
@@ -1878,12 +1911,6 @@ def check_all_channels() -> dict:
     return {"status": "ok", "message": "已完成浏览器渠道巡检"}
 
 
-@app.on_event("startup")
-def schedule_startup_channel_check() -> None:
-    log_event(logger, "INFO", "application.startup.channel_check_scheduled")
-    threading.Thread(target=refresh_browser_channel_states, daemon=True).start()
-
-
 def iso(value: datetime) -> str:
     return value.astimezone().isoformat(timespec="seconds")
 
@@ -2075,18 +2102,6 @@ collection_worker = CollectionWorker(
     normalize_snapshot=normalize_snapshot_record,
     request_config_for=channel_request_config,
 )
-
-
-@app.on_event("startup")
-def start_collection_worker() -> None:
-    log_event(logger, "INFO", "application.startup.worker")
-    collection_worker.start()
-
-
-@app.on_event("shutdown")
-def stop_collection_worker() -> None:
-    log_event(logger, "INFO", "application.shutdown.worker")
-    collection_worker.stop()
 
 
 def insert_source_job(conn: sqlite3.Connection, job: dict) -> None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import tempfile
+import time
 import unittest
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -46,6 +47,7 @@ class WorkerBehaviorTests(unittest.TestCase):
                   id TEXT PRIMARY KEY, action TEXT NOT NULL, windows TEXT NOT NULL,
                   parent_task_id TEXT NOT NULL DEFAULT '', query TEXT NOT NULL DEFAULT '',
                   evidence_layer TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
+                  created_at TEXT NOT NULL DEFAULT '',
                   snapshot_count INTEGER NOT NULL DEFAULT 0, completed_at TEXT NOT NULL DEFAULT '',
                   error TEXT NOT NULL DEFAULT '', report TEXT, report_anchor TEXT NOT NULL DEFAULT ''
                 );
@@ -128,6 +130,22 @@ class WorkerBehaviorTests(unittest.TestCase):
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM source_collection_watermarks_v2").fetchone()[0], 1)
             runs = dict(conn.execute("SELECT channel_id,status FROM source_collection_runs"))
             self.assertEqual(runs, {"good": "completed", "bad": "failed"})
+
+    def test_worker_can_restart_after_clean_stop(self) -> None:
+        self.worker.start()
+        self.assertTrue(self.worker.thread and self.worker.thread.is_alive())
+        self.worker.stop(timeout_seconds=1)
+        self.assertFalse(self.worker.thread and self.worker.thread.is_alive())
+        self.worker.start()
+        self.assertTrue(self.worker.thread and self.worker.thread.is_alive())
+        self.worker.stop(timeout_seconds=1)
+
+    def test_worker_survives_transient_loop_error(self) -> None:
+        with patch.object(self.worker, "claim_next", side_effect=[RuntimeError("temporary failure"), None, None]):
+            self.worker.start()
+            time.sleep(0.04)
+            self.assertTrue(self.worker.thread and self.worker.thread.is_alive())
+            self.worker.stop(timeout_seconds=1)
 
     def test_zero_new_snapshots_still_advance_watermark(self) -> None:
         self.insert_channels("good")
