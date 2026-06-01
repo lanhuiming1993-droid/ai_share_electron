@@ -1,5 +1,6 @@
-const { app, BrowserWindow } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain } = require("electron");
 const { spawn } = require("child_process");
+const fs = require("fs/promises");
 const http = require("http");
 const path = require("path");
 
@@ -69,11 +70,31 @@ function createWindow() {
     minHeight: 760,
     backgroundColor: "#08111f",
     titleBarStyle: "hiddenInset",
-    webPreferences: { contextIsolation: true, sandbox: true },
+    webPreferences: {
+      contextIsolation: true,
+      sandbox: true,
+      preload: path.join(__dirname, "preload.cjs"),
+    },
   });
   const devUrl = process.env.VITE_DEV_SERVER_URL;
   mainWindow.loadURL(devUrl || `file://${path.join(__dirname, "..", "frontend", "dist", "index.html")}`);
 }
+
+ipcMain.handle("alphadesk:save-html-report", async (_event, payload = {}) => {
+  const html = typeof payload.html === "string" ? payload.html : "";
+  if (!html.trim()) throw new Error("HTML report content is empty");
+  const requestedName = typeof payload.filename === "string" ? payload.filename : "AlphaDesk-report.html";
+  const safeName = requestedName.replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").slice(0, 120) || "AlphaDesk-report.html";
+  const filename = safeName.toLowerCase().endsWith(".html") ? safeName : `${safeName}.html`;
+  const result = await dialog.showSaveDialog(mainWindow, {
+    title: "导出 HTML 报告",
+    defaultPath: path.join(app.getPath("documents"), filename),
+    filters: [{ name: "HTML 报告", extensions: ["html"] }],
+  });
+  if (result.canceled || !result.filePath) return { status: "cancelled" };
+  await fs.writeFile(result.filePath, html, "utf8");
+  return { status: "saved", filePath: result.filePath };
+});
 
 app.on("second-instance", () => {
   if (!mainWindow) return;

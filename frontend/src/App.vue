@@ -9,6 +9,7 @@ const sourceJob = reactive({ action: "collect", channel_ids: [], lookback_days: 
 const activePage = ref("dashboard");
 const notice = ref("");
 const selectedReport = ref("");
+const selectedReportTitle = ref("");
 const reportModal = ref(false);
 const sourceJobSubmitting = ref(false);
 const sourceJobFeedback = ref("");
@@ -227,7 +228,7 @@ async function createSourceJob() {
     notice.value = message;
     sourceJobFeedback.value = message;
     sourceJobFeedbackType.value = result.status === "deduplicated" || result.deduplicated ? "warn" : "success";
-    if (result.report) openReport(result.report);
+    if (result.report) openReport(result.report, result.report_title);
     await refresh();
   } catch (error) {
     notice.value = error.message;
@@ -243,7 +244,7 @@ async function retrySourceJob(job) {
   try {
     const result = await request(`/api/source-jobs/${job.id}/retry`, { method: "POST" });
     notice.value = result.status === "review" ? "报告已重新生成，等待审查" : "信源任务已重新进入采集队列";
-    if (result.report) openReport(result.report);
+    if (result.report) openReport(result.report, result.report_title || job.report_title);
     await refresh();
   } catch (error) { notice.value = error.message; }
 }
@@ -259,7 +260,7 @@ async function openSnapshots(job) {
 async function openJobReport(job) {
   try {
     const result = await request(`/api/source-jobs/${job.id}/report`);
-    openReport(result.report);
+    openReport(result.report, result.report_title || job.report_title);
   } catch (error) { notice.value = error.message; }
 }
 
@@ -318,7 +319,8 @@ async function runTask(id) {
   notice.value = "模型正在编排研究计划...";
   try {
     const result = await request(`/api/tasks/${id}/analyze`, { method: "POST" });
-    if (result.report) openReport(result.report);
+    const taskItem = data.tasks.find((item) => item.id === id);
+    if (result.report) openReport(result.report, taskItem ? `${taskItem.target} - ${taskItem.title}` : "个股研究报告");
     notice.value = result.status === "review"
       ? "AI 研究报告已生成，等待审查"
       : `Agent 已请求 ${result.evidence_layer} 证据，采集器正在执行`;
@@ -553,14 +555,16 @@ function normalizeChannelForm() {
   channelForm.max_scrolls = Number(channelForm.max_scrolls);
 }
 
-function openReport(report) {
+function openReport(report, title = "AlphaDesk 报告") {
   selectedReport.value = report;
+  selectedReportTitle.value = title || "AlphaDesk 报告";
   reportModal.value = true;
 }
 
 function closeReport() {
   reportModal.value = false;
   selectedReport.value = "";
+  selectedReportTitle.value = "";
 }
 
 function escapeHtml(value) {
@@ -582,6 +586,45 @@ function buildReportPreviewDocument(report) {
       : text.replace(/<html([^>]*)>/i, `<html$1><head>${csp}</head>`);
   }
   return `<!DOCTYPE html><html><head>${csp}<style>body{margin:0;padding:32px;background:#f8fafc;color:#1e293b;font-family:Inter,"Microsoft YaHei",sans-serif}.notice{margin-bottom:20px;padding:12px 14px;border:1px solid #f59e0b;border-radius:10px;background:#fffbeb;color:#92400e;font-size:13px}pre{white-space:pre-wrap;word-break:break-word;line-height:1.75;font-size:14px}</style></head><body><div class="notice">历史报告：生成于 HTML-only 红线启用之前，暂以纯文本兼容预览。重新生成后将使用 HTML 格式。</div><pre>${escapeHtml(text)}</pre></body></html>`;
+}
+
+function buildReportExportDocument(report) {
+  const text = (report || "").trim();
+  return /<html(?:\s|>)/i.test(text) && /<body(?:\s|>)/i.test(text)
+    ? text
+    : buildReportPreviewDocument(text);
+}
+
+function reportExportFilename() {
+  const stem = (selectedReportTitle.value || "AlphaDesk 报告")
+    .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_")
+    .trim()
+    .slice(0, 100) || "AlphaDesk 报告";
+  return `${stem}.html`;
+}
+
+async function exportReportHtml() {
+  const filename = reportExportFilename();
+  const html = buildReportExportDocument(selectedReport.value);
+  try {
+    if (window.alphadesk?.saveHtmlReport) {
+      const result = await window.alphadesk.saveHtmlReport({ filename, html });
+      if (result.status === "cancelled") return;
+      notice.value = `HTML 报告已导出：${result.filePath}`;
+      return;
+    }
+    const url = URL.createObjectURL(new Blob([html], { type: "text/html;charset=utf-8" }));
+    const anchor = document.createElement("a");
+    anchor.href = url;
+    anchor.download = filename;
+    document.body.appendChild(anchor);
+    anchor.click();
+    anchor.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    notice.value = `HTML 报告已下载：${filename}`;
+  } catch (error) {
+    notice.value = `HTML 报告导出失败：${error.message}`;
+  }
 }
 
 function closeTopmostModal(event) {
@@ -703,7 +746,7 @@ onUnmounted(() => {
                     <p class="text-sm font-medium text-white">{{ item.target }} · {{ item.title }}</p>
                     <p class="mt-1 text-xs text-slate-600">{{ item.created_at }} · {{ item.status }}</p>
                   </div>
-                  <button v-if="item.report" @click="openReport(item.report)" class="report-action">查看报告</button>
+                  <button v-if="item.report" @click="openReport(item.report, `${item.target} - ${item.title}`)" class="report-action">查看报告</button>
                   <button v-else-if="canRunTask(item)" @click="runTask(item.id)" class="secondary">{{ taskActionLabel(item) }}</button>
                   <span v-else class="status-warn">{{ taskActionLabel(item) }}</span>
                 </div>
@@ -767,7 +810,7 @@ onUnmounted(() => {
                 <p v-if="item.agent_error" class="mt-2 text-xs text-rose-300">{{ item.agent_error }}</p>
               </div>
               <div class="flex shrink-0 items-center gap-2">
-                <button v-if="item.report" @click="openReport(item.report)" class="report-action">查看报告</button>
+                <button v-if="item.report" @click="openReport(item.report, `${item.target} - ${item.title}`)" class="report-action">查看报告</button>
                 <button v-if="canRunTask(item)" @click="runTask(item.id)" class="secondary">{{ taskActionLabel(item) }}</button>
                 <span v-else-if="!item.report" class="status-warn">{{ taskActionLabel(item) }}</span>
                 <button @click="resetTask(item)" class="secondary">重置</button>
@@ -1101,7 +1144,10 @@ onUnmounted(() => {
             <h2 class="text-lg font-semibold text-white">HTML 报告预览</h2>
             <p class="mt-1 text-xs text-slate-500">隔离预览 · 禁止脚本执行 · 新生成报告严禁 Markdown</p>
           </div>
-          <button @click="closeReport" class="flex h-8 w-8 items-center justify-center rounded-full text-lg text-slate-500 transition hover:bg-white/[.06] hover:text-white">×</button>
+          <div class="flex items-center gap-2">
+            <button @click="exportReportHtml" class="report-action">导出 HTML</button>
+            <button @click="closeReport" class="flex h-8 w-8 items-center justify-center rounded-full text-lg text-slate-500 transition hover:bg-white/[.06] hover:text-white">×</button>
+          </div>
         </header>
         <div class="bg-slate-100 p-3">
           <iframe :srcdoc="reportPreviewDocument" sandbox="" referrerpolicy="no-referrer" title="HTML 报告预览" class="h-[78vh] w-full rounded-xl border-0 bg-white"></iframe>
