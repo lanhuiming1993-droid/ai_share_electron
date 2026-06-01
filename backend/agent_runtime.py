@@ -1,14 +1,29 @@
 from __future__ import annotations
 
-import json
-import re
 from pathlib import Path
-from typing import Any
+from typing import Literal
 
 from fastapi import HTTPException
+from pydantic import BaseModel, model_validator
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILLS_DIR = ROOT / "skills"
+
+
+class AgentDecision(BaseModel):
+    decision: Literal["need_evidence", "final"]
+    next_source: str = ""
+    reason: str = ""
+    report: str = ""
+    used_model_knowledge: bool = False
+
+    @model_validator(mode="after")
+    def validate_decision(self):
+        if self.decision == "need_evidence" and not self.next_source:
+            raise ValueError("模型请求证据时缺少 next_source")
+        if self.decision == "final" and not self.report:
+            raise ValueError("模型完成分析时缺少 report")
+        return self
 
 
 def load_skill(skill_name: str) -> str:
@@ -95,21 +110,3 @@ def build_agent_step_prompt(
 
 禁止跳过证据层、禁止虚构已采集数据、禁止输出 JSON 以外的内容。
 如果输出最终报告，JSON 的 `report` 字段必须是完整 HTML 文档字符串，严禁 Markdown。"""
-
-
-def parse_agent_decision(raw: str) -> dict[str, Any]:
-    text = raw.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
-    try:
-        decision = json.loads(text)
-    except json.JSONDecodeError as exc:
-        raise ValueError("模型没有返回可解析的 Agent JSON") from exc
-    if not isinstance(decision, dict) or decision.get("decision") not in ("need_evidence", "final"):
-        raise ValueError("模型返回的 Agent JSON 缺少有效 decision")
-    if decision["decision"] == "need_evidence" and not decision.get("next_source"):
-        raise ValueError("模型请求证据时缺少 next_source")
-    if decision["decision"] == "final" and not decision.get("report"):
-        raise ValueError("模型完成分析时缺少 report")
-    return decision

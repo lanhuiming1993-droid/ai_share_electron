@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 from backend.collectors import collect_http
 from backend.industry_news_sources import collect_public_industry_news
+from backend.model_gateway import GatewayResult, ModelGateway, ProviderRuntimeConfig
 from backend.worker import CollectionWorker
 
 
@@ -256,8 +257,9 @@ class MainBehaviorTests(unittest.TestCase):
         self.assertEqual(tg_items[0]["content"], "world")
         self.assertGreaterEqual(tg_items[0]["quality_score"], 80)
 
-    def test_responses_provider_uses_responses_endpoint_and_extracts_output_text(self) -> None:
+    def test_provider_calls_pydantic_gateway_with_encrypted_runtime_config(self) -> None:
         provider = {
+            "id": "provider-test",
             "base_url": "https://api.openai.com/v1",
             "model": "gpt-test",
             "protocol": "openai_responses",
@@ -265,16 +267,19 @@ class MainBehaviorTests(unittest.TestCase):
             "enabled": True,
             "extra_body": {},
         }
-        response = Mock()
-        response.raise_for_status.return_value = None
-        response.json.return_value = {"output": [{"content": [{"type": "output_text", "text": "ok"}]}]}
         cipher = Mock()
         cipher.decrypt.return_value = b"secret"
-        with patch.object(self.main, "provider_row", return_value=provider), patch.object(self.main, "cipher", return_value=cipher), patch.object(self.main.requests, "post", return_value=response) as post:
+        gateway_result = GatewayResult(output="ok", input_tokens=3, output_tokens=1, requests=1)
+        with patch.object(self.main, "provider_row", return_value=provider), patch.object(self.main, "cipher", return_value=cipher), patch.object(self.main.model_gateway, "run_text", return_value=gateway_result) as run_text:
             result = self.main.call_provider("hello", system_prompt="rules")
         self.assertEqual(result, "ok")
-        self.assertEqual(post.call_args.args[0], "https://api.openai.com/v1/responses")
-        self.assertEqual(post.call_args.kwargs["json"], {"model": "gpt-test", "instructions": "rules", "input": "hello", "store": False})
+        config = run_text.call_args.args[0]
+        self.assertEqual(config.api_key, "secret")
+        self.assertEqual(config.protocol, "openai_responses")
+        self.assertEqual(run_text.call_args.kwargs["instructions"], "rules")
+        with self.main.db() as conn:
+            log = conn.execute("SELECT status,input_tokens,output_tokens,request_count FROM model_call_logs").fetchone()
+        self.assertEqual(tuple(log), ("completed", 3, 1, 1))
 
     def test_stock_context_can_include_general_source_reports(self) -> None:
         now = timestamp()
@@ -347,9 +352,10 @@ class MainBehaviorTests(unittest.TestCase):
                 ],
             )
 
-        def capture_prompt(prompt, system_prompt=""):
+        def capture_prompt(prompt, system_prompt="", purpose=""):
             self.assertIn("SELECTED_CONTENT", prompt)
             self.assertNotIn("EXCLUDED_CONTENT", prompt)
+            self.assertEqual(purpose, "source_report")
             return "<html><head></head><body>ok</body></html>"
 
         with patch.object(self.main, "call_provider", side_effect=capture_prompt):
@@ -357,6 +363,36 @@ class MainBehaviorTests(unittest.TestCase):
                 self.main.SourceJobInput(action="report", channel_ids=["selected"], report_title="selected only")
             )
         self.assertIn("<html>", report)
+
+
+class ModelGatewayBehaviorTests(unittest.TestCase):
+    def test_responses_model_disables_remote_storage(self) -> None:
+        gateway = ModelGateway()
+        config = ProviderRuntimeConfig(
+            id="responses",
+            base_url="https://api.openai.com/v1",
+            model="gpt-test",
+            protocol="openai_responses",
+            api_key="secret",
+            extra_body={},
+        )
+        settings = gateway._model_settings(config)
+        self.assertFalse(settings["openai_store"])
+        self.assertNotIn("temperature", settings)
+
+    def test_chat_model_preserves_openai_compatible_parameters(self) -> None:
+        gateway = ModelGateway()
+        config = ProviderRuntimeConfig(
+            id="chat",
+            base_url="https://api.deepseek.com",
+            model="deepseek-test",
+            protocol="openai_chat_completions",
+            api_key="secret",
+            extra_body={"top_p": 0.9},
+        )
+        settings = gateway._model_settings(config)
+        self.assertEqual(settings["temperature"], 0.2)
+        self.assertEqual(settings["extra_body"], {"top_p": 0.9})
 
 
 class PaginationBehaviorTests(unittest.TestCase):

@@ -13,7 +13,7 @@ import tomllib
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 import requests
@@ -22,7 +22,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from backend.agent_runtime import build_agent_step_prompt, parse_agent_decision
+from backend.agent_runtime import AgentDecision, build_agent_step_prompt
+from backend.model_gateway import GatewayResult, ModelGateway, ProviderRuntimeConfig
 from backend.worker import CollectionWorker
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -112,6 +113,24 @@ class SourceSnapshotInput(BaseModel):
     occurred_at: datetime
     source_url: str
     content: str
+
+
+class NormalizedSourceItem(BaseModel):
+    item_key: str = ""
+    occurred_at: str = ""
+    author: str = ""
+    title: str = ""
+    content: str
+    source_url: str = ""
+    attachments: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    quality_score: int = Field(default=0, ge=0, le=100)
+
+
+class NormalizationResult(BaseModel):
+    items: list[NormalizedSourceItem]
+    quality_score: int = Field(default=0, ge=0, le=100)
+    notes: str = ""
 
 
 class CompleteSourceJobInput(BaseModel):
@@ -311,6 +330,18 @@ def init_db() -> None:
               last_test_at TEXT NOT NULL DEFAULT '',
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS model_call_logs (
+              id TEXT PRIMARY KEY,
+              provider_id TEXT NOT NULL,
+              purpose TEXT NOT NULL,
+              status TEXT NOT NULL,
+              latency_ms INTEGER NOT NULL DEFAULT 0,
+              input_tokens INTEGER NOT NULL DEFAULT 0,
+              output_tokens INTEGER NOT NULL DEFAULT 0,
+              request_count INTEGER NOT NULL DEFAULT 0,
+              error TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS tasks (
               id TEXT PRIMARY KEY,
@@ -789,34 +820,6 @@ def source_report_system_prompt() -> str:
 6. 报告重点是产业趋势、政策、供需、技术迭代、产能、订单、价格、上下游和公司公告。严禁输出技术面分析、交易策略或买卖点。"""
 
 
-def provider_endpoint(provider: dict) -> str:
-    base_url = provider["base_url"].rstrip("/")
-    resource = "responses" if provider["protocol"] == "openai_responses" else "chat/completions"
-    if base_url.endswith(f"/{resource}"):
-        return base_url
-    if base_url.endswith("/v1"):
-        return base_url + f"/{resource}"
-    return base_url + f"/v1/{resource}"
-
-
-def provider_response_text(provider: dict, response_body: dict) -> str:
-    if provider["protocol"] == "openai_chat_completions":
-        return str(response_body["choices"][0]["message"]["content"])
-    output_text = response_body.get("output_text")
-    if isinstance(output_text, str) and output_text:
-        return output_text
-    chunks = []
-    for item in response_body.get("output", []):
-        if not isinstance(item, dict):
-            continue
-        for content in item.get("content", []):
-            if isinstance(content, dict) and content.get("type") in {"output_text", "text"} and content.get("text"):
-                chunks.append(str(content["text"]))
-    if not chunks:
-        raise ValueError("Responses API returned no output text")
-    return "".join(chunks)
-
-
 def normalization_system_prompt() -> str:
     research_red_lines()
     return """你是信源数据整理器，不是研究分析模型。你只能对已采集的原始快照执行以下操作：
@@ -830,51 +833,87 @@ def normalization_system_prompt() -> str:
 必须只输出 JSON 对象，不要输出 Markdown 代码围栏。"""
 
 
-def call_provider(prompt: str, provider_id: str = "", system_prompt: str = "") -> str:
+model_gateway = ModelGateway()
+
+
+def provider_runtime_config(provider: dict) -> ProviderRuntimeConfig:
+    return ProviderRuntimeConfig(
+        id=provider["id"],
+        base_url=provider["base_url"],
+        model=provider["model"],
+        protocol=provider["protocol"],
+        api_key=cipher().decrypt(provider["encrypted_api_key"].encode()).decode(),
+        extra_body=provider.get("extra_body") or {},
+    )
+
+
+def record_model_call(provider_id: str, purpose: str, status: str, latency_ms: int, result: GatewayResult | None = None, error: str = "") -> None:
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO model_call_logs(id,provider_id,purpose,status,latency_ms,input_tokens,output_tokens,request_count,error,created_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                uuid4().hex[:12],
+                provider_id,
+                purpose,
+                status,
+                latency_ms,
+                result.input_tokens if result else 0,
+                result.output_tokens if result else 0,
+                result.requests if result else 0,
+                error[:1200],
+                now(),
+            ),
+        )
+
+
+def call_provider(prompt: str, provider_id: str = "", system_prompt: str = "", purpose: str = "text") -> str:
     research_red_lines()
     provider = provider_row(provider_id)
     if not provider or not provider.get("encrypted_api_key"):
         raise HTTPException(409, "请先在设置中配置模型供应商")
     if not provider["enabled"]:
         raise HTTPException(409, "模型通道已停用")
-    api_key = cipher().decrypt(provider["encrypted_api_key"].encode()).decode()
-    url = provider_endpoint(provider)
-    if provider["protocol"] == "openai_responses":
-        payload = {
-            "model": provider["model"],
-            "instructions": system_prompt or analysis_system_prompt(),
-            "input": prompt,
-            "store": False,
-        }
-    else:
-        payload = {
-            "model": provider["model"],
-            "messages": [
-                {"role": "system", "content": system_prompt or analysis_system_prompt()},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0.2,
-        }
-    payload.update(provider.get("extra_body") or {})
+    config = provider_runtime_config(provider)
+    started_at = time.perf_counter()
     try:
-        response = requests.post(url, headers={"Authorization": f"Bearer {api_key}"}, json=payload, timeout=90)
-        response.raise_for_status()
-        return provider_response_text(provider, response.json())
-    except requests.RequestException as exc:
-        raise HTTPException(502, f"模型供应商请求失败: {exc}") from exc
-    except (KeyError, TypeError, ValueError) as exc:
-        raise HTTPException(502, f"模型供应商返回格式异常: {exc}") from exc
+        result = model_gateway.run_text(config, prompt, instructions=system_prompt or analysis_system_prompt())
+    except Exception as exc:
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        detail = str(exc).replace(config.api_key, "[REDACTED]")
+        record_model_call(provider["id"], purpose, "failed", latency_ms, error=f"{type(exc).__name__}: {detail}")
+        raise HTTPException(502, f"模型供应商请求失败: {type(exc).__name__}: {detail}") from exc
+    latency_ms = int((time.perf_counter() - started_at) * 1000)
+    record_model_call(provider["id"], purpose, "completed", latency_ms, result)
+    return str(result.output)
 
 
-def parse_json_object(raw: str) -> dict:
-    text = raw.strip()
-    if text.startswith("```"):
-        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
-        text = re.sub(r"\s*```$", "", text)
-    value = json.loads(text)
-    if not isinstance(value, dict):
-        raise ValueError("Model response must be a JSON object")
-    return value
+def call_provider_structured(prompt: str, output_type: type[BaseModel], provider_id: str = "", system_prompt: str = "", purpose: str = "structured") -> BaseModel:
+    research_red_lines()
+    provider = provider_row(provider_id)
+    if not provider or not provider.get("encrypted_api_key"):
+        raise HTTPException(409, "请先在设置中配置模型供应商")
+    if not provider["enabled"]:
+        raise HTTPException(409, "模型通道已停用")
+    config = provider_runtime_config(provider)
+    started_at = time.perf_counter()
+    try:
+        result = model_gateway.run_structured(
+            config,
+            prompt,
+            instructions=system_prompt or analysis_system_prompt(),
+            output_type=output_type,
+        )
+    except Exception as exc:
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        detail = str(exc).replace(config.api_key, "[REDACTED]")
+        record_model_call(provider["id"], purpose, "failed", latency_ms, error=f"{type(exc).__name__}: {detail}")
+        raise HTTPException(502, f"模型供应商请求失败: {type(exc).__name__}: {detail}") from exc
+    latency_ms = int((time.perf_counter() - started_at) * 1000)
+    record_model_call(provider["id"], purpose, "completed", latency_ms, result)
+    return result.output
 
 
 def clamp_quality_score(value: object, default: int = 0) -> int:
@@ -1070,42 +1109,37 @@ def ai_normalized_items(snapshot: sqlite3.Row, channel: sqlite3.Row, mode: str) 
         f"Collected at: {snapshot['collected_at']}\n"
         f"Raw snapshot content:\n{str(snapshot['content'] or '')[:120_000]}"
     )
-    payload = parse_json_object(call_provider(prompt, system_prompt=normalization_system_prompt()))
-    raw_items = payload.get("items", [])
-    if not isinstance(raw_items, list):
-        raise ValueError("Model response items must be a list")
-    top_score = clamp_quality_score(payload.get("quality_score"), 0)
-    notes = str(payload.get("notes", "") or "")[:1_000]
+    payload = call_provider_structured(
+        prompt,
+        NormalizationResult,
+        system_prompt=normalization_system_prompt(),
+        purpose="normalization",
+    )
+    raw_items = payload.items
+    top_score = clamp_quality_score(payload.quality_score, 0)
+    notes = str(payload.notes or "")[:1_000]
     items: list[dict] = []
     for raw_item in raw_items[:100]:
-        if not isinstance(raw_item, dict):
-            continue
-        content = str(raw_item.get("content", "") or "").strip()
+        content = str(raw_item.content or "").strip()
         if not content:
             continue
-        occurred_at = normalized_occurred_at(raw_item.get("occurred_at"), snapshot["occurred_at"] or snapshot["collected_at"])
-        source_url = str(raw_item.get("source_url", "") or snapshot["source_url"] or "").strip()
-        title = str(raw_item.get("title", "") or "").strip()
-        item_key = str(raw_item.get("item_key", "") or "").strip()
-        attachments = raw_item.get("attachments", [])
-        metadata = raw_item.get("metadata", {})
-        if not isinstance(attachments, list):
-            attachments = []
-        if not isinstance(metadata, dict):
-            metadata = {}
+        occurred_at = normalized_occurred_at(raw_item.occurred_at, snapshot["occurred_at"] or snapshot["collected_at"])
+        source_url = str(raw_item.source_url or snapshot["source_url"] or "").strip()
+        title = str(raw_item.title or "").strip()
+        item_key = str(raw_item.item_key or "").strip()
         if not item_key:
             item_key = stable_item_key(snapshot["channel_id"], source_url, occurred_at, title, content)
         items.append(
             {
                 "item_key": item_key[:255],
                 "occurred_at": occurred_at,
-                "author": str(raw_item.get("author", "") or "")[:255],
+                "author": str(raw_item.author or "")[:255],
                 "title": title[:500],
                 "content": content,
                 "source_url": source_url[:2_000],
-                "attachments": attachments,
-                "metadata": metadata,
-                "quality_score": clamp_quality_score(raw_item.get("quality_score"), top_score),
+                "attachments": raw_item.attachments,
+                "metadata": raw_item.metadata,
+                "quality_score": clamp_quality_score(raw_item.quality_score, top_score),
                 "normalization_mode": mode,
             }
         )
@@ -1868,7 +1902,7 @@ def generate_source_report(payload: SourceJobInput) -> tuple[str, str]:
 
 通用信源快照：
 {context}"""
-    return require_html_report(call_provider(prompt, system_prompt=source_report_system_prompt())), anchor
+    return require_html_report(call_provider(prompt, system_prompt=source_report_system_prompt(), purpose="source_report")), anchor
 
 
 def report_after_collection(job: dict) -> tuple[str, str]:
@@ -2390,7 +2424,7 @@ def activate_provider(provider_id: str) -> dict:
 def test_provider(provider_id: str) -> dict:
     started = time.perf_counter()
     try:
-        answer = call_provider("只回复：模型通道可用", provider_id)
+        answer = call_provider("只回复：模型通道可用", provider_id, purpose="provider_health_check")
     except HTTPException:
         with db() as conn:
             conn.execute("UPDATE model_providers SET status='failed',last_test_at=?,updated_at=? WHERE id=?", (now(), now(), provider_id))
@@ -2606,7 +2640,7 @@ def advance_analysis_task(task_id: str) -> dict:
             next_layer=next_layer,
             allow_model_knowledge="model_knowledge" in completed,
         )
-        decision = parse_agent_decision(call_provider(prompt))
+        decision = call_provider_structured(prompt, AgentDecision, purpose="stock_agent_decision").model_dump()
         record_agent_event(task_id, "model_decision", {"next_allowed_layer": next_layer, "decision": decision})
         if decision["decision"] == "final":
             if decision.get("used_model_knowledge") and "model_knowledge" not in completed:
