@@ -14,6 +14,7 @@ from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import requests
@@ -46,7 +47,14 @@ from backend.runtime_health import (
     worker_check,
 )
 from backend.source_registry import CANONICAL_CHANNEL_NAMES, source_catalog, tool_catalog
-from backend.wechat_rss import check_werss, managed_werss_status, normalize_werss_config, public_werss_config, start_managed_werss
+from backend.wechat_rss import (
+    managed_werss_status,
+    normalize_werss_config,
+    public_werss_config,
+    start_managed_werss,
+    start_werss_wechat_login,
+    werss_wechat_login_status,
+)
 from backend.worker import CollectionWorker
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -231,6 +239,8 @@ class WechatRssConfigInput(BaseModel):
     feed_ids: list[str] = Field(default_factory=lambda: ["all"])
     access_key: str = Field(default="", repr=False)
     secret_key: str = Field(default="", repr=False)
+    admin_username: str = "admin"
+    admin_password: str = Field(default="", repr=False)
     clear_credentials: bool = False
     timeout_seconds: int = Field(default=20, ge=3, le=120)
     max_items_per_feed: int = Field(default=100, ge=1, le=500)
@@ -721,7 +731,7 @@ def init_db() -> None:
                 "http://127.0.0.1:8001",
                 "wechat_rss",
                 "pending",
-                "读取独立部署的 WeRSS RSS 服务；请先在 WeRSS 中完成公众号订阅",
+                "微信扫码登录后自动同步已订阅公众号，并按严格时间窗读取文章快照",
                 "fixed",
                 85,
                 1,
@@ -734,7 +744,7 @@ def init_db() -> None:
             """
             UPDATE channels
             SET name='微信公众号（WeRSS）',type='外部 RSS 聚合',collection_mode='wechat_rss',
-                notes='读取独立部署的 WeRSS RSS 服务；请先在 WeRSS 中完成公众号订阅',
+                notes='微信扫码登录后自动同步已订阅公众号，并按严格时间窗读取文章快照',
                 parsing_strategy='fixed',normalization_quality_threshold=85,max_scrolls=1,
                 research_enabled=1,builtin=1
             WHERE id='wechat-mp-rss'
@@ -1770,12 +1780,14 @@ def update_wechat_rss_config(payload: WechatRssConfigInput) -> dict:
     existing = wechat_rss_config()
     supplied_access_key = payload.access_key.strip()
     supplied_secret_key = payload.secret_key.strip()
+    supplied_admin_password = payload.admin_password.strip()
     if payload.clear_credentials:
         access_key = ""
         secret_key = ""
     else:
         access_key = supplied_access_key if supplied_access_key and supplied_access_key != MASKED_SECRET else str(existing.get("access_key") or "")
         secret_key = supplied_secret_key if supplied_secret_key and supplied_secret_key != MASKED_SECRET else str(existing.get("secret_key") or "")
+    admin_password = supplied_admin_password if supplied_admin_password and supplied_admin_password != MASKED_SECRET else str(existing.get("admin_password") or "admin@123")
     try:
         config = normalize_werss_config(
             {
@@ -1783,6 +1795,8 @@ def update_wechat_rss_config(payload: WechatRssConfigInput) -> dict:
                 "feed_ids": payload.feed_ids,
                 "access_key": access_key,
                 "secret_key": secret_key,
+                "admin_username": payload.admin_username,
+                "admin_password": admin_password,
                 "timeout_seconds": payload.timeout_seconds,
                 "max_items_per_feed": payload.max_items_per_feed,
             }
@@ -1808,7 +1822,92 @@ def update_wechat_rss_config(payload: WechatRssConfigInput) -> dict:
 
 @app.get("/api/channels/wechat-mp-rss/component-status")
 def wechat_rss_component_status() -> dict:
-    return managed_werss_status(wechat_rss_config())
+    return persist_wechat_rss_status(managed_werss_status(wechat_rss_config()))
+
+
+def persist_wechat_rss_status(result: dict) -> dict:
+    status = "online" if result.get("ready") else ("pending" if result.get("service_online") else "offline")
+    checked_at = str(result.get("checked_at") or now())
+    result["status"] = status
+    with db() as conn:
+        conn.execute(
+            "UPDATE channels SET status=?,last_check=?,updated_at=? WHERE id='wechat-mp-rss'",
+            (status, checked_at, checked_at),
+        )
+    return result
+
+
+@app.post("/api/channels/wechat-mp-rss/wechat-login")
+def start_wechat_rss_login() -> dict:
+    config = wechat_rss_config()
+    status = managed_werss_status(config)
+    if not status["service_online"]:
+        hostname = str(urlsplit(config["base_url"]).hostname or "").lower()
+        if hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise HTTPException(409, "WeRSS 服务不可用，请检查高级配置中的服务地址")
+        log_event(logger, "INFO", "channel.wechat_rss.sidecar.autostarting", channel_id="wechat-mp-rss")
+        try:
+            start_managed_werss()
+        except Exception as exc:
+            log_exception(logger, "channel.wechat_rss.sidecar.failed", exc, channel_id="wechat-mp-rss")
+            raise HTTPException(409, str(exc)) from exc
+        for _ in range(30):
+            time.sleep(0.5)
+            status = managed_werss_status(config)
+            if status["service_online"]:
+                break
+        if not status["service_online"]:
+            raise HTTPException(409, "WeRSS 本地组件尚未就绪，请稍后重试")
+    try:
+        result = start_werss_wechat_login(config)
+    except Exception as exc:
+        log_exception(logger, "channel.wechat_rss.login.failed", exc, channel_id="wechat-mp-rss")
+        raise HTTPException(409, str(exc)) from exc
+    log_event(logger, "INFO", "channel.wechat_rss.login.qr_created", channel_id="wechat-mp-rss")
+    return result
+
+
+@app.get("/api/channels/wechat-mp-rss/wechat-login/status")
+def wechat_rss_login_status() -> dict:
+    try:
+        result = werss_wechat_login_status(wechat_rss_config())
+    except Exception as exc:
+        log_exception(logger, "channel.wechat_rss.login.status_failed", exc, channel_id="wechat-mp-rss")
+        raise HTTPException(409, str(exc)) from exc
+    if result["authorized"]:
+        status = persist_wechat_rss_status(managed_werss_status(wechat_rss_config()))
+        result.update(
+            {
+                "ready": status["ready"],
+                "subscriptions": status["subscriptions"],
+                "subscription_count": status["subscription_count"],
+            }
+        )
+        log_event(
+            logger,
+            "INFO",
+            "channel.wechat_rss.login.authorized",
+            channel_id="wechat-mp-rss",
+            subscription_count=status["subscription_count"],
+            ready=status["ready"],
+        )
+    return result
+
+
+@app.get("/api/channels/wechat-mp-rss/subscriptions")
+def wechat_rss_subscriptions() -> dict:
+    try:
+        status = persist_wechat_rss_status(managed_werss_status(wechat_rss_config()))
+    except Exception as exc:
+        log_exception(logger, "channel.wechat_rss.subscriptions.failed", exc, channel_id="wechat-mp-rss")
+        raise HTTPException(409, str(exc)) from exc
+    return {
+        "status": status["status"],
+        "ready": status["ready"],
+        "subscriptions": status["subscriptions"],
+        "subscription_count": status["subscription_count"],
+        "message": status["message"],
+    }
 
 
 @app.post("/api/channels/wechat-mp-rss/start-sidecar")
@@ -1823,9 +1922,9 @@ def start_wechat_rss_sidecar() -> dict:
         status = managed_werss_status(wechat_rss_config())
         if status["service_online"]:
             log_event(logger, "INFO", "channel.wechat_rss.sidecar.started", channel_id="wechat-mp-rss", rss_online=status["rss_online"])
-            return status
+            return persist_wechat_rss_status(status)
         time.sleep(0.5)
-    status = managed_werss_status(wechat_rss_config())
+    status = persist_wechat_rss_status(managed_werss_status(wechat_rss_config()))
     log_event(logger, "WARNING", "channel.wechat_rss.sidecar.start_timeout", channel_id="wechat-mp-rss")
     return status
 
@@ -1987,12 +2086,7 @@ def check_channel(channel_id: str) -> dict:
         log_event(logger, "INFO" if result["status"] == "online" else "WARNING", "channel.check.completed", channel_id=channel_id, status=result["status"], message=result["message"])
         return result
     if channel_id == "wechat-mp-rss" and channel:
-        result = check_werss(wechat_rss_config())
-        with db() as conn:
-            conn.execute(
-                "UPDATE channels SET status=?,last_check=?,updated_at=? WHERE id=?",
-                (result["status"], result["checked_at"], result["checked_at"], channel_id),
-            )
+        result = persist_wechat_rss_status(managed_werss_status(wechat_rss_config()))
         log_event(logger, "INFO" if result["status"] == "online" else "WARNING", "channel.check.completed", channel_id=channel_id, status=result["status"], message=result["message"])
         return result
     if channel:

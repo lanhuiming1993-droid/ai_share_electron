@@ -25,10 +25,13 @@ const editingProviderId = ref("");
 const providerFormInitialized = ref(false);
 const channelForm = reactive({ name: "", type: "", url: "", collection_mode: "playwright", status: "pending", notes: "", validation_url: "", success_url_contains: "", success_selector: "", group_ids: [], parsing_strategy: "hybrid", normalization_quality_threshold: 60, max_scrolls: 8, research_enabled: false });
 const marketDataForm = reactive({ enable_akshare: true, enable_baostock: true, enable_tushare: true, tushare_token: "", tushare_token_configured: false, clear_tushare_token: false, component_timeout_seconds: 35 });
-const wechatRssForm = reactive({ base_url: "http://127.0.0.1:8001", feed_ids_text: "all", access_key: "", secret_key: "", credentials_configured: false, clear_credentials: false, timeout_seconds: 20, max_items_per_feed: 100 });
-const wechatRssComponent = reactive({ status: "pending", message: "尚未检查", service_online: false, rss_online: false, docker_available: false, docker_engine_available: false, managed_setup_available: false, management_url: "http://127.0.0.1:8001/", onboarding_steps: [] });
+const wechatRssForm = reactive({ base_url: "http://127.0.0.1:8001", feed_ids_text: "all", access_key: "", secret_key: "", credentials_configured: false, admin_username: "admin", admin_password: "", admin_password_configured: false, clear_credentials: false, timeout_seconds: 20, max_items_per_feed: 100 });
+const wechatRssComponent = reactive({ status: "pending", message: "尚未检查", ready: false, service_online: false, rss_online: false, subscription_count: 0, subscriptions: [], subscription_error: "", docker_available: false, docker_engine_available: false, managed_setup_available: false, management_url: "http://127.0.0.1:8001/", onboarding_steps: [] });
 const wechatRssComponentLoading = ref(false);
 const wechatRssStarting = ref(false);
+const wechatRssLoginModal = ref(false);
+const wechatRssLoginLoading = ref(false);
+const wechatRssLogin = reactive({ login_state: "idle", message: "点击登录后获取微信二维码", qr_image_url: "", qr_base_url: "", qr_loaded: false, authorized: false });
 const mxHarFile = ref(null);
 const mxHarImporting = ref(false);
 const inventoryCleanupSubmitting = ref(false);
@@ -81,13 +84,13 @@ function channelDisplayName(channelOrId) {
 }
 function channelStatusDescription(channel) {
   if (channel.status === "online") {
-    if (channel.id === "wechat-mp-rss") return "外部 RSS 服务可用";
+    if (channel.id === "wechat-mp-rss") return "微信公众号快照采集可用";
     if (channel.collection_mode === "playwright") return "登录态可用";
     if (channel.id === "web-rumors") return "授权会话可用";
     return "公开采集可用";
   }
   if (channel.status === "offline") {
-    if (channel.id === "wechat-mp-rss") return "外部 RSS 服务不可用，请检查独立部署";
+    if (channel.id === "wechat-mp-rss") return "微信公众号组件不可用，请重新登录或检查高级配置";
     if (channel.collection_mode === "playwright") return "登录态失效，请重新登录";
     if (channel.id === "web-rumors") return "授权会话失效，请重新导入 HAR";
     return "公开采集暂不可用";
@@ -565,16 +568,25 @@ function openChannelModal(channel = null) {
   Object.assign(channelForm, channel ? { ...channel, research_enabled: Boolean(channel.research_enabled), group_ids: [...(channel.group_ids || [])] } : { name: "", type: "", url: "", collection_mode: "playwright", status: "pending", notes: "", validation_url: "", success_url_contains: "", success_selector: "", group_ids: [], parsing_strategy: "hybrid", normalization_quality_threshold: 60, max_scrolls: 8, research_enabled: false });
   Object.assign(marketDataForm, channel?.market_data_config || { enable_akshare: true, enable_baostock: true, enable_tushare: true, tushare_token: "", tushare_token_configured: false, clear_tushare_token: false, component_timeout_seconds: 35 });
   marketDataForm.clear_tushare_token = false;
-  const wechatRssConfig = channel?.wechat_rss_config || { base_url: "http://127.0.0.1:8001", feed_ids: ["all"], access_key: "", secret_key: "", credentials_configured: false, timeout_seconds: 20, max_items_per_feed: 100 };
+  const wechatRssConfig = channel?.wechat_rss_config || { base_url: "http://127.0.0.1:8001", feed_ids: ["all"], access_key: "", secret_key: "", credentials_configured: false, admin_username: "admin", admin_password: "", admin_password_configured: false, timeout_seconds: 20, max_items_per_feed: 100 };
   Object.assign(wechatRssForm, { ...wechatRssConfig, feed_ids_text: (wechatRssConfig.feed_ids || ["all"]).join("\n"), clear_credentials: false });
   channelModal.value = true;
   if (channel?.id === "wechat-mp-rss") void refreshWechatRssComponentStatus();
 }
 
 function closeChannelModal() {
+  closeWechatRssLogin();
   channelModal.value = false;
   editingChannel.value = null;
   mxHarFile.value = null;
+}
+
+async function saveWechatRssConfiguration() {
+  const { feed_ids_text, ...wechatRssConfig } = wechatRssForm;
+  return request("/api/channels/wechat-mp-rss/config", {
+    method: "PUT",
+    body: JSON.stringify({ ...wechatRssConfig, feed_ids: feed_ids_text.split(/\r?\n|,|，/).map((item) => item.trim()).filter(Boolean) }),
+  });
 }
 
 async function saveChannel(openLoginAfterSave = false) {
@@ -590,11 +602,7 @@ async function saveChannel(openLoginAfterSave = false) {
       await request("/api/channels/akshare/market-data-config", { method: "PUT", body: JSON.stringify(marketDataForm) });
     }
     if (saved.id === "wechat-mp-rss") {
-      const { feed_ids_text, ...wechatRssConfig } = wechatRssForm;
-      await request("/api/channels/wechat-mp-rss/config", {
-        method: "PUT",
-        body: JSON.stringify({ ...wechatRssConfig, feed_ids: feed_ids_text.split(/\r?\n|,|，/).map((item) => item.trim()).filter(Boolean) }),
-      });
+      await saveWechatRssConfiguration();
     }
     notice.value = editingChannel.value ? "渠道配置已更新" : "新渠道已添加";
     closeChannelModal();
@@ -654,7 +662,7 @@ async function openWechatRssConsole(path = "", baseUrlOverride = "") {
     } else {
       window.open(url, "_blank", "noopener,noreferrer");
     }
-    notice.value = "已打开 WeRSS 管理台。请在管理台登录后扫码授权，并添加需要采集的公众号。";
+    notice.value = "已打开 WeRSS 原生管理台。这里仅用于高级排障和订阅维护；日常登录请使用 AlphaDesk 的扫码弹窗。";
   } catch (error) {
     notice.value = `打开 WeRSS 管理台失败：${error.message}`;
   }
@@ -677,12 +685,107 @@ async function startWechatRssSidecar() {
   try {
     Object.assign(wechatRssComponent, await request("/api/channels/wechat-mp-rss/start-sidecar", { method: "POST" }));
     notice.value = wechatRssComponent.service_online
-      ? "WeRSS 已启动。请打开管理台登录，并使用微信扫码授权后添加订阅。"
+      ? "WeRSS 已启动。点击“登录微信公众号”即可在 AlphaDesk 中扫码并同步公众号。"
       : "已提交 WeRSS 启动命令，但服务尚未就绪，请稍后重新检查。";
   } catch (error) {
     notice.value = error.message;
   } finally {
     wechatRssStarting.value = false;
+  }
+}
+
+let wechatRssLoginPollTimer;
+let wechatRssQrRefreshTimer;
+
+function stopWechatRssLoginPolling() {
+  window.clearInterval(wechatRssLoginPollTimer);
+  wechatRssLoginPollTimer = undefined;
+}
+
+function stopWechatRssQrRefresh() {
+  window.clearInterval(wechatRssQrRefreshTimer);
+  wechatRssQrRefreshTimer = undefined;
+}
+
+function refreshWechatRssQrImage() {
+  if (!wechatRssLogin.qr_base_url || wechatRssLogin.authorized || wechatRssLogin.qr_loaded) return;
+  const separator = wechatRssLogin.qr_base_url.includes("?") ? "&" : "?";
+  wechatRssLogin.qr_image_url = `${wechatRssLogin.qr_base_url}${separator}alphadesk=${Date.now()}`;
+}
+
+function markWechatRssQrLoaded() {
+  wechatRssLogin.qr_loaded = true;
+  stopWechatRssQrRefresh();
+}
+
+function closeWechatRssLogin() {
+  stopWechatRssLoginPolling();
+  stopWechatRssQrRefresh();
+  wechatRssLoginModal.value = false;
+}
+
+async function syncWechatRssSubscriptions({ quiet = false } = {}) {
+  try {
+    const result = await request("/api/channels/wechat-mp-rss/subscriptions");
+    Object.assign(wechatRssComponent, result);
+    if (!quiet) {
+      notice.value = result.ready
+        ? `微信公众号信源可用，已同步 ${result.subscription_count} 个公众号`
+        : "尚未识别到已订阅公众号，请先扫码授权并完成订阅";
+    }
+    await refresh();
+    return result;
+  } catch (error) {
+    if (!quiet) notice.value = `同步公众号失败：${error.message}`;
+    throw error;
+  }
+}
+
+async function pollWechatRssLoginStatus() {
+  try {
+    const result = await request("/api/channels/wechat-mp-rss/wechat-login/status");
+    Object.assign(wechatRssLogin, result);
+    if (result.authorized) {
+      stopWechatRssLoginPolling();
+      stopWechatRssQrRefresh();
+      Object.assign(wechatRssComponent, {
+        ready: Boolean(result.ready),
+        subscriptions: result.subscriptions || [],
+        subscription_count: result.subscription_count || 0,
+      });
+      notice.value = result.ready
+        ? `微信扫码成功，已同步 ${result.subscription_count} 个公众号，信源可用`
+        : "微信扫码成功。尚未识别到订阅公众号；需要新增订阅时可在高级配置中打开原生管理台维护。";
+      await refresh();
+    } else if (result.login_state === "expired") {
+      stopWechatRssLoginPolling();
+      stopWechatRssQrRefresh();
+    }
+  } catch (error) {
+    stopWechatRssLoginPolling();
+    stopWechatRssQrRefresh();
+    wechatRssLogin.message = error.message;
+    wechatRssLogin.login_state = "failed";
+  }
+}
+
+async function beginWechatRssLogin() {
+  wechatRssLoginModal.value = true;
+  wechatRssLoginLoading.value = true;
+  stopWechatRssLoginPolling();
+  stopWechatRssQrRefresh();
+  Object.assign(wechatRssLogin, { login_state: "starting", message: "正在准备微信扫码二维码...", qr_image_url: "", qr_base_url: "", qr_loaded: false, authorized: false });
+  try {
+    await saveWechatRssConfiguration();
+    const result = await request("/api/channels/wechat-mp-rss/wechat-login", { method: "POST" });
+    Object.assign(wechatRssLogin, result, { qr_base_url: result.qr_image_url, qr_loaded: false, authorized: false });
+    refreshWechatRssQrImage();
+    wechatRssQrRefreshTimer = window.setInterval(refreshWechatRssQrImage, 1200);
+    wechatRssLoginPollTimer = window.setInterval(() => void pollWechatRssLoginStatus(), 3000);
+  } catch (error) {
+    Object.assign(wechatRssLogin, { login_state: "failed", message: error.message, qr_image_url: "", qr_base_url: "", qr_loaded: false, authorized: false });
+  } finally {
+    wechatRssLoginLoading.value = false;
   }
 }
 
@@ -804,7 +907,8 @@ async function exportReportHtml() {
 
 function closeTopmostModal(event) {
   if (event.key !== "Escape" || event.defaultPrevented) return;
-  if (reportModal.value) closeReport();
+  if (wechatRssLoginModal.value) closeWechatRssLogin();
+  else if (reportModal.value) closeReport();
   else if (normalizedModal.value) closeNormalizedItems();
   else if (snapshotModal.value) closeSnapshots();
   else if (channelModal.value) closeChannelModal();
@@ -837,6 +941,8 @@ onUnmounted(() => {
   window.removeEventListener("unhandledrejection", captureUnhandledRejection);
   window.clearTimeout(frontendLogFlushTimer);
   clearInterval(refreshTimer);
+  stopWechatRssLoginPolling();
+  stopWechatRssQrRefresh();
 });
 </script>
 
@@ -1150,7 +1256,7 @@ onUnmounted(() => {
                 <small>{{ channel.type }} · {{ channelStatusDescription(channel) }}</small>
                 <small v-if="channel.group_ids?.length">星球 ID：{{ channel.group_ids.join('、') }}</small>
                 <small v-if="channel.id==='akshare'">组件：AkShare · BaoStock · TuShare{{ channel.market_data_config?.tushare_token_configured ? '（token 已加密保存）' : '（等待 token）' }}</small>
-                <small v-if="channel.id==='wechat-mp-rss'">Sidecar：{{ channel.wechat_rss_config?.base_url }} · Feed：{{ channel.wechat_rss_config?.feed_ids?.join('、') }}{{ channel.wechat_rss_config?.credentials_configured ? '（AK/SK 已加密保存）' : '' }}</small>
+                <small v-if="channel.id==='wechat-mp-rss'">微信扫码登录后自动同步已订阅公众号；采集按严格时间窗读取文章快照</small>
                 <small>整理策略：{{ channel.parsing_strategy }} · 质量阈值 {{ channel.normalization_quality_threshold }} · 最大滚动 {{ channel.max_scrolls }}</small>
                 <small>个股补证：{{ channel.research_enabled ? '允许' : '关闭' }}</small>
                 <small v-if="channel.last_check">上次检查：{{ channel.last_check }}</small>
@@ -1158,7 +1264,6 @@ onUnmounted(() => {
               <div class="flex items-center gap-3">
                 <span :class="channel.status==='online'?'status-good':'status-warn'">{{ channel.status }}</span>
                 <button @click="normalizeExistingChannel(channel)" class="secondary">整理已有快照</button>
-                  <button v-if="channel.id==='wechat-mp-rss'" @click="openWechatRssConsole('', channel.wechat_rss_config?.base_url)" class="secondary">打开管理台</button>
                 <button v-if="channel.collection_mode==='playwright' || ['web-rumors','akshare','industry-news','wechat-mp-rss'].includes(channel.id)" @click="checkChannel(channel)" class="secondary">检查状态</button>
                 <button @click="openChannelModal(channel)" class="secondary">配置</button>
               </div>
@@ -1444,6 +1549,42 @@ onUnmounted(() => {
       </section>
     </div>
 
+    <div v-if="wechatRssLoginModal" class="fixed inset-0 z-[70] flex items-center justify-center bg-black/75 p-6 backdrop-blur-sm" @click.self="closeWechatRssLogin">
+      <section class="flex max-h-[90vh] w-full max-w-md flex-col overflow-hidden rounded-3xl border border-white/[.12] bg-[#101a2a] shadow-2xl shadow-black/40">
+        <header class="flex items-center justify-between border-b border-white/[.08] px-6 py-5">
+          <div>
+            <h2 class="text-lg font-semibold text-white">登录微信公众号</h2>
+            <p class="mt-1 text-xs text-slate-500">微信扫码授权后，AlphaDesk 会自动识别已订阅公众号</p>
+          </div>
+          <button @click="closeWechatRssLogin" class="flex h-8 w-8 items-center justify-center rounded-full text-lg text-slate-500 transition hover:bg-white/[.06] hover:text-white">×</button>
+        </header>
+        <div class="overflow-y-auto p-6">
+          <div class="flex min-h-64 items-center justify-center rounded-2xl border border-white/[.08] bg-white p-4">
+            <img v-if="wechatRssLogin.qr_image_url && !wechatRssLogin.authorized" :src="wechatRssLogin.qr_image_url" alt="微信公众号登录二维码" class="h-56 w-56 object-contain" @load="markWechatRssQrLoaded" @error="wechatRssLogin.qr_loaded=false" />
+            <div v-else-if="wechatRssLogin.authorized" class="text-center">
+              <p class="text-base font-semibold text-emerald-600">微信扫码授权成功</p>
+              <p class="mt-2 text-sm text-slate-500">已识别 {{ wechatRssComponent.subscription_count || 0 }} 个订阅公众号</p>
+            </div>
+            <div v-else class="text-center">
+              <p class="text-sm text-slate-500">{{ wechatRssLoginLoading ? '正在准备二维码...' : '二维码暂不可用' }}</p>
+            </div>
+          </div>
+          <p class="mt-4 text-center text-sm" :class="wechatRssLogin.authorized ? 'text-emerald-300' : wechatRssLogin.login_state==='failed' || wechatRssLogin.login_state==='expired' ? 'text-amber-300' : 'text-slate-300'">{{ wechatRssLogin.message }}</p>
+          <div v-if="wechatRssComponent.subscriptions?.length" class="mt-4 max-h-36 space-y-2 overflow-y-auto rounded-xl border border-white/[.07] bg-black/10 p-3">
+            <div v-for="item in wechatRssComponent.subscriptions" :key="item.id" class="flex items-center justify-between gap-3 text-xs">
+              <span class="truncate text-slate-200">{{ item.name }}</span>
+              <span :class="item.enabled ? 'status-good' : 'status-warn'">{{ item.enabled ? '已启用' : '已停用' }}</span>
+            </div>
+          </div>
+          <div class="mt-4 flex justify-center gap-2">
+            <button v-if="wechatRssLogin.login_state==='failed' || wechatRssLogin.login_state==='expired'" type="button" @click="beginWechatRssLogin" class="primary">重新获取二维码</button>
+            <button v-if="wechatRssLogin.authorized" type="button" @click="syncWechatRssSubscriptions()" class="secondary">重新同步公众号</button>
+            <button type="button" @click="closeWechatRssLogin" class="secondary">{{ wechatRssLogin.authorized ? '完成' : '取消' }}</button>
+          </div>
+        </div>
+      </section>
+    </div>
+
     <div v-if="channelModal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6 backdrop-blur-sm" @click.self="closeChannelModal">
       <section class="flex max-h-[94vh] w-full max-w-2xl flex-col overflow-hidden rounded-3xl border border-white/[.12] bg-[#101a2a] shadow-2xl shadow-black/40">
         <header class="flex items-center justify-between border-b border-white/[.08] px-6 py-5">
@@ -1527,43 +1668,41 @@ onUnmounted(() => {
           <div v-if="editingChannel?.id==='wechat-mp-rss'" class="col-span-2 rounded-2xl border border-teal-400/20 bg-teal-400/[.04] p-4">
             <div class="flex flex-wrap items-start justify-between gap-3">
               <div>
-                <span class="form-label">微信公众号 WeRSS 本地组件</span>
-                <p class="mt-1 text-xs leading-5 text-slate-500">WeRSS 负责微信扫码授权、识别公众号、订阅管理和文章刷新；AlphaDesk 按时间窗读取它生成的 RSS 快照。</p>
+                <span class="form-label">微信公众号</span>
+                <p class="mt-1 text-xs leading-5 text-slate-500">微信扫码一次，自动识别已订阅公众号。后续采集任务会按严格时间窗保存文章快照。</p>
               </div>
-              <span :class="wechatRssComponent.service_online ? 'status-good' : 'status-warn'">{{ wechatRssComponentLoading ? 'checking' : (wechatRssComponent.service_online ? 'service online' : 'service offline') }}</span>
+              <span :class="wechatRssComponent.ready ? 'status-good' : 'status-warn'">{{ wechatRssComponentLoading ? '正在检查' : (wechatRssComponent.ready ? '信源可用' : '等待登录') }}</span>
             </div>
-            <div class="mt-4 grid gap-3">
-              <div class="rounded-xl border border-white/[.07] bg-black/10 p-3">
-                <strong class="text-sm text-slate-200">1. 启动或连接 WeRSS</strong>
-                <p class="mt-1 text-xs leading-5 text-slate-500">默认使用本机 `127.0.0.1:8001`。已部署到其他主机时，填写对应服务地址即可。</p>
-                <div class="mt-3 flex flex-wrap gap-2">
-                  <button type="button" @click="startWechatRssSidecar" :disabled="wechatRssStarting" class="primary disabled:cursor-wait disabled:opacity-60">{{ wechatRssStarting ? '正在启动...' : '启动本地 WeRSS' }}</button>
-                  <button type="button" @click="refreshWechatRssComponentStatus" :disabled="wechatRssComponentLoading" class="secondary">{{ wechatRssComponentLoading ? '正在检查...' : '检查组件状态' }}</button>
-                </div>
-                <p class="mt-2 text-xs leading-5" :class="wechatRssComponent.service_online ? 'text-emerald-300' : 'text-amber-300'">{{ wechatRssComponent.message }}</p>
-                <p v-if="!wechatRssComponent.docker_available" class="mt-1 text-xs leading-5 text-slate-500">当前电脑未检测到 Docker Desktop。本地一键启动需要先安装并运行 Docker；已有外部 WeRSS 服务不受影响。</p>
-                <p v-else-if="!wechatRssComponent.docker_engine_available" class="mt-1 text-xs leading-5 text-slate-500">已检测到 Docker 命令，但 Docker Desktop 引擎尚未运行。启动 Docker Desktop 后即可一键启动本地 WeRSS。</p>
-              </div>
-              <div class="rounded-xl border border-white/[.07] bg-black/10 p-3">
-                <strong class="text-sm text-slate-200">2. 扫码授权并管理公众号订阅</strong>
-                <p class="mt-1 text-xs leading-5 text-slate-500">打开 WeRSS 原生管理台，登录管理账号后进入公众号状态页扫码，再搜索并添加需要采集的公众号。</p>
-                <div class="mt-3 flex flex-wrap gap-2">
-                  <button type="button" @click="openWechatRssConsole()" class="primary">打开 WeRSS 管理台</button>
-                  <button type="button" @click="openWechatRssConsole('/wechat-status')" class="secondary">扫码授权页</button>
-                  <button type="button" @click="openWechatRssConsole('/add-subscription')" class="secondary">添加公众号订阅</button>
-                </div>
-              </div>
-              <div class="rounded-xl border border-white/[.07] bg-black/10 p-3">
-                <strong class="text-sm text-slate-200">3. 回到 AlphaDesk 采集</strong>
-                <p class="mt-1 text-xs leading-5 text-slate-500">完成扫码和订阅后，点击“检查状态”。渠道变为 online 后，即可和其他信源一起发起采集任务。</p>
-              </div>
+            <div class="mt-4 grid grid-cols-4 gap-2">
+              <div class="rounded-xl border border-white/[.07] bg-black/10 p-3"><p class="text-[11px] text-slate-500">组件</p><p class="mt-1 text-xs font-semibold" :class="wechatRssComponent.service_online?'text-emerald-300':'text-amber-300'">{{ wechatRssComponent.service_online ? '已连接' : '待启动' }}</p></div>
+              <div class="rounded-xl border border-white/[.07] bg-black/10 p-3"><p class="text-[11px] text-slate-500">微信登录</p><p class="mt-1 text-xs font-semibold" :class="wechatRssLogin.authorized || wechatRssComponent.ready ? 'text-emerald-300' : 'text-slate-300'">{{ wechatRssLogin.authorized || wechatRssComponent.ready ? '已授权' : '等待扫码' }}</p></div>
+              <div class="rounded-xl border border-white/[.07] bg-black/10 p-3"><p class="text-[11px] text-slate-500">已订阅公众号</p><p class="mt-1 text-xs font-semibold text-slate-200">{{ wechatRssComponent.subscription_count || 0 }} 个</p></div>
+              <div class="rounded-xl border border-white/[.07] bg-black/10 p-3"><p class="text-[11px] text-slate-500">采集状态</p><p class="mt-1 text-xs font-semibold" :class="wechatRssComponent.ready?'text-emerald-300':'text-amber-300'">{{ wechatRssComponent.ready ? '可用' : '待配置' }}</p></div>
             </div>
-            <label class="mt-3 block">
-              <span class="form-label">WeRSS 服务地址</span>
-              <input v-model="wechatRssForm.base_url" placeholder="http://127.0.0.1:8001" class="field mt-2 w-full" />
-            </label>
+            <div class="mt-3 flex flex-wrap gap-2">
+              <button type="button" @click="beginWechatRssLogin" :disabled="wechatRssLoginLoading" class="primary disabled:cursor-wait disabled:opacity-60">{{ wechatRssLoginLoading ? '正在准备...' : '登录微信公众号' }}</button>
+              <button type="button" @click="syncWechatRssSubscriptions()" :disabled="wechatRssComponentLoading" class="secondary">{{ wechatRssComponentLoading ? '正在同步...' : '同步已订阅公众号' }}</button>
+            </div>
+            <p class="mt-3 text-xs leading-5" :class="wechatRssComponent.ready ? 'text-emerald-300' : 'text-slate-500'">{{ wechatRssComponent.ready ? `信源可用，已识别 ${wechatRssComponent.subscription_count} 个公众号` : '首次使用请点击“登录微信公众号”，扫码后会自动同步订阅列表。' }}</p>
+            <div v-if="wechatRssComponent.subscriptions?.length" class="mt-3 flex max-h-28 flex-wrap gap-2 overflow-y-auto">
+              <span v-for="item in wechatRssComponent.subscriptions" :key="item.id" class="rounded-full border border-teal-400/20 bg-teal-400/[.06] px-3 py-1 text-xs text-teal-100">{{ item.name }}</span>
+            </div>
             <details class="mt-3 rounded-xl border border-white/[.07] bg-black/10 p-3">
-              <summary class="cursor-pointer text-xs font-semibold text-slate-300">高级配置：Feed 范围、AK/SK 和采集上限</summary>
+              <summary class="cursor-pointer text-xs font-semibold text-slate-300">高级配置与维护</summary>
+              <div class="mt-3 flex flex-wrap gap-2">
+                <button type="button" @click="startWechatRssSidecar" :disabled="wechatRssStarting" class="secondary disabled:cursor-wait disabled:opacity-60">{{ wechatRssStarting ? '正在启动...' : '手工启动本地组件' }}</button>
+                <button type="button" @click="refreshWechatRssComponentStatus" :disabled="wechatRssComponentLoading" class="secondary">{{ wechatRssComponentLoading ? '正在检查...' : '检查组件状态' }}</button>
+                <button type="button" @click="openWechatRssConsole()" class="secondary">打开原生管理台</button>
+              </div>
+              <p class="mt-2 text-xs leading-5 text-slate-500">{{ wechatRssComponent.message }}</p>
+              <label class="mt-3 block">
+                <span class="form-label">WeRSS 服务地址</span>
+                <input v-model="wechatRssForm.base_url" placeholder="http://127.0.0.1:8001" class="field mt-2 w-full" />
+              </label>
+              <div class="mt-3 grid grid-cols-2 gap-3">
+                <label><span class="form-label">管理账号</span><input v-model="wechatRssForm.admin_username" placeholder="admin" class="field mt-2 w-full" /></label>
+                <label><span class="form-label">管理密码</span><input v-model="wechatRssForm.admin_password" type="password" :placeholder="wechatRssForm.admin_password_configured ? '已加密保存；无需重复填写' : 'WeRSS 管理密码'" class="field mt-2 w-full" /></label>
+              </div>
               <label class="mt-3 block">
                 <span class="form-label">Feed ID 列表</span>
                 <textarea v-model="wechatRssForm.feed_ids_text" rows="3" placeholder="all&#10;或每行填写一个 Feed ID" class="field mt-2 w-full"></textarea>

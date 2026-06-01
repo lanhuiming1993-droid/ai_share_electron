@@ -7,10 +7,13 @@ from unittest.mock import patch
 from backend.wechat_rss import (
     check_werss,
     collect_werss,
+    fetch_werss_subscriptions,
     managed_werss_status,
     parse_werss_feed,
     public_werss_config,
     start_managed_werss,
+    start_werss_wechat_login,
+    werss_wechat_login_status,
     werss_headers,
 )
 
@@ -54,13 +57,17 @@ ATOM_XML = """<?xml version="1.0" encoding="UTF-8"?>
 
 
 class FakeResponse:
-    def __init__(self, text: str, url: str = "http://127.0.0.1:8001/feed/all.rss?limit=100&offset=0") -> None:
+    def __init__(self, text: str, url: str = "http://127.0.0.1:8001/feed/all.rss?limit=100&offset=0", json_payload=None) -> None:
         self.text = text
         self.url = url
         self.status_code = 200
+        self.json_payload = json_payload
 
     def raise_for_status(self) -> None:
         return None
+
+    def json(self):
+        return self.json_payload
 
 
 class FakeSession:
@@ -71,6 +78,27 @@ class FakeSession:
     def get(self, url: str, **kwargs):
         self.calls.append({"url": url, **kwargs})
         return FakeResponse(self.text, url)
+
+
+class WerssApiSession:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def post(self, url: str, **kwargs):
+        self.calls.append({"method": "POST", "url": url, **kwargs})
+        return FakeResponse("", url, {"code": 0, "data": {"access_token": "admin-token"}})
+
+    def get(self, url: str, **kwargs):
+        self.calls.append({"method": "GET", "url": url, **kwargs})
+        if url.endswith("/auth/qr/code"):
+            payload = {"code": 0, "data": {"code": "/static/wx_qrcode.png?t=1", "is_exists": True}}
+        elif url.endswith("/auth/qr/status"):
+            payload = {"code": 0, "data": {"login_status": True, "qr_code": False}}
+        elif url.endswith("/mps"):
+            payload = {"code": 0, "data": {"list": [{"id": "MP_WXS_1", "mp_name": "产业研究", "status": 1}], "total": 1}}
+        else:
+            payload = {"code": 0, "data": {}}
+        return FakeResponse("", url, payload)
 
 
 class WechatRssTests(unittest.TestCase):
@@ -110,6 +138,7 @@ class WechatRssTests(unittest.TestCase):
         self.assertTrue(config["credentials_configured"])
         self.assertEqual(config["access_key"], "****************")
         self.assertEqual(config["secret_key"], "****************")
+        self.assertEqual(config["admin_password"], "****************")
 
     def test_headers_omit_auth_when_credentials_are_empty(self) -> None:
         self.assertNotIn("Authorization", werss_headers({"access_key": "", "secret_key": ""}))
@@ -123,13 +152,28 @@ class WechatRssTests(unittest.TestCase):
 
     def test_component_status_exposes_qr_login_console_without_requiring_docker(self) -> None:
         session = FakeSession("<rss version=\"2.0\"><channel></channel></rss>")
-        with patch("backend.wechat_rss.browser_http_session", return_value=session), patch("backend.wechat_rss.shutil.which", return_value=None):
+        with patch("backend.wechat_rss.browser_http_session", return_value=session), patch("backend.wechat_rss.fetch_werss_subscriptions", return_value=[{"id": "MP_WXS_1", "name": "产业研究"}]), patch("backend.wechat_rss.shutil.which", return_value=None):
             result = managed_werss_status()
         self.assertTrue(result["service_online"])
         self.assertTrue(result["rss_online"])
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["subscription_count"], 1)
         self.assertFalse(result["docker_available"])
         self.assertEqual(result["wechat_status_url"], "http://127.0.0.1:8001/wechat-status")
         self.assertEqual(result["add_subscription_url"], "http://127.0.0.1:8001/add-subscription")
+
+    def test_qr_login_and_subscription_sync_use_managed_admin_session(self) -> None:
+        session = WerssApiSession()
+        config = {"base_url": "http://127.0.0.1:8123"}
+        qr = start_werss_wechat_login(config, session=session)
+        status = werss_wechat_login_status(config, session=session)
+        subscriptions = fetch_werss_subscriptions(config, session=session)
+        self.assertEqual(qr["qr_image_url"], "http://127.0.0.1:8123/static/wx_qrcode.png?t=1")
+        self.assertTrue(status["authorized"])
+        self.assertEqual(subscriptions[0]["name"], "产业研究")
+        login_call = next(call for call in session.calls if call["method"] == "POST")
+        self.assertEqual(login_call["data"]["username"], "admin")
+        self.assertEqual(login_call["data"]["password"], "admin@123")
 
     def test_managed_start_explains_missing_docker(self) -> None:
         with patch("backend.wechat_rss.shutil.which", return_value=None):

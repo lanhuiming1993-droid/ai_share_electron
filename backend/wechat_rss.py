@@ -4,11 +4,12 @@ import json
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 from xml.etree import ElementTree
 
 from backend.http_policy import browser_http_session
@@ -19,6 +20,8 @@ DEFAULT_WERSS_CONFIG = {
     "feed_ids": ["all"],
     "access_key": "",
     "secret_key": "",
+    "admin_username": "admin",
+    "admin_password": "admin@123",
     "timeout_seconds": 20,
     "max_items_per_feed": 100,
 }
@@ -29,6 +32,9 @@ MAX_FEED_RESPONSE_BYTES = 8 * 1024 * 1024
 ROOT = Path(__file__).resolve().parents[1]
 WERSS_INTEGRATION_DIR = ROOT / "integrations" / "werss"
 WERSS_COMPOSE_PATH = WERSS_INTEGRATION_DIR / "compose.yaml"
+WERSS_API_PREFIX = "/api/v1/wx"
+WERSS_TOKEN_TTL_SECONDS = 25 * 60
+_WERSS_ADMIN_TOKENS: dict[str, tuple[str, float]] = {}
 
 
 def normalize_werss_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -52,12 +58,18 @@ def normalize_werss_config(config: dict[str, Any] | None = None) -> dict[str, An
     secret_key = str(merged.get("secret_key") or "").strip()
     if bool(access_key) != bool(secret_key):
         raise ValueError("WeRSS AK 和 SK 必须同时填写或同时留空")
+    admin_username = str(merged.get("admin_username") or "admin").strip()
+    admin_password = str(merged.get("admin_password") or "admin@123").strip()
+    if not admin_username or not admin_password:
+        raise ValueError("WeRSS 管理账号和密码不能为空")
     return {
         "adapter": "werss_external_rss",
         "base_url": base_url,
         "feed_ids": feed_ids,
         "access_key": access_key,
         "secret_key": secret_key,
+        "admin_username": admin_username,
+        "admin_password": admin_password,
         "timeout_seconds": min(max(int(merged.get("timeout_seconds") or 20), 3), 120),
         "max_items_per_feed": min(max(int(merged.get("max_items_per_feed") or 100), 1), 500),
     }
@@ -66,13 +78,114 @@ def normalize_werss_config(config: dict[str, Any] | None = None) -> dict[str, An
 def public_werss_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
     normalized = normalize_werss_config(config)
     configured = bool(normalized["access_key"] and normalized["secret_key"])
+    admin_password_configured = bool(normalized["admin_password"])
     return {
         **normalized,
         "management_url": f"{normalized['base_url']}/",
         "credentials_configured": configured,
         "access_key": MASKED_SECRET if configured else "",
         "secret_key": MASKED_SECRET if configured else "",
+        "admin_password_configured": admin_password_configured,
+        "admin_password": MASKED_SECRET if admin_password_configured else "",
     }
+
+
+def werss_api_url(config: dict[str, Any], path: str) -> str:
+    return f"{config['base_url']}{WERSS_API_PREFIX}/{path.lstrip('/')}"
+
+
+def werss_response_data(response) -> Any:
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError("WeRSS 返回了无法识别的响应")
+    if payload.get("code", 0) != 0:
+        raise RuntimeError(str(payload.get("message") or "WeRSS 请求失败"))
+    return payload.get("data")
+
+
+def werss_admin_token(config: dict[str, Any], session=None, force_refresh: bool = False) -> str:
+    normalized = normalize_werss_config(config)
+    cache_key = normalized["base_url"]
+    cached = _WERSS_ADMIN_TOKENS.get(cache_key)
+    if not force_refresh and cached and cached[1] > time.time():
+        return cached[0]
+    session = session or browser_http_session()
+    response = session.post(
+        werss_api_url(normalized, "auth/login"),
+        data={"username": normalized["admin_username"], "password": normalized["admin_password"]},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=normalized["timeout_seconds"],
+    )
+    data = werss_response_data(response)
+    token = str(data.get("access_token") if isinstance(data, dict) else "").strip()
+    if not token:
+        raise RuntimeError("WeRSS 管理登录未返回访问令牌")
+    _WERSS_ADMIN_TOKENS[cache_key] = (token, time.time() + WERSS_TOKEN_TTL_SECONDS)
+    return token
+
+
+def werss_admin_get(config: dict[str, Any], path: str, *, params: dict[str, Any] | None = None, session=None) -> Any:
+    normalized = normalize_werss_config(config)
+    session = session or browser_http_session()
+    token = werss_admin_token(normalized, session=session)
+    response = session.get(
+        werss_api_url(normalized, path),
+        params=params,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=normalized["timeout_seconds"],
+    )
+    if response.status_code == 401:
+        token = werss_admin_token(normalized, session=session, force_refresh=True)
+        response = session.get(
+            werss_api_url(normalized, path),
+            params=params,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=normalized["timeout_seconds"],
+        )
+    return werss_response_data(response)
+
+
+def fetch_werss_subscriptions(config: dict[str, Any] | None = None, session=None) -> list[dict[str, Any]]:
+    normalized = normalize_werss_config(config)
+    data = werss_admin_get(normalized, "mps", params={"limit": 100, "offset": 0}, session=session)
+    rows = data.get("list") if isinstance(data, dict) else []
+    return [
+        {
+            "id": str(row.get("id") or ""),
+            "name": str(row.get("mp_name") or ""),
+            "avatar": str(row.get("mp_cover") or ""),
+            "intro": str(row.get("mp_intro") or ""),
+            "enabled": int(row.get("status") or 0) == 1,
+        }
+        for row in rows or []
+        if isinstance(row, dict)
+    ]
+
+
+def start_werss_wechat_login(config: dict[str, Any] | None = None, session=None) -> dict[str, Any]:
+    normalized = normalize_werss_config(config)
+    data = werss_admin_get(normalized, "auth/qr/code", session=session)
+    qr_path = str(data.get("code") if isinstance(data, dict) else "").strip()
+    if not qr_path:
+        raise RuntimeError("WeRSS 尚未生成微信扫码二维码，请稍后重试")
+    return {
+        "login_state": "waiting_scan",
+        "message": "请使用微信扫描二维码完成授权",
+        "qr_image_url": urljoin(f"{normalized['base_url']}/", qr_path.lstrip("/")),
+    }
+
+
+def werss_wechat_login_status(config: dict[str, Any] | None = None, session=None) -> dict[str, Any]:
+    normalized = normalize_werss_config(config)
+    data = werss_admin_get(normalized, "auth/qr/status", session=session)
+    login_status = bool(data.get("login_status")) if isinstance(data, dict) else False
+    qr_exists = bool(data.get("qr_code")) if isinstance(data, dict) else False
+    if login_status:
+        return {"login_state": "authorized", "message": "微信扫码授权成功", "authorized": True}
+    if qr_exists:
+        return {"login_state": "waiting_scan", "message": "等待微信扫码授权", "authorized": False}
+    return {"login_state": "expired", "message": "二维码已失效，请重新获取", "authorized": False}
 
 
 def werss_headers(config: dict[str, Any]) -> dict[str, str]:
@@ -229,19 +342,31 @@ def managed_werss_status(config: dict[str, Any] | None = None) -> dict[str, Any]
     normalized = normalize_werss_config(config)
     session = browser_http_session()
     service_online = False
+    subscriptions: list[dict[str, Any]] = []
+    subscription_error = ""
     try:
         response = session.get(f"{normalized['base_url']}/", timeout=min(normalized["timeout_seconds"], 5))
         service_online = response.status_code < 500
     except Exception:
         pass
+    if service_online:
+        try:
+            subscriptions = fetch_werss_subscriptions(normalized, session=session)
+        except Exception as exc:
+            subscription_error = f"{type(exc).__name__}: {exc}"
     rss_status = check_werss(normalized)
     docker_available = shutil.which("docker") is not None
+    ready = service_online and rss_status["status"] == "online" and bool(subscriptions)
     return {
-        "status": rss_status["status"],
-        "message": rss_status["message"],
+        "status": "online" if ready else ("pending" if service_online else "offline"),
+        "message": "微信公众号信源可用" if ready else rss_status["message"],
         "checked_at": rss_status["checked_at"],
+        "ready": ready,
         "service_online": service_online,
         "rss_online": rss_status["status"] == "online",
+        "subscription_count": len(subscriptions),
+        "subscriptions": subscriptions,
+        "subscription_error": subscription_error,
         "docker_available": docker_available,
         "docker_engine_available": docker_engine_available() if docker_available else False,
         "managed_setup_available": WERSS_COMPOSE_PATH.exists(),
@@ -250,11 +375,10 @@ def managed_werss_status(config: dict[str, Any] | None = None) -> dict[str, Any]
         "subscription_url": f"{normalized['base_url']}/wechat/mp",
         "add_subscription_url": f"{normalized['base_url']}/add-subscription",
         "onboarding_steps": [
-            "启动本地 WeRSS 组件，或填写已有 WeRSS 服务地址",
-            "打开 WeRSS 管理台并登录管理账号",
-            "进入公众号状态页面，使用微信扫码授权",
-            "进入添加订阅页面，搜索并选择需要采集的公众号",
-            "回到 AlphaDesk 检查状态，再发起信源采集任务",
+            "点击登录微信公众号",
+            "使用微信扫描弹窗中的二维码",
+            "AlphaDesk 自动同步 WeRSS 中已订阅公众号",
+            "公众号列表同步成功后，渠道状态变为可用",
         ],
     }
 
