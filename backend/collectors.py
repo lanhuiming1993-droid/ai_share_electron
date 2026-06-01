@@ -215,7 +215,7 @@ def collect_mx(channel: dict[str, Any], window: dict[str, str], query: str = "")
     session = requests.Session()
     session.headers.update(
         {
-            "User-Agent": "AlphaDesk/0.1",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36",
             "Content-Type": "application/json",
             "token": token,
             "AD": str(config.get("ad") or "1"),
@@ -327,7 +327,7 @@ def collect_http(channel: dict[str, Any], window: dict[str, str], query: str = "
     if not channel["url"]:
         raise ValueError("HTTP channel URL is empty")
     request_url = render_query_url(channel["url"], query)
-    response = requests.get(request_url, timeout=30, headers={"User-Agent": "AlphaDesk/0.1"})
+    response = requests.get(request_url, timeout=30, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"})
     response.raise_for_status()
     content_type = response.headers.get("content-type", "")
     response_text = response.text
@@ -404,7 +404,7 @@ def collect_http(channel: dict[str, Any], window: dict[str, str], query: str = "
             older_response = requests.get(
                 f"{page_url}?before={oldest_post_id}",
                 timeout=30,
-                headers={"User-Agent": "AlphaDesk/0.1"},
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"},
             )
             older_response.raise_for_status()
             page_text = older_response.text
