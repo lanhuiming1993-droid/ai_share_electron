@@ -46,7 +46,7 @@ from backend.runtime_health import (
     worker_check,
 )
 from backend.source_registry import CANONICAL_CHANNEL_NAMES, source_catalog, tool_catalog
-from backend.wechat_rss import check_werss, normalize_werss_config, public_werss_config
+from backend.wechat_rss import check_werss, managed_werss_status, normalize_werss_config, public_werss_config, start_managed_werss
 from backend.worker import CollectionWorker
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1804,6 +1804,30 @@ def update_wechat_rss_config(payload: WechatRssConfigInput) -> dict:
         credentials_configured=bool(config["access_key"]),
     )
     return {"status": "saved", "config": public_werss_config(config)}
+
+
+@app.get("/api/channels/wechat-mp-rss/component-status")
+def wechat_rss_component_status() -> dict:
+    return managed_werss_status(wechat_rss_config())
+
+
+@app.post("/api/channels/wechat-mp-rss/start-sidecar")
+def start_wechat_rss_sidecar() -> dict:
+    log_event(logger, "INFO", "channel.wechat_rss.sidecar.starting", channel_id="wechat-mp-rss")
+    try:
+        start_managed_werss()
+    except RuntimeError as exc:
+        log_exception(logger, "channel.wechat_rss.sidecar.failed", exc, channel_id="wechat-mp-rss")
+        raise HTTPException(409, str(exc)) from exc
+    for _ in range(30):
+        status = managed_werss_status(wechat_rss_config())
+        if status["service_online"]:
+            log_event(logger, "INFO", "channel.wechat_rss.sidecar.started", channel_id="wechat-mp-rss", rss_online=status["rss_online"])
+            return status
+        time.sleep(0.5)
+    status = managed_werss_status(wechat_rss_config())
+    log_event(logger, "WARNING", "channel.wechat_rss.sidecar.start_timeout", channel_id="wechat-mp-rss")
+    return status
 
 
 @app.post("/api/channels")

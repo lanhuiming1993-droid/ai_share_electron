@@ -7,8 +7,10 @@ from unittest.mock import patch
 from backend.wechat_rss import (
     check_werss,
     collect_werss,
+    managed_werss_status,
     parse_werss_feed,
     public_werss_config,
+    start_managed_werss,
     werss_headers,
 )
 
@@ -55,6 +57,7 @@ class FakeResponse:
     def __init__(self, text: str, url: str = "http://127.0.0.1:8001/feed/all.rss?limit=100&offset=0") -> None:
         self.text = text
         self.url = url
+        self.status_code = 200
 
     def raise_for_status(self) -> None:
         return None
@@ -117,6 +120,26 @@ class WechatRssTests(unittest.TestCase):
             result = check_werss()
         self.assertEqual(result["status"], "online")
         self.assertIn("抽样读取 0 条文章", result["message"])
+
+    def test_component_status_exposes_qr_login_console_without_requiring_docker(self) -> None:
+        session = FakeSession("<rss version=\"2.0\"><channel></channel></rss>")
+        with patch("backend.wechat_rss.browser_http_session", return_value=session), patch("backend.wechat_rss.shutil.which", return_value=None):
+            result = managed_werss_status()
+        self.assertTrue(result["service_online"])
+        self.assertTrue(result["rss_online"])
+        self.assertFalse(result["docker_available"])
+        self.assertEqual(result["wechat_status_url"], "http://127.0.0.1:8001/wechat-status")
+        self.assertEqual(result["add_subscription_url"], "http://127.0.0.1:8001/add-subscription")
+
+    def test_managed_start_explains_missing_docker(self) -> None:
+        with patch("backend.wechat_rss.shutil.which", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "Docker"):
+                start_managed_werss()
+
+    def test_managed_start_explains_stopped_docker_engine(self) -> None:
+        with patch("backend.wechat_rss.shutil.which", return_value="docker"), patch("backend.wechat_rss.docker_engine_available", return_value=False):
+            with self.assertRaisesRegex(RuntimeError, "引擎未运行"):
+                start_managed_werss()
 
 
 if __name__ == "__main__":

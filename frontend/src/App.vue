@@ -26,6 +26,9 @@ const providerFormInitialized = ref(false);
 const channelForm = reactive({ name: "", type: "", url: "", collection_mode: "playwright", status: "pending", notes: "", validation_url: "", success_url_contains: "", success_selector: "", group_ids: [], parsing_strategy: "hybrid", normalization_quality_threshold: 60, max_scrolls: 8, research_enabled: false });
 const marketDataForm = reactive({ enable_akshare: true, enable_baostock: true, enable_tushare: true, tushare_token: "", tushare_token_configured: false, clear_tushare_token: false, component_timeout_seconds: 35 });
 const wechatRssForm = reactive({ base_url: "http://127.0.0.1:8001", feed_ids_text: "all", access_key: "", secret_key: "", credentials_configured: false, clear_credentials: false, timeout_seconds: 20, max_items_per_feed: 100 });
+const wechatRssComponent = reactive({ status: "pending", message: "尚未检查", service_online: false, rss_online: false, docker_available: false, docker_engine_available: false, managed_setup_available: false, management_url: "http://127.0.0.1:8001/", onboarding_steps: [] });
+const wechatRssComponentLoading = ref(false);
+const wechatRssStarting = ref(false);
 const mxHarFile = ref(null);
 const mxHarImporting = ref(false);
 const inventoryCleanupSubmitting = ref(false);
@@ -565,6 +568,7 @@ function openChannelModal(channel = null) {
   const wechatRssConfig = channel?.wechat_rss_config || { base_url: "http://127.0.0.1:8001", feed_ids: ["all"], access_key: "", secret_key: "", credentials_configured: false, timeout_seconds: 20, max_items_per_feed: 100 };
   Object.assign(wechatRssForm, { ...wechatRssConfig, feed_ids_text: (wechatRssConfig.feed_ids || ["all"]).join("\n"), clear_credentials: false });
   channelModal.value = true;
+  if (channel?.id === "wechat-mp-rss") void refreshWechatRssComponentStatus();
 }
 
 function closeChannelModal() {
@@ -622,6 +626,7 @@ async function checkChannel(channel) {
     frontendLog("info", "channel.check.clicked", "", { channel_id: channel.id });
     const result = await request(`/api/channels/${channel.id}/check`, { method: "POST" });
     notice.value = `${channelDisplayName(channel)}: ${result.message}`;
+    if (channel.id === "wechat-mp-rss") await refreshWechatRssComponentStatus();
     await refresh();
   } catch (error) { notice.value = error.message; }
 }
@@ -633,6 +638,52 @@ async function checkAllChannels() {
     notice.value = result.message;
     await refresh();
   } catch (error) { notice.value = error.message; }
+}
+
+function wechatRssConsoleUrl(path = "", baseUrlOverride = "") {
+  const baseUrl = (baseUrlOverride || wechatRssForm.base_url || "http://127.0.0.1:8001").replace(/\/+$/, "");
+  return `${baseUrl}${path.startsWith("/") ? path : `/${path}`}`;
+}
+
+async function openWechatRssConsole(path = "", baseUrlOverride = "") {
+  const url = wechatRssConsoleUrl(path, baseUrlOverride);
+  frontendLog("info", "channel.wechat_rss.console.opened", "", { path: path || "/" });
+  try {
+    if (window.alphadesk?.openExternalUrl) {
+      await window.alphadesk.openExternalUrl({ url });
+    } else {
+      window.open(url, "_blank", "noopener,noreferrer");
+    }
+    notice.value = "已打开 WeRSS 管理台。请在管理台登录后扫码授权，并添加需要采集的公众号。";
+  } catch (error) {
+    notice.value = `打开 WeRSS 管理台失败：${error.message}`;
+  }
+}
+
+async function refreshWechatRssComponentStatus() {
+  wechatRssComponentLoading.value = true;
+  try {
+    Object.assign(wechatRssComponent, await request("/api/channels/wechat-mp-rss/component-status"));
+  } catch (error) {
+    Object.assign(wechatRssComponent, { status: "offline", message: error.message, service_online: false, rss_online: false });
+  } finally {
+    wechatRssComponentLoading.value = false;
+  }
+}
+
+async function startWechatRssSidecar() {
+  wechatRssStarting.value = true;
+  notice.value = "正在启动本地 WeRSS 组件，首次使用可能需要拉取固定版本镜像...";
+  try {
+    Object.assign(wechatRssComponent, await request("/api/channels/wechat-mp-rss/start-sidecar", { method: "POST" }));
+    notice.value = wechatRssComponent.service_online
+      ? "WeRSS 已启动。请打开管理台登录，并使用微信扫码授权后添加订阅。"
+      : "已提交 WeRSS 启动命令，但服务尚未就绪，请稍后重新检查。";
+  } catch (error) {
+    notice.value = error.message;
+  } finally {
+    wechatRssStarting.value = false;
+  }
 }
 
 function selectMxHar(event) {
@@ -1107,6 +1158,7 @@ onUnmounted(() => {
               <div class="flex items-center gap-3">
                 <span :class="channel.status==='online'?'status-good':'status-warn'">{{ channel.status }}</span>
                 <button @click="normalizeExistingChannel(channel)" class="secondary">整理已有快照</button>
+                  <button v-if="channel.id==='wechat-mp-rss'" @click="openWechatRssConsole('', channel.wechat_rss_config?.base_url)" class="secondary">打开管理台</button>
                 <button v-if="channel.collection_mode==='playwright' || ['web-rumors','akshare','industry-news','wechat-mp-rss'].includes(channel.id)" @click="checkChannel(channel)" class="secondary">检查状态</button>
                 <button @click="openChannelModal(channel)" class="secondary">配置</button>
               </div>
@@ -1473,39 +1525,73 @@ onUnmounted(() => {
             </div>
           </div>
           <div v-if="editingChannel?.id==='wechat-mp-rss'" class="col-span-2 rounded-2xl border border-teal-400/20 bg-teal-400/[.04] p-4">
-            <span class="form-label">微信公众号 WeRSS 外部组件</span>
-            <p class="mt-1 text-xs leading-5 text-slate-500">AlphaDesk 只读取你独立部署并授权的 WeRSS RSS 服务，不会下载或运行第三方抓取器。请先在 WeRSS 中完成公众号订阅。</p>
+            <div class="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <span class="form-label">微信公众号 WeRSS 本地组件</span>
+                <p class="mt-1 text-xs leading-5 text-slate-500">WeRSS 负责微信扫码授权、识别公众号、订阅管理和文章刷新；AlphaDesk 按时间窗读取它生成的 RSS 快照。</p>
+              </div>
+              <span :class="wechatRssComponent.service_online ? 'status-good' : 'status-warn'">{{ wechatRssComponentLoading ? 'checking' : (wechatRssComponent.service_online ? 'service online' : 'service offline') }}</span>
+            </div>
+            <div class="mt-4 grid gap-3">
+              <div class="rounded-xl border border-white/[.07] bg-black/10 p-3">
+                <strong class="text-sm text-slate-200">1. 启动或连接 WeRSS</strong>
+                <p class="mt-1 text-xs leading-5 text-slate-500">默认使用本机 `127.0.0.1:8001`。已部署到其他主机时，填写对应服务地址即可。</p>
+                <div class="mt-3 flex flex-wrap gap-2">
+                  <button type="button" @click="startWechatRssSidecar" :disabled="wechatRssStarting" class="primary disabled:cursor-wait disabled:opacity-60">{{ wechatRssStarting ? '正在启动...' : '启动本地 WeRSS' }}</button>
+                  <button type="button" @click="refreshWechatRssComponentStatus" :disabled="wechatRssComponentLoading" class="secondary">{{ wechatRssComponentLoading ? '正在检查...' : '检查组件状态' }}</button>
+                </div>
+                <p class="mt-2 text-xs leading-5" :class="wechatRssComponent.service_online ? 'text-emerald-300' : 'text-amber-300'">{{ wechatRssComponent.message }}</p>
+                <p v-if="!wechatRssComponent.docker_available" class="mt-1 text-xs leading-5 text-slate-500">当前电脑未检测到 Docker Desktop。本地一键启动需要先安装并运行 Docker；已有外部 WeRSS 服务不受影响。</p>
+                <p v-else-if="!wechatRssComponent.docker_engine_available" class="mt-1 text-xs leading-5 text-slate-500">已检测到 Docker 命令，但 Docker Desktop 引擎尚未运行。启动 Docker Desktop 后即可一键启动本地 WeRSS。</p>
+              </div>
+              <div class="rounded-xl border border-white/[.07] bg-black/10 p-3">
+                <strong class="text-sm text-slate-200">2. 扫码授权并管理公众号订阅</strong>
+                <p class="mt-1 text-xs leading-5 text-slate-500">打开 WeRSS 原生管理台，登录管理账号后进入公众号状态页扫码，再搜索并添加需要采集的公众号。</p>
+                <div class="mt-3 flex flex-wrap gap-2">
+                  <button type="button" @click="openWechatRssConsole()" class="primary">打开 WeRSS 管理台</button>
+                  <button type="button" @click="openWechatRssConsole('/wechat-status')" class="secondary">扫码授权页</button>
+                  <button type="button" @click="openWechatRssConsole('/add-subscription')" class="secondary">添加公众号订阅</button>
+                </div>
+              </div>
+              <div class="rounded-xl border border-white/[.07] bg-black/10 p-3">
+                <strong class="text-sm text-slate-200">3. 回到 AlphaDesk 采集</strong>
+                <p class="mt-1 text-xs leading-5 text-slate-500">完成扫码和订阅后，点击“检查状态”。渠道变为 online 后，即可和其他信源一起发起采集任务。</p>
+              </div>
+            </div>
             <label class="mt-3 block">
               <span class="form-label">WeRSS 服务地址</span>
               <input v-model="wechatRssForm.base_url" placeholder="http://127.0.0.1:8001" class="field mt-2 w-full" />
             </label>
-            <label class="mt-3 block">
-              <span class="form-label">Feed ID 列表</span>
-              <textarea v-model="wechatRssForm.feed_ids_text" rows="3" placeholder="all&#10;或每行填写一个 Feed ID" class="field mt-2 w-full"></textarea>
-              <small class="mt-1 block text-xs leading-5 text-slate-600">每行一个或使用逗号分隔；默认 <code>all</code> 读取 WeRSS 中全部已订阅公众号。</small>
-            </label>
-            <div class="mt-3 grid grid-cols-2 gap-3">
-              <label>
-                <span class="form-label">Access Key（可选）</span>
-                <input v-model="wechatRssForm.access_key" type="password" :placeholder="wechatRssForm.credentials_configured ? '已加密保存；保留密文即可' : 'WeRSS AK'" class="field mt-2 w-full" />
+            <details class="mt-3 rounded-xl border border-white/[.07] bg-black/10 p-3">
+              <summary class="cursor-pointer text-xs font-semibold text-slate-300">高级配置：Feed 范围、AK/SK 和采集上限</summary>
+              <label class="mt-3 block">
+                <span class="form-label">Feed ID 列表</span>
+                <textarea v-model="wechatRssForm.feed_ids_text" rows="3" placeholder="all&#10;或每行填写一个 Feed ID" class="field mt-2 w-full"></textarea>
+                <small class="mt-1 block text-xs leading-5 text-slate-600">默认 <code>all</code> 读取 WeRSS 中全部已订阅公众号；仅在需要限制范围时填写具体 Feed ID。</small>
               </label>
-              <label>
-                <span class="form-label">Secret Key（可选）</span>
-                <input v-model="wechatRssForm.secret_key" type="password" :placeholder="wechatRssForm.credentials_configured ? '已加密保存；保留密文即可' : 'WeRSS SK'" class="field mt-2 w-full" />
-              </label>
-            </div>
-            <small class="mt-2 block text-xs leading-5 text-slate-600">AK/SK 必须同时填写或同时留空。凭据只在本机加密保存，页面接口只回显掩码。</small>
-            <div class="mt-3 flex flex-wrap items-center gap-4">
-              <label class="text-xs text-slate-400"><input v-model="wechatRssForm.clear_credentials" type="checkbox" class="mr-2" />清除已保存 AK/SK</label>
-              <label class="flex items-center gap-2 text-xs text-slate-400">请求超时
-                <input v-model.number="wechatRssForm.timeout_seconds" type="number" min="3" max="120" class="field w-20" />
-                秒
-              </label>
-              <label class="flex items-center gap-2 text-xs text-slate-400">单 Feed 上限
-                <input v-model.number="wechatRssForm.max_items_per_feed" type="number" min="1" max="500" class="field w-20" />
-                条
-              </label>
-            </div>
+              <div class="mt-3 grid grid-cols-2 gap-3">
+                <label>
+                  <span class="form-label">Access Key（可选）</span>
+                  <input v-model="wechatRssForm.access_key" type="password" :placeholder="wechatRssForm.credentials_configured ? '已加密保存；保留密文即可' : 'WeRSS AK'" class="field mt-2 w-full" />
+                </label>
+                <label>
+                  <span class="form-label">Secret Key（可选）</span>
+                  <input v-model="wechatRssForm.secret_key" type="password" :placeholder="wechatRssForm.credentials_configured ? '已加密保存；保留密文即可' : 'WeRSS SK'" class="field mt-2 w-full" />
+                </label>
+              </div>
+              <small class="mt-2 block text-xs leading-5 text-slate-600">AK/SK 必须同时填写或同时留空。凭据只在本机加密保存，页面接口只回显掩码。</small>
+              <div class="mt-3 flex flex-wrap items-center gap-4">
+                <label class="text-xs text-slate-400"><input v-model="wechatRssForm.clear_credentials" type="checkbox" class="mr-2" />清除已保存 AK/SK</label>
+                <label class="flex items-center gap-2 text-xs text-slate-400">请求超时
+                  <input v-model.number="wechatRssForm.timeout_seconds" type="number" min="3" max="120" class="field w-20" />
+                  秒
+                </label>
+                <label class="flex items-center gap-2 text-xs text-slate-400">单 Feed 上限
+                  <input v-model.number="wechatRssForm.max_items_per_feed" type="number" min="1" max="500" class="field w-20" />
+                  条
+                </label>
+              </div>
+            </details>
           </div>
           <label class="flex items-center gap-3 rounded-2xl border border-white/[.07] bg-black/10 px-4 py-3">
             <input v-model="channelForm.research_enabled" type="checkbox" />

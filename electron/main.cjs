@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, shell } = require("electron");
 const { spawn } = require("child_process");
 const fs = require("fs/promises");
 const http = require("http");
@@ -139,6 +139,15 @@ ipcMain.handle("alphadesk:save-html-report", async (_event, payload = {}) => {
   await fs.writeFile(result.filePath, html, "utf8");
   electronLog("info", "report.exported", { file_path: result.filePath, html_chars: html.length });
   return { status: "saved", filePath: result.filePath };
+});
+
+ipcMain.handle("alphadesk:open-external-url", async (_event, payload = {}) => {
+  const requestedUrl = typeof payload.url === "string" ? payload.url.trim() : "";
+  const parsed = new URL(requestedUrl);
+  if (!["http:", "https:"].includes(parsed.protocol)) throw new Error("Only http and https URLs can be opened");
+  await shell.openExternal(parsed.toString());
+  electronLog("info", "external_url.opened", { protocol: parsed.protocol, hostname: parsed.hostname });
+  return { status: "opened" };
 });
 
 app.on("second-instance", () => {

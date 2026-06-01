@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import json
+import shutil
+import subprocess
+import sys
 from datetime import datetime
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
 from xml.etree import ElementTree
@@ -22,6 +26,9 @@ MASKED_SECRET = "****************"
 ATOM_NAMESPACE = "http://www.w3.org/2005/Atom"
 CONTENT_NAMESPACE = "http://purl.org/rss/1.0/modules/content/"
 MAX_FEED_RESPONSE_BYTES = 8 * 1024 * 1024
+ROOT = Path(__file__).resolve().parents[1]
+WERSS_INTEGRATION_DIR = ROOT / "integrations" / "werss"
+WERSS_COMPOSE_PATH = WERSS_INTEGRATION_DIR / "compose.yaml"
 
 
 def normalize_werss_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -61,6 +68,7 @@ def public_werss_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
     configured = bool(normalized["access_key"] and normalized["secret_key"])
     return {
         **normalized,
+        "management_url": f"{normalized['base_url']}/",
         "credentials_configured": configured,
         "access_key": MASKED_SECRET if configured else "",
         "secret_key": MASKED_SECRET if configured else "",
@@ -215,3 +223,75 @@ def check_werss(config: dict[str, Any] | None = None) -> dict[str, Any]:
         "message": f"WeRSS RSS 服务可用；抽样读取 {len(items)} 条文章",
         "checked_at": checked_at,
     }
+
+
+def managed_werss_status(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    normalized = normalize_werss_config(config)
+    session = browser_http_session()
+    service_online = False
+    try:
+        response = session.get(f"{normalized['base_url']}/", timeout=min(normalized["timeout_seconds"], 5))
+        service_online = response.status_code < 500
+    except Exception:
+        pass
+    rss_status = check_werss(normalized)
+    docker_available = shutil.which("docker") is not None
+    return {
+        "status": rss_status["status"],
+        "message": rss_status["message"],
+        "checked_at": rss_status["checked_at"],
+        "service_online": service_online,
+        "rss_online": rss_status["status"] == "online",
+        "docker_available": docker_available,
+        "docker_engine_available": docker_engine_available() if docker_available else False,
+        "managed_setup_available": WERSS_COMPOSE_PATH.exists(),
+        "management_url": f"{normalized['base_url']}/",
+        "wechat_status_url": f"{normalized['base_url']}/wechat-status",
+        "subscription_url": f"{normalized['base_url']}/wechat/mp",
+        "add_subscription_url": f"{normalized['base_url']}/add-subscription",
+        "onboarding_steps": [
+            "启动本地 WeRSS 组件，或填写已有 WeRSS 服务地址",
+            "打开 WeRSS 管理台并登录管理账号",
+            "进入公众号状态页面，使用微信扫码授权",
+            "进入添加订阅页面，搜索并选择需要采集的公众号",
+            "回到 AlphaDesk 检查状态，再发起信源采集任务",
+        ],
+    }
+
+
+def docker_engine_available() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    try:
+        completed = subprocess.run(
+            ["docker", "info", "--format", "{{.ServerVersion}}"],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            creationflags=creationflags,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return completed.returncode == 0
+
+
+def start_managed_werss() -> None:
+    if shutil.which("docker") is None:
+        raise RuntimeError("未检测到 Docker。请先安装并启动 Docker Desktop，再启动本地 WeRSS 组件。")
+    if not docker_engine_available():
+        raise RuntimeError("已检测到 Docker 命令，但 Docker Desktop 引擎未运行。请启动 Docker Desktop 后重试。")
+    if not WERSS_COMPOSE_PATH.exists():
+        raise RuntimeError("缺少 WeRSS Compose 配置，无法启动本地组件。")
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    completed = subprocess.run(
+        ["docker", "compose", "-f", str(WERSS_COMPOSE_PATH), "up", "-d"],
+        cwd=WERSS_INTEGRATION_DIR,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        creationflags=creationflags,
+    )
+    if completed.returncode:
+        detail = (completed.stderr or completed.stdout or "docker compose failed").strip()
+        raise RuntimeError(f"WeRSS 启动失败：{detail[-1200:]}")

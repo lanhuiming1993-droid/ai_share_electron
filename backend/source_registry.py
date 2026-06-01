@@ -51,10 +51,10 @@ SOURCES = (
         display_name="微信公众号（WeRSS）",
         category="public_wechat_articles",
         collection_mode="wechat_rss",
-        capabilities=("wechat_official_accounts", "rss_feed", "article_snapshot"),
+        capabilities=("wechat_qr_login", "wechat_official_accounts", "subscription_management", "rss_feed", "article_snapshot"),
         credential_mode="optional_access_key",
         risk_level="medium",
-        detail="通过独立部署的 WeRSS RSS 服务读取已订阅公众号文章；AlphaDesk 不内嵌第三方抓取器。",
+        detail="通过独立部署的 WeRSS 管理台完成扫码授权、公众号订阅和文章刷新；AlphaDesk 读取 RSS 快照。",
     ),
     SourceDefinition(
         id="zsxq",

@@ -54,12 +54,14 @@ npm.cmd run start:api
 
 ## 微信公众号 WeRSS 外部组件
 
-内置 `wechat-mp-rss` 渠道用于读取独立部署的 [WeRSS](https://github.com/rachelos/we-mp-rss) 服务。AlphaDesk 仅消费 `/feed/<feed_id>.rss` 输出，不会自动下载、安装、启动或更新第三方抓取器。请先在单独运行的 WeRSS 中完成授权和公众号订阅，再到“信源渠道 -> 微信公众号（WeRSS） -> 配置”填写服务地址和 Feed ID。
+内置 `wechat-mp-rss` 渠道用于连接独立运行的 [WeRSS](https://github.com/rachelos/we-mp-rss) 组件。WeRSS 原生管理台负责微信扫码授权、公众号搜索与订阅、定时更新和 RSS 生成；AlphaDesk 负责显示组件状态、打开管理台，并按任务时间窗消费 `/feed/<feed_id>.rss` 输出。
 
-- 默认 Feed ID 为 `all`，也可逐行填写多个 Feed ID
+- “信源渠道 -> 微信公众号（WeRSS） -> 配置”提供本地组件启动、状态检查和管理台入口
+- 安装并启动 Docker Desktop 后可一键启动固定镜像摘要；也可填写已有 WeRSS 服务地址
+- 默认 Feed ID 为 `all`，扫码授权和公众号订阅完成后即可采集全部订阅内容
 - 可选 AK/SK 只在本机 Fernet 加密保存，接口只回显掩码
 - 文章严格按 RSS 发布时间和任务时间窗过滤，再保存原始快照
-- 上游版本应固定到经过审查的提交或镜像摘要，不建议生产环境跟随 `latest`
+- AlphaDesk 不导入第三方 Python 模块；内置 Compose 固定到已记录的镜像摘要，不跟随 `latest`
 
 安全边界、部署建议和已核对的上游接口见 `docs/wechat-rss-sidecar.md`。
 
