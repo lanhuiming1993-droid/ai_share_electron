@@ -32,7 +32,7 @@ const wechatRssStarting = ref(false);
 const wechatRssLoginModal = ref(false);
 const wechatRssLoginLoading = ref(false);
 const wechatRssLogin = reactive({ login_state: "idle", message: "点击登录后获取微信二维码", qr_image_url: "", qr_base_url: "", qr_loaded: false, authorized: false });
-const wechatRssSearch = reactive({ query: "", items: [], loading: false, adding_id: "" });
+const wechatRssSearch = reactive({ query: "", items: [], loading: false, adding_id: "", removing_id: "" });
 const mxHarFile = ref(null);
 const mxHarImporting = ref(false);
 const inventoryCleanupSubmitting = ref(false);
@@ -776,6 +776,25 @@ async function addWechatRssSubscription(item) {
     notice.value = `加入公众号失败：${error.message}`;
   } finally {
     wechatRssSearch.adding_id = "";
+  }
+}
+
+async function removeWechatRssSubscription(item) {
+  if (!window.confirm(`确认移除公众号订阅“${item.name}”吗？后续任务将不再采集该公众号；已经保存的历史快照仍可在采集审计中清理。`)) return;
+  wechatRssSearch.removing_id = item.id;
+  try {
+    const result = await request(`/api/channels/wechat-mp-rss/subscriptions/${encodeURIComponent(item.id)}`, { method: "DELETE" });
+    Object.assign(wechatRssComponent, {
+      ready: Boolean(result.ready),
+      subscriptions: result.subscriptions || [],
+      subscription_count: result.subscription_count || 0,
+    });
+    notice.value = `已移除公众号订阅：${item.name}`;
+    await refresh();
+  } catch (error) {
+    notice.value = `移除公众号失败：${error.message}`;
+  } finally {
+    wechatRssSearch.removing_id = "";
   }
 }
 
@@ -1631,7 +1650,10 @@ onUnmounted(() => {
           <div v-if="wechatRssComponent.subscriptions?.length" class="mt-4 max-h-36 space-y-2 overflow-y-auto rounded-xl border border-white/[.07] bg-black/10 p-3">
             <div v-for="item in wechatRssComponent.subscriptions" :key="item.id" class="flex items-center justify-between gap-3 text-xs">
               <span class="truncate text-slate-200">{{ item.name }}</span>
-              <span :class="item.enabled ? 'status-good' : 'status-warn'">{{ item.enabled ? '已启用' : '已停用' }}</span>
+              <div class="flex shrink-0 items-center gap-2">
+                <span :class="item.enabled ? 'status-good' : 'status-warn'">{{ item.enabled ? '已启用' : '已停用' }}</span>
+                <button type="button" @click="removeWechatRssSubscription(item)" :disabled="wechatRssSearch.removing_id===item.id" class="rounded-lg px-2 py-1 font-semibold text-rose-300 transition hover:bg-rose-400/10 disabled:cursor-wait disabled:opacity-60">{{ wechatRssSearch.removing_id===item.id ? '移除中...' : '移除' }}</button>
+              </div>
             </div>
           </div>
           <div class="mt-4 flex justify-center gap-2">
@@ -1743,7 +1765,10 @@ onUnmounted(() => {
             </div>
             <p class="mt-3 text-xs leading-5" :class="wechatRssComponent.ready ? 'text-emerald-300' : 'text-slate-500'">{{ wechatRssComponent.ready ? `信源可用，WeRSS 已加入 ${wechatRssComponent.subscription_count} 个公众号` : '首次使用请点击“登录微信公众号”，扫码后搜索并加入需要采集的公众号。' }}</p>
             <div v-if="wechatRssComponent.subscriptions?.length" class="mt-3 flex max-h-28 flex-wrap gap-2 overflow-y-auto">
-              <span v-for="item in wechatRssComponent.subscriptions" :key="item.id" class="rounded-full border border-teal-400/20 bg-teal-400/[.06] px-3 py-1 text-xs text-teal-100">{{ item.name }}</span>
+              <span v-for="item in wechatRssComponent.subscriptions" :key="item.id" class="inline-flex items-center gap-1 rounded-full border border-teal-400/20 bg-teal-400/[.06] py-1 pl-3 pr-1 text-xs text-teal-100">
+                {{ item.name }}
+                <button type="button" @click="removeWechatRssSubscription(item)" :disabled="wechatRssSearch.removing_id===item.id" :title="`移除公众号订阅：${item.name}`" class="flex h-5 w-5 items-center justify-center rounded-full text-sm text-rose-300 transition hover:bg-rose-400/15 disabled:cursor-wait disabled:opacity-60">×</button>
+              </span>
             </div>
             <details class="mt-3 rounded-xl border border-white/[.07] bg-black/10 p-3">
               <summary class="cursor-pointer text-xs font-semibold text-slate-300">高级配置与维护</summary>

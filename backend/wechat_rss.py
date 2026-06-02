@@ -177,6 +177,25 @@ def werss_admin_post(config: dict[str, Any], path: str, *, json_body: dict[str, 
     return werss_response_data(response)
 
 
+def werss_admin_delete(config: dict[str, Any], path: str, *, session=None) -> Any:
+    normalized = normalize_werss_config(config)
+    session = session or browser_http_session()
+    token = werss_admin_token(normalized, session=session)
+    response = session.delete(
+        werss_api_url(normalized, path),
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=normalized["timeout_seconds"],
+    )
+    if response.status_code == 401:
+        token = werss_admin_token(normalized, session=session, force_refresh=True)
+        response = session.delete(
+            werss_api_url(normalized, path),
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=normalized["timeout_seconds"],
+        )
+    return werss_response_data(response)
+
+
 def fetch_werss_subscriptions(config: dict[str, Any] | None = None, session=None) -> list[dict[str, Any]]:
     normalized = normalize_werss_config(config)
     data = werss_admin_get(normalized, "mps", params={"limit": 100, "offset": 0}, session=session)
@@ -245,6 +264,15 @@ def add_werss_subscription(config: dict[str, Any] | None, account: dict[str, Any
         "intro": str(data.get("mp_intro") or ""),
         "enabled": int(data.get("status") or 0) == 1,
     }
+
+
+def delete_werss_subscription(config: dict[str, Any] | None, subscription_id: str, session=None) -> dict[str, str]:
+    normalized = normalize_werss_config(config)
+    normalized_id = str(subscription_id or "").strip()
+    if not normalized_id:
+        raise ValueError("WeRSS 订阅 ID 不能为空")
+    werss_admin_delete(normalized, f"mps/{quote(normalized_id, safe='')}", session=session)
+    return {"id": normalized_id}
 
 
 def remember_werss_wechat_authorization(config: dict[str, Any], authorized: bool) -> bool:

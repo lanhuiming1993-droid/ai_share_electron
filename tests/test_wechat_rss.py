@@ -9,6 +9,7 @@ from backend.wechat_rss import (
     add_werss_subscription,
     check_werss,
     collect_werss,
+    delete_werss_subscription,
     fetch_werss_subscriptions,
     managed_werss_status,
     parse_werss_feed,
@@ -160,6 +161,10 @@ class WerssApiSession:
             payload = {"code": 0, "data": {}}
         return FakeResponse("", url, payload)
 
+    def delete(self, url: str, **kwargs):
+        self.calls.append({"method": "DELETE", "url": url, **kwargs})
+        return FakeResponse("", url, {"code": 0, "data": None})
+
 
 class WechatRssTests(unittest.TestCase):
     def test_managed_sidecar_enables_rate_limited_full_text_collection(self) -> None:
@@ -293,15 +298,19 @@ class WechatRssTests(unittest.TestCase):
         self.assertTrue(status["authorized"])
         self.assertFalse(any(call["url"].endswith("/auth/qr/code") for call in session.calls))
 
-    def test_search_and_add_subscription_are_proxied_through_werss(self) -> None:
+    def test_search_add_and_delete_subscription_are_proxied_through_werss(self) -> None:
         session = WerssApiSession(persistent_authorization=True)
         config = {"base_url": "http://127.0.0.1:8125"}
         results = search_werss_public_accounts(config, "产业", session=session)
         subscription = add_werss_subscription(config, results[0], session=session)
+        removed = delete_werss_subscription(config, subscription["id"], session=session)
         self.assertEqual(results[0]["name"], "产业研究")
         self.assertEqual(subscription["name"], "产业研究")
+        self.assertEqual(removed["id"], "MP_WXS_1")
         add_call = next(call for call in session.calls if call["method"] == "POST" and call["url"].endswith("/mps"))
         self.assertEqual(add_call["json"]["mp_id"], "ZmFrZS1pZA==")
+        delete_call = next(call for call in session.calls if call["method"] == "DELETE")
+        self.assertTrue(delete_call["url"].endswith("/mps/MP_WXS_1"))
 
     def test_managed_start_explains_missing_docker(self) -> None:
         with patch("backend.wechat_rss.shutil.which", return_value=None):

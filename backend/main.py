@@ -49,6 +49,7 @@ from backend.runtime_health import (
 from backend.source_registry import CANONICAL_CHANNEL_NAMES, source_catalog, tool_catalog
 from backend.wechat_rss import (
     add_werss_subscription,
+    delete_werss_subscription,
     managed_werss_status,
     normalize_werss_config,
     public_werss_config,
@@ -1991,6 +1992,23 @@ def add_wechat_rss_subscription(payload: WechatRssSubscriptionInput) -> dict:
         log_exception(logger, "channel.wechat_rss.subscription.add_failed", exc, channel_id="wechat-mp-rss")
         raise HTTPException(409, str(exc)) from exc
     log_event(logger, "INFO", "channel.wechat_rss.subscription.added", channel_id="wechat-mp-rss", subscription_id=subscription["id"])
+    return {
+        "subscription": subscription,
+        "ready": status["ready"],
+        "subscriptions": status["subscriptions"],
+        "subscription_count": status["subscription_count"],
+    }
+
+
+@app.delete("/api/channels/wechat-mp-rss/subscriptions/{subscription_id}")
+def remove_wechat_rss_subscription(subscription_id: str) -> dict:
+    try:
+        subscription = delete_werss_subscription(wechat_rss_config(), subscription_id)
+        status = persist_wechat_rss_status(managed_werss_status(wechat_rss_config()))
+    except Exception as exc:
+        log_exception(logger, "channel.wechat_rss.subscription.remove_failed", exc, channel_id="wechat-mp-rss", subscription_id=subscription_id)
+        raise HTTPException(409, str(exc)) from exc
+    log_event(logger, "INFO", "channel.wechat_rss.subscription.removed", channel_id="wechat-mp-rss", subscription_id=subscription_id)
     return {
         "subscription": subscription,
         "ready": status["ready"],
