@@ -2,7 +2,7 @@
 
 ## 接入边界
 
-AlphaDesk 将 [rachelos/we-mp-rss](https://github.com/rachelos/we-mp-rss) 作为隔离 sidecar 服务使用。WeRSS 负责微信扫码授权、公众号订阅、定时更新和 RSS 生成；AlphaDesk 负责自动启动本地组件、代理扫码登录、同步已订阅公众号、展示可用状态和消费严格时间窗内的 RSS。当前项目不会 vendor、导入或直接执行第三方 Python 模块。
+AlphaDesk 将 [rachelos/we-mp-rss](https://github.com/rachelos/we-mp-rss) 作为隔离 sidecar 服务使用。WeRSS 负责微信扫码授权、公众号订阅、定时更新和 RSS 生成；AlphaDesk 负责自动启动本地组件、代理扫码登录、搜索并加入公众号、同步已订阅公众号、展示可用状态和消费严格时间窗内的 RSS。当前项目不会 vendor、导入或直接执行第三方 Python 模块。
 
 在使用前，请确认公众号内容采集和保存方式符合你的授权范围、平台规则和适用法律。
 
@@ -16,6 +16,8 @@ AlphaDesk 将 [rachelos/we-mp-rss](https://github.com/rachelos/we-mp-rss) 作为
 - 管理登录：`POST /api/v1/wx/auth/login`
 - 生成扫码二维码：`GET /api/v1/wx/auth/qr/code`
 - 检查扫码状态：`GET /api/v1/wx/auth/qr/status`
+- 搜索公众号：`GET /api/v1/wx/mps/search/{kw}`
+- 添加公众号订阅：`POST /api/v1/wx/mps`
 - 读取已订阅公众号：`GET /api/v1/wx/mps`
 - 原生管理台：`GET /`
 
@@ -30,9 +32,10 @@ AlphaDesk 默认请求 `GET /feed/all.rss`，也支持配置一个或多个 Feed
 1. 安装并启动 Docker Desktop，或准备独立主机上的 WeRSS 服务。
 2. 在 AlphaDesk 的“微信公众号（WeRSS）”渠道中点击“配置”。
 3. 点击“登录微信公众号”。本地 sidecar 未启动时，AlphaDesk 会自动启动固定镜像摘要对应的容器。
-4. 在 AlphaDesk 弹窗中使用微信扫码。工作台会自动轮询授权状态并同步 WeRSS 中已订阅公众号。
-5. 确认“组件”“微信登录”“已订阅公众号”“采集状态”均可用后发起采集。
-6. 仅在排障或跨主机部署时展开高级配置；原生管理台、Feed ID、AK/SK 和反向代理 HTTPS 均属于高级能力。
+4. 在 AlphaDesk 弹窗中使用微信扫码。工作台会自动轮询授权状态。
+5. 在同一个弹窗中搜索并加入需要采集的公众号。WeRSS 无法枚举个人微信的全部关注列表；只会展示已加入 WeRSS 的订阅。
+6. 确认“组件”“微信登录”“已订阅公众号”“采集状态”均可用后发起采集。
+7. 仅在排障或跨主机部署时展开高级配置；原生管理台、Feed ID、AK/SK 和反向代理 HTTPS 均属于高级能力。
 
 ## 运行时行为
 

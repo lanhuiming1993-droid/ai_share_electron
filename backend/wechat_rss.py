@@ -34,7 +34,10 @@ WERSS_INTEGRATION_DIR = ROOT / "integrations" / "werss"
 WERSS_COMPOSE_PATH = WERSS_INTEGRATION_DIR / "compose.yaml"
 WERSS_API_PREFIX = "/api/v1/wx"
 WERSS_TOKEN_TTL_SECONDS = 25 * 60
+WERSS_WECHAT_AUTH_TRUE_TTL_SECONDS = 5 * 60
+WERSS_WECHAT_AUTH_FALSE_TTL_SECONDS = 10
 _WERSS_ADMIN_TOKENS: dict[str, tuple[str, float]] = {}
+_WERSS_WECHAT_AUTH: dict[str, tuple[bool, float]] = {}
 
 
 def normalize_werss_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -99,6 +102,11 @@ def werss_response_data(response) -> Any:
     payload = response.json()
     if not isinstance(payload, dict):
         raise RuntimeError("WeRSS 返回了无法识别的响应")
+    detail = payload.get("detail")
+    if isinstance(detail, dict):
+        nested = detail.get("detail")
+        detail = nested if isinstance(nested, dict) else detail
+        raise RuntimeError(str(detail.get("message") or "WeRSS 请求失败"))
     if payload.get("code", 0) != 0:
         raise RuntimeError(str(payload.get("message") or "WeRSS 请求失败"))
     return payload.get("data")
@@ -146,6 +154,27 @@ def werss_admin_get(config: dict[str, Any], path: str, *, params: dict[str, Any]
     return werss_response_data(response)
 
 
+def werss_admin_post(config: dict[str, Any], path: str, *, json_body: dict[str, Any], session=None) -> Any:
+    normalized = normalize_werss_config(config)
+    session = session or browser_http_session()
+    token = werss_admin_token(normalized, session=session)
+    response = session.post(
+        werss_api_url(normalized, path),
+        json=json_body,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=normalized["timeout_seconds"],
+    )
+    if response.status_code == 401:
+        token = werss_admin_token(normalized, session=session, force_refresh=True)
+        response = session.post(
+            werss_api_url(normalized, path),
+            json=json_body,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=normalized["timeout_seconds"],
+        )
+    return werss_response_data(response)
+
+
 def fetch_werss_subscriptions(config: dict[str, Any] | None = None, session=None) -> list[dict[str, Any]]:
     normalized = normalize_werss_config(config)
     data = werss_admin_get(normalized, "mps", params={"limit": 100, "offset": 0}, session=session)
@@ -163,8 +192,87 @@ def fetch_werss_subscriptions(config: dict[str, Any] | None = None, session=None
     ]
 
 
+def search_werss_public_accounts(config: dict[str, Any] | None, keyword: str, session=None, limit: int = 10) -> list[dict[str, Any]]:
+    normalized = normalize_werss_config(config)
+    query = str(keyword or "").strip()
+    if not query:
+        raise ValueError("请输入公众号名称或关键词")
+    data = werss_admin_get(
+        normalized,
+        f"mps/search/{quote(query, safe='')}",
+        params={"limit": min(max(int(limit), 1), 20), "offset": 0},
+        session=session,
+    )
+    if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+        raise RuntimeError("微信公众号授权尚未生效，请重新扫码")
+    return [
+        {
+            "id": str(row.get("fakeid") or ""),
+            "name": str(row.get("nickname") or ""),
+            "alias": str(row.get("alias") or ""),
+            "avatar": str(row.get("round_head_img") or ""),
+            "intro": str(row.get("signature") or ""),
+            "service_type": int(row.get("service_type") or 0),
+            "verify_status": int(row.get("verify_status") or 0),
+        }
+        for row in data["list"]
+        if isinstance(row, dict) and row.get("fakeid") and row.get("nickname")
+    ]
+
+
+def add_werss_subscription(config: dict[str, Any] | None, account: dict[str, Any], session=None) -> dict[str, Any]:
+    normalized = normalize_werss_config(config)
+    data = werss_admin_post(
+        normalized,
+        "mps",
+        json_body={
+            "mp_name": str(account.get("name") or "").strip(),
+            "mp_cover": str(account.get("avatar") or "").strip(),
+            "mp_id": str(account.get("id") or "").strip(),
+            "avatar": str(account.get("avatar") or "").strip(),
+            "mp_intro": str(account.get("intro") or "").strip(),
+        },
+        session=session,
+    )
+    if not isinstance(data, dict) or not data.get("id"):
+        raise RuntimeError("WeRSS 未返回新增订阅信息")
+    return {
+        "id": str(data.get("id") or ""),
+        "name": str(data.get("mp_name") or ""),
+        "avatar": str(data.get("mp_cover") or ""),
+        "intro": str(data.get("mp_intro") or ""),
+        "enabled": int(data.get("status") or 0) == 1,
+    }
+
+
+def remember_werss_wechat_authorization(config: dict[str, Any], authorized: bool) -> bool:
+    normalized = normalize_werss_config(config)
+    ttl = WERSS_WECHAT_AUTH_TRUE_TTL_SECONDS if authorized else WERSS_WECHAT_AUTH_FALSE_TTL_SECONDS
+    _WERSS_WECHAT_AUTH[normalized["base_url"]] = (authorized, time.time() + ttl)
+    return authorized
+
+
+def probe_werss_wechat_authorization(config: dict[str, Any] | None = None, session=None, force_refresh: bool = False) -> bool:
+    normalized = normalize_werss_config(config)
+    cached = _WERSS_WECHAT_AUTH.get(normalized["base_url"])
+    if not force_refresh and cached and cached[1] > time.time():
+        return cached[0]
+    try:
+        search_werss_public_accounts(normalized, "证券", session=session, limit=1)
+    except Exception:
+        return remember_werss_wechat_authorization(normalized, False)
+    return remember_werss_wechat_authorization(normalized, True)
+
+
 def start_werss_wechat_login(config: dict[str, Any] | None = None, session=None) -> dict[str, Any]:
     normalized = normalize_werss_config(config)
+    if probe_werss_wechat_authorization(normalized, session=session):
+        return {
+            "login_state": "authorized",
+            "message": "微信授权仍然有效，无需重复扫码",
+            "authorized": True,
+            "qr_image_url": "",
+        }
     data = werss_admin_get(normalized, "auth/qr/code", session=session)
     qr_path = str(data.get("code") if isinstance(data, dict) else "").strip()
     if not qr_path:
@@ -172,6 +280,7 @@ def start_werss_wechat_login(config: dict[str, Any] | None = None, session=None)
     return {
         "login_state": "waiting_scan",
         "message": "请使用微信扫描二维码完成授权",
+        "authorized": False,
         "qr_image_url": urljoin(f"{normalized['base_url']}/", qr_path.lstrip("/")),
     }
 
@@ -182,7 +291,10 @@ def werss_wechat_login_status(config: dict[str, Any] | None = None, session=None
     login_status = bool(data.get("login_status")) if isinstance(data, dict) else False
     qr_exists = bool(data.get("qr_code")) if isinstance(data, dict) else False
     if login_status:
+        remember_werss_wechat_authorization(normalized, True)
         return {"login_state": "authorized", "message": "微信扫码授权成功", "authorized": True}
+    if probe_werss_wechat_authorization(normalized, session=session):
+        return {"login_state": "authorized", "message": "微信授权有效", "authorized": True}
     if qr_exists:
         return {"login_state": "waiting_scan", "message": "等待微信扫码授权", "authorized": False}
     return {"login_state": "expired", "message": "二维码已失效，请重新获取", "authorized": False}

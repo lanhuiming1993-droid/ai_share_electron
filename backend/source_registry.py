@@ -54,7 +54,7 @@ SOURCES = (
         capabilities=("wechat_qr_login", "wechat_official_accounts", "subscription_management", "rss_feed", "article_snapshot"),
         credential_mode="optional_access_key",
         risk_level="medium",
-        detail="通过 AlphaDesk 弹窗完成微信扫码授权并同步已订阅公众号；后台读取严格时间窗内的 RSS 快照。",
+        detail="通过 AlphaDesk 弹窗完成微信扫码授权，搜索并加入公众号；后台读取严格时间窗内的 RSS 快照。",
     ),
     SourceDefinition(
         id="zsxq",

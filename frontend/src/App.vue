@@ -32,6 +32,7 @@ const wechatRssStarting = ref(false);
 const wechatRssLoginModal = ref(false);
 const wechatRssLoginLoading = ref(false);
 const wechatRssLogin = reactive({ login_state: "idle", message: "点击登录后获取微信二维码", qr_image_url: "", qr_base_url: "", qr_loaded: false, authorized: false });
+const wechatRssSearch = reactive({ query: "", items: [], loading: false, adding_id: "" });
 const mxHarFile = ref(null);
 const mxHarImporting = ref(false);
 const inventoryCleanupSubmitting = ref(false);
@@ -685,7 +686,7 @@ async function startWechatRssSidecar() {
   try {
     Object.assign(wechatRssComponent, await request("/api/channels/wechat-mp-rss/start-sidecar", { method: "POST" }));
     notice.value = wechatRssComponent.service_online
-      ? "WeRSS 已启动。点击“登录微信公众号”即可在 AlphaDesk 中扫码并同步公众号。"
+      ? "WeRSS 已启动。点击“登录微信公众号”即可在 AlphaDesk 中扫码，并搜索加入公众号。"
       : "已提交 WeRSS 启动命令，但服务尚未就绪，请稍后重新检查。";
   } catch (error) {
     notice.value = error.message;
@@ -730,14 +731,51 @@ async function syncWechatRssSubscriptions({ quiet = false } = {}) {
     Object.assign(wechatRssComponent, result);
     if (!quiet) {
       notice.value = result.ready
-        ? `微信公众号信源可用，已同步 ${result.subscription_count} 个公众号`
-        : "尚未识别到已订阅公众号，请先扫码授权并完成订阅";
+        ? `微信公众号信源可用，WeRSS 已加入 ${result.subscription_count} 个公众号`
+        : "WeRSS 尚未加入公众号，请先扫码授权，再搜索并加入需要采集的公众号";
     }
     await refresh();
     return result;
   } catch (error) {
     if (!quiet) notice.value = `同步公众号失败：${error.message}`;
     throw error;
+  }
+}
+
+async function searchWechatRssAccounts() {
+  const query = wechatRssSearch.query.trim();
+  if (!query) return notice.value = "请输入公众号名称或关键词";
+  wechatRssSearch.loading = true;
+  try {
+    const result = await request(`/api/channels/wechat-mp-rss/subscriptions/search?q=${encodeURIComponent(query)}`);
+    wechatRssSearch.items = result.items || [];
+    notice.value = result.count ? `已找到 ${result.count} 个公众号候选` : "没有找到匹配的公众号，请换一个关键词";
+  } catch (error) {
+    notice.value = `搜索公众号失败：${error.message}`;
+  } finally {
+    wechatRssSearch.loading = false;
+  }
+}
+
+async function addWechatRssSubscription(item) {
+  wechatRssSearch.adding_id = item.id;
+  try {
+    const result = await request("/api/channels/wechat-mp-rss/subscriptions", {
+      method: "POST",
+      body: JSON.stringify({ id: item.id, name: item.name, avatar: item.avatar || "", intro: item.intro || "" }),
+    });
+    Object.assign(wechatRssComponent, {
+      ready: Boolean(result.ready),
+      subscriptions: result.subscriptions || [],
+      subscription_count: result.subscription_count || 0,
+    });
+    wechatRssSearch.items = wechatRssSearch.items.filter((candidate) => candidate.id !== item.id);
+    notice.value = `已加入公众号订阅：${item.name}`;
+    await refresh();
+  } catch (error) {
+    notice.value = `加入公众号失败：${error.message}`;
+  } finally {
+    wechatRssSearch.adding_id = "";
   }
 }
 
@@ -755,7 +793,7 @@ async function pollWechatRssLoginStatus() {
       });
       notice.value = result.ready
         ? `微信扫码成功，已同步 ${result.subscription_count} 个公众号，信源可用`
-        : "微信扫码成功。尚未识别到订阅公众号；需要新增订阅时可在高级配置中打开原生管理台维护。";
+        : "微信扫码成功。请在当前弹窗中搜索并加入需要采集的公众号。";
       await refresh();
     } else if (result.login_state === "expired") {
       stopWechatRssLoginPolling();
@@ -778,7 +816,11 @@ async function beginWechatRssLogin() {
   try {
     await saveWechatRssConfiguration();
     const result = await request("/api/channels/wechat-mp-rss/wechat-login", { method: "POST" });
-    Object.assign(wechatRssLogin, result, { qr_base_url: result.qr_image_url, qr_loaded: false, authorized: false });
+    Object.assign(wechatRssLogin, result, { qr_base_url: result.qr_image_url || "", qr_loaded: false, authorized: Boolean(result.authorized) });
+    if (result.authorized) {
+      await syncWechatRssSubscriptions({ quiet: true });
+      return;
+    }
     refreshWechatRssQrImage();
     wechatRssQrRefreshTimer = window.setInterval(refreshWechatRssQrImage, 1200);
     wechatRssLoginPollTimer = window.setInterval(() => void pollWechatRssLoginStatus(), 3000);
@@ -1256,7 +1298,7 @@ onUnmounted(() => {
                 <small>{{ channel.type }} · {{ channelStatusDescription(channel) }}</small>
                 <small v-if="channel.group_ids?.length">星球 ID：{{ channel.group_ids.join('、') }}</small>
                 <small v-if="channel.id==='akshare'">组件：AkShare · BaoStock · TuShare{{ channel.market_data_config?.tushare_token_configured ? '（token 已加密保存）' : '（等待 token）' }}</small>
-                <small v-if="channel.id==='wechat-mp-rss'">微信扫码登录后自动同步已订阅公众号；采集按严格时间窗读取文章快照</small>
+                <small v-if="channel.id==='wechat-mp-rss'">微信扫码登录后搜索并加入公众号；采集按严格时间窗读取文章快照</small>
                 <small>整理策略：{{ channel.parsing_strategy }} · 质量阈值 {{ channel.normalization_quality_threshold }} · 最大滚动 {{ channel.max_scrolls }}</small>
                 <small>个股补证：{{ channel.research_enabled ? '允许' : '关闭' }}</small>
                 <small v-if="channel.last_check">上次检查：{{ channel.last_check }}</small>
@@ -1550,11 +1592,11 @@ onUnmounted(() => {
     </div>
 
     <div v-if="wechatRssLoginModal" class="fixed inset-0 z-[70] flex items-center justify-center bg-black/75 p-6 backdrop-blur-sm" @click.self="closeWechatRssLogin">
-      <section class="flex max-h-[90vh] w-full max-w-md flex-col overflow-hidden rounded-3xl border border-white/[.12] bg-[#101a2a] shadow-2xl shadow-black/40">
+      <section class="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-3xl border border-white/[.12] bg-[#101a2a] shadow-2xl shadow-black/40">
         <header class="flex items-center justify-between border-b border-white/[.08] px-6 py-5">
           <div>
             <h2 class="text-lg font-semibold text-white">登录微信公众号</h2>
-            <p class="mt-1 text-xs text-slate-500">微信扫码授权后，AlphaDesk 会自动识别已订阅公众号</p>
+            <p class="mt-1 text-xs text-slate-500">微信扫码授权后，可在 AlphaDesk 内搜索并加入需要采集的公众号</p>
           </div>
           <button @click="closeWechatRssLogin" class="flex h-8 w-8 items-center justify-center rounded-full text-lg text-slate-500 transition hover:bg-white/[.06] hover:text-white">×</button>
         </header>
@@ -1563,13 +1605,29 @@ onUnmounted(() => {
             <img v-if="wechatRssLogin.qr_image_url && !wechatRssLogin.authorized" :src="wechatRssLogin.qr_image_url" alt="微信公众号登录二维码" class="h-56 w-56 object-contain" @load="markWechatRssQrLoaded" @error="wechatRssLogin.qr_loaded=false" />
             <div v-else-if="wechatRssLogin.authorized" class="text-center">
               <p class="text-base font-semibold text-emerald-600">微信扫码授权成功</p>
-              <p class="mt-2 text-sm text-slate-500">已识别 {{ wechatRssComponent.subscription_count || 0 }} 个订阅公众号</p>
+              <p class="mt-2 text-sm text-slate-500">WeRSS 已加入 {{ wechatRssComponent.subscription_count || 0 }} 个公众号</p>
             </div>
             <div v-else class="text-center">
               <p class="text-sm text-slate-500">{{ wechatRssLoginLoading ? '正在准备二维码...' : '二维码暂不可用' }}</p>
             </div>
           </div>
           <p class="mt-4 text-center text-sm" :class="wechatRssLogin.authorized ? 'text-emerald-300' : wechatRssLogin.login_state==='failed' || wechatRssLogin.login_state==='expired' ? 'text-amber-300' : 'text-slate-300'">{{ wechatRssLogin.message }}</p>
+          <div v-if="wechatRssLogin.authorized" class="mt-4 rounded-xl border border-teal-400/20 bg-teal-400/[.04] p-3">
+            <p class="text-xs leading-5 text-slate-400">WeRSS 无法枚举个人微信的全部关注列表。请搜索需要采集的公众号并加入订阅；已加入项会自动进入后续快照采集。</p>
+            <div class="mt-3 flex gap-2">
+              <input v-model="wechatRssSearch.query" @keyup.enter="searchWechatRssAccounts" placeholder="搜索公众号，例如 半导体、证券时报" class="field min-w-0 flex-1" />
+              <button type="button" @click="searchWechatRssAccounts" :disabled="wechatRssSearch.loading" class="primary disabled:cursor-wait disabled:opacity-60">{{ wechatRssSearch.loading ? '搜索中...' : '搜索' }}</button>
+            </div>
+            <div v-if="wechatRssSearch.items.length" class="mt-3 max-h-48 space-y-2 overflow-y-auto">
+              <div v-for="item in wechatRssSearch.items" :key="item.id" class="flex items-center justify-between gap-3 rounded-lg border border-white/[.07] bg-black/10 px-3 py-2">
+                <div class="min-w-0">
+                  <p class="truncate text-xs font-semibold text-slate-200">{{ item.name }}</p>
+                  <p class="truncate text-[11px] text-slate-500">{{ item.alias || item.intro || '未提供简介' }}</p>
+                </div>
+                <button type="button" @click="addWechatRssSubscription(item)" :disabled="wechatRssSearch.adding_id===item.id" class="secondary shrink-0 disabled:cursor-wait disabled:opacity-60">{{ wechatRssSearch.adding_id===item.id ? '加入中...' : '加入订阅' }}</button>
+              </div>
+            </div>
+          </div>
           <div v-if="wechatRssComponent.subscriptions?.length" class="mt-4 max-h-36 space-y-2 overflow-y-auto rounded-xl border border-white/[.07] bg-black/10 p-3">
             <div v-for="item in wechatRssComponent.subscriptions" :key="item.id" class="flex items-center justify-between gap-3 text-xs">
               <span class="truncate text-slate-200">{{ item.name }}</span>
@@ -1669,7 +1727,7 @@ onUnmounted(() => {
             <div class="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <span class="form-label">微信公众号</span>
-                <p class="mt-1 text-xs leading-5 text-slate-500">微信扫码一次，自动识别已订阅公众号。后续采集任务会按严格时间窗保存文章快照。</p>
+                <p class="mt-1 text-xs leading-5 text-slate-500">微信扫码一次，在 AlphaDesk 内搜索并加入需要采集的公众号。后续任务会按严格时间窗保存文章快照。</p>
               </div>
               <span :class="wechatRssComponent.ready ? 'status-good' : 'status-warn'">{{ wechatRssComponentLoading ? '正在检查' : (wechatRssComponent.ready ? '信源可用' : '等待登录') }}</span>
             </div>
@@ -1683,7 +1741,7 @@ onUnmounted(() => {
               <button type="button" @click="beginWechatRssLogin" :disabled="wechatRssLoginLoading" class="primary disabled:cursor-wait disabled:opacity-60">{{ wechatRssLoginLoading ? '正在准备...' : '登录微信公众号' }}</button>
               <button type="button" @click="syncWechatRssSubscriptions()" :disabled="wechatRssComponentLoading" class="secondary">{{ wechatRssComponentLoading ? '正在同步...' : '同步已订阅公众号' }}</button>
             </div>
-            <p class="mt-3 text-xs leading-5" :class="wechatRssComponent.ready ? 'text-emerald-300' : 'text-slate-500'">{{ wechatRssComponent.ready ? `信源可用，已识别 ${wechatRssComponent.subscription_count} 个公众号` : '首次使用请点击“登录微信公众号”，扫码后会自动同步订阅列表。' }}</p>
+            <p class="mt-3 text-xs leading-5" :class="wechatRssComponent.ready ? 'text-emerald-300' : 'text-slate-500'">{{ wechatRssComponent.ready ? `信源可用，WeRSS 已加入 ${wechatRssComponent.subscription_count} 个公众号` : '首次使用请点击“登录微信公众号”，扫码后搜索并加入需要采集的公众号。' }}</p>
             <div v-if="wechatRssComponent.subscriptions?.length" class="mt-3 flex max-h-28 flex-wrap gap-2 overflow-y-auto">
               <span v-for="item in wechatRssComponent.subscriptions" :key="item.id" class="rounded-full border border-teal-400/20 bg-teal-400/[.06] px-3 py-1 text-xs text-teal-100">{{ item.name }}</span>
             </div>

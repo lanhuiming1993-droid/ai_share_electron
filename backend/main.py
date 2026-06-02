@@ -19,7 +19,7 @@ from uuid import uuid4
 
 import requests
 from cryptography.fernet import Fernet
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -48,9 +48,11 @@ from backend.runtime_health import (
 )
 from backend.source_registry import CANONICAL_CHANNEL_NAMES, source_catalog, tool_catalog
 from backend.wechat_rss import (
+    add_werss_subscription,
     managed_werss_status,
     normalize_werss_config,
     public_werss_config,
+    search_werss_public_accounts,
     start_managed_werss,
     start_werss_wechat_login,
     werss_wechat_login_status,
@@ -244,6 +246,13 @@ class WechatRssConfigInput(BaseModel):
     clear_credentials: bool = False
     timeout_seconds: int = Field(default=20, ge=3, le=120)
     max_items_per_feed: int = Field(default=100, ge=1, le=500)
+
+
+class WechatRssSubscriptionInput(BaseModel):
+    id: str = Field(min_length=1, max_length=255)
+    name: str = Field(min_length=1, max_length=255)
+    avatar: str = Field(default="", max_length=1_000)
+    intro: str = Field(default="", max_length=1_000)
 
 
 class FrontendLogInput(BaseModel):
@@ -1907,6 +1916,34 @@ def wechat_rss_subscriptions() -> dict:
         "subscriptions": status["subscriptions"],
         "subscription_count": status["subscription_count"],
         "message": status["message"],
+    }
+
+
+@app.get("/api/channels/wechat-mp-rss/subscriptions/search")
+def search_wechat_rss_subscriptions(q: str = Query(min_length=1, max_length=100)) -> dict:
+    try:
+        items = search_werss_public_accounts(wechat_rss_config(), q)
+    except Exception as exc:
+        log_exception(logger, "channel.wechat_rss.subscriptions.search_failed", exc, channel_id="wechat-mp-rss")
+        raise HTTPException(409, str(exc)) from exc
+    log_event(logger, "INFO", "channel.wechat_rss.subscriptions.searched", channel_id="wechat-mp-rss", result_count=len(items))
+    return {"items": items, "count": len(items)}
+
+
+@app.post("/api/channels/wechat-mp-rss/subscriptions")
+def add_wechat_rss_subscription(payload: WechatRssSubscriptionInput) -> dict:
+    try:
+        subscription = add_werss_subscription(wechat_rss_config(), payload.model_dump())
+        status = persist_wechat_rss_status(managed_werss_status(wechat_rss_config()))
+    except Exception as exc:
+        log_exception(logger, "channel.wechat_rss.subscription.add_failed", exc, channel_id="wechat-mp-rss")
+        raise HTTPException(409, str(exc)) from exc
+    log_event(logger, "INFO", "channel.wechat_rss.subscription.added", channel_id="wechat-mp-rss", subscription_id=subscription["id"])
+    return {
+        "subscription": subscription,
+        "ready": status["ready"],
+        "subscriptions": status["subscriptions"],
+        "subscription_count": status["subscription_count"],
     }
 
 

@@ -6,6 +6,7 @@ data/*.db
 data/*.key
 data/browser-profile/
 data/logs/
+data/werss/
 __pycache__/
 *.pyc
 *.har

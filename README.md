@@ -54,10 +54,10 @@ npm.cmd run start:api
 
 ## 微信公众号 WeRSS 组件
 
-内置 `wechat-mp-rss` 渠道用于连接隔离运行的 [WeRSS](https://github.com/rachelos/we-mp-rss) 组件。AlphaDesk 已将常用流程收进微信公众号渠道弹窗：点击登录、微信扫码、自动识别已订阅公众号、确认信源可用。正常使用无需理解 WeRSS 管理台、Feed 或 AK/SK。
+内置 `wechat-mp-rss` 渠道用于连接隔离运行的 [WeRSS](https://github.com/rachelos/we-mp-rss) 组件。AlphaDesk 已将常用流程收进微信公众号渠道弹窗：点击登录、微信扫码、搜索目标公众号、一键加入订阅、确认信源可用。正常使用无需理解 WeRSS 管理台、Feed 或 AK/SK。
 
 - “信源渠道 -> 微信公众号（WeRSS） -> 配置 -> 登录微信公众号”会按需启动本地组件并弹出微信二维码
-- 扫码成功后自动读取已订阅公众号，并将渠道标记为可用
+- 扫码成功后可在 AlphaDesk 内搜索并加入公众号；加入至少一个订阅后渠道标记为可用
 - 安装并启动 Docker Desktop 后可按需启动固定镜像摘要；也可在高级配置中填写已有 WeRSS 服务地址
 - 默认 Feed ID 为 `all`，扫码授权和公众号订阅完成后即可采集全部订阅内容
 - 可选 AK/SK 只在本机 Fernet 加密保存，接口只回显掩码
