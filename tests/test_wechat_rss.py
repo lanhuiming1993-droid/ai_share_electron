@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from backend.wechat_rss import (
@@ -120,6 +121,13 @@ class WerssApiSession:
 
 
 class WechatRssTests(unittest.TestCase):
+    def test_managed_sidecar_enables_rate_limited_full_text_collection(self) -> None:
+        compose = (Path(__file__).parents[1] / "integrations" / "werss" / "compose.yaml").read_text(encoding="utf-8")
+        self.assertIn('GATHER.CONTENT: "True"', compose)
+        self.assertIn('GATHER.CONTENT_AUTO_CHECK: "True"', compose)
+        self.assertIn('GATHER.CONTENT_AUTO_INTERVAL: "15"', compose)
+        self.assertIn('RSS_FULL_CONTEXT: "True"', compose)
+
     def test_collect_werss_applies_strict_timestamp_window_and_optional_auth(self) -> None:
         session = FakeSession(RSS_XML)
         with patch("backend.wechat_rss.browser_http_session", return_value=session):

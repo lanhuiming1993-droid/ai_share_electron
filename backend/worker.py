@@ -47,7 +47,7 @@ class CollectionWorker:
         db_path: Path,
         profile_for: Callable[[str], Path],
         report_after_collection: Callable[[dict], tuple[str, str]],
-        normalize_snapshot: Callable[[str], dict] | None = None,
+        normalize_snapshot: Callable[..., dict] | None = None,
         on_evidence_ready: Callable[[str], None] | None = None,
         request_config_for: Callable[[str], dict] | None = None,
         poll_seconds: float = 1.5,
@@ -185,7 +185,7 @@ class CollectionWorker:
                 ),
             )
 
-    def persist_channel_result(self, job: dict, window: dict, snapshots: list[dict]) -> tuple[int, int, list[str]]:
+    def persist_channel_result(self, job: dict, window: dict, snapshots: list[dict]) -> tuple[int, int, list[str], list[str]]:
         collected_at = current_time()
         general_refresh = job.get("evidence_layer") == "local_source_snapshots" and not canonical_scope_key(job.get("query", ""))
         scope_type = "general" if general_refresh or not (job.get("parent_task_id") or job.get("query") or job.get("evidence_layer")) else "research"
@@ -193,6 +193,7 @@ class CollectionWorker:
         inserted = 0
         duplicates = 0
         inserted_snapshot_ids: list[str] = []
+        refreshed_snapshot_ids: list[str] = []
         with self.connect() as conn:
             for item in snapshots:
                 before = conn.total_changes
@@ -221,7 +222,7 @@ class CollectionWorker:
                     duplicates += 1
                     existing = conn.execute(
                         """
-                        SELECT id FROM source_snapshots
+                        SELECT id,content FROM source_snapshots
                         WHERE channel_id=? AND source_url=? AND occurred_at=? AND scope_type=? AND scope_key=?
                         """,
                         (item["channel_id"], item["source_url"], item["occurred_at"], scope_type, scope_key),
@@ -229,6 +230,12 @@ class CollectionWorker:
                     if not existing:
                         continue
                     snapshot_id = existing["id"]
+                    if len(str(item["content"] or "").strip()) > len(str(existing["content"] or "").strip()):
+                        conn.execute(
+                            "UPDATE source_snapshots SET content=?,collected_at=? WHERE id=?",
+                            (item["content"], collected_at, snapshot_id),
+                        )
+                        refreshed_snapshot_ids.append(snapshot_id)
                 conn.execute(
                     "INSERT OR IGNORE INTO source_job_snapshots(job_id,snapshot_id) VALUES(?,?)",
                     (job["id"], snapshot_id),
@@ -250,14 +257,16 @@ class CollectionWorker:
             scope_key=scope_key,
             received_snapshots=len(snapshots),
             inserted_snapshots=inserted,
+            refreshed_snapshots=len(refreshed_snapshot_ids),
             duplicate_snapshots=duplicates,
         )
-        return inserted, duplicates, inserted_snapshot_ids
+        return inserted, duplicates, inserted_snapshot_ids, refreshed_snapshot_ids
 
     def execute(self, job: dict) -> None:
         successful_channels: set[str] = set()
         errors: dict[str, str] = {}
         total_inserted = 0
+        total_refreshed = 0
         log_event(
             logger,
             "INFO",
@@ -295,8 +304,9 @@ class CollectionWorker:
                         self.profile_for(channel["id"]),
                         job.get("query", ""),
                     )
-                    inserted, duplicates, snapshot_ids = self.persist_channel_result(job, window, channel_snapshots)
+                    inserted, duplicates, snapshot_ids, refreshed_snapshot_ids = self.persist_channel_result(job, window, channel_snapshots)
                     total_inserted += inserted
+                    total_refreshed += len(refreshed_snapshot_ids)
                     successful_channels.add(channel["id"])
                     coverage_complete = snapshots_cover_window(channel_snapshots)
                     if not coverage_complete:
@@ -304,7 +314,7 @@ class CollectionWorker:
                     self.record_run(
                         job["id"],
                         channel["id"],
-                        "partial_coverage" if not coverage_complete else "completed" if inserted else "deduplicated",
+                        "partial_coverage" if not coverage_complete else "completed" if inserted or refreshed_snapshot_ids else "deduplicated",
                         started_at=started_at,
                         snapshot_count=inserted,
                         duplicate_count=duplicates,
@@ -318,6 +328,7 @@ class CollectionWorker:
                         channel_id=channel["id"],
                         received_snapshots=len(channel_snapshots),
                         inserted_snapshots=inserted,
+                        refreshed_snapshots=len(refreshed_snapshot_ids),
                         duplicate_snapshots=duplicates,
                         coverage_complete=coverage_complete,
                     )
@@ -330,6 +341,19 @@ class CollectionWorker:
                                 log_exception(
                                     logger,
                                     "worker.normalization.failed",
+                                    exc,
+                                    job_id=job["id"],
+                                    channel_id=channel["id"],
+                                    snapshot_id=snapshot_id,
+                                )
+                        for snapshot_id in refreshed_snapshot_ids:
+                            try:
+                                self.normalize_snapshot(snapshot_id, force=True)
+                            except Exception as exc:
+                                errors[channel["id"]] = f"Normalization failed after snapshot refresh: {exc}"[:1200]
+                                log_exception(
+                                    logger,
+                                    "worker.normalization.refresh_failed",
                                     exc,
                                     job_id=job["id"],
                                     channel_id=channel["id"],
@@ -353,12 +377,12 @@ class CollectionWorker:
                                 "UPDATE channels SET status='offline',last_check=?,updated_at=? WHERE id=?",
                                 (checked_at, checked_at, channel["id"]),
                             )
-            self.finish_collection(job, successful_channels, errors, total_inserted)
+            self.finish_collection(job, successful_channels, errors, total_inserted, total_refreshed)
         except Exception as exc:
             log_exception(logger, "worker.collection.failed", exc, job_id=job["id"])
             self.fail_job(job, str(exc))
 
-    def finish_collection(self, job: dict, successful_channels: set[str], errors: dict[str, str], inserted: int) -> None:
+    def finish_collection(self, job: dict, successful_channels: set[str], errors: dict[str, str], inserted: int, refreshed: int = 0) -> None:
         completed_at = current_time()
         if not successful_channels:
             self.fail_job(job, json.dumps(errors, ensure_ascii=False) or "No source channel completed successfully")
@@ -368,7 +392,7 @@ class CollectionWorker:
         elif errors:
             status = "partial_completed"
         else:
-            status = "completed" if inserted else "deduplicated"
+            status = "completed" if inserted or refreshed else "deduplicated"
         error = json.dumps(errors, ensure_ascii=False) if errors else ""
         with self.connect() as conn:
             conn.execute(
@@ -384,6 +408,7 @@ class CollectionWorker:
             job_id=job["id"],
             status=status,
             inserted_snapshots=inserted,
+            refreshed_snapshots=refreshed,
             successful_channels=sorted(successful_channels),
             channel_errors=errors,
         )

@@ -163,6 +163,29 @@ class WorkerBehaviorTests(unittest.TestCase):
                 second_window["window_end"],
             )
 
+    def test_richer_duplicate_snapshot_refreshes_content_and_normalization(self) -> None:
+        self.insert_channels("good")
+        occurred_at = timestamp(-5)
+        window = {"channel_id": "good", "window_start": timestamp(-30), "window_end": timestamp()}
+        summary = {"channel_id": "good", "occurred_at": occurred_at, "source_url": "good://same", "content": "summary"}
+        full_text = {**summary, "content": "full article body " * 40}
+        normalization_calls: list[tuple[str, bool]] = []
+
+        def normalize(snapshot_id: str, force: bool = False) -> dict:
+            normalization_calls.append((snapshot_id, force))
+            return {}
+
+        self.worker.normalize_snapshot = normalize
+        with patch("backend.worker.collect_channel", side_effect=[[summary], [full_text]]):
+            self.worker.execute(self.insert_job("summary", [window]))
+            self.worker.execute(self.insert_job("full-text", [window]))
+        with database(self.db_path) as conn:
+            snapshot_rows = conn.execute("SELECT content FROM source_snapshots").fetchall()
+            second_status = conn.execute("SELECT status FROM source_collection_jobs WHERE id='full-text'").fetchone()[0]
+        self.assertEqual(snapshot_rows, [(full_text["content"],)])
+        self.assertEqual(second_status, "completed")
+        self.assertEqual([force for _, force in normalization_calls], [False, True])
+
     def test_general_and_research_snapshots_do_not_overwrite_each_other(self) -> None:
         self.insert_channels("good")
         window = {"channel_id": "good", "window_start": timestamp(-30), "window_end": timestamp()}

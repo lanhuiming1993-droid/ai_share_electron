@@ -23,6 +23,8 @@ AlphaDesk 将 [rachelos/we-mp-rss](https://github.com/rachelos/we-mp-rss) 作为
 
 AlphaDesk 默认请求 `GET /feed/all.rss`，也支持配置一个或多个 Feed ID。采集器只保存 RSS 中发布时间落在任务时间窗内的文章。
 
+本地托管容器默认启用正文抓取、全文 RSS 和每 15 分钟一次的缺失正文补抓。WeRSS 会先同步公众号文章索引，再在受控频率下补充正文；正文尚未回填时，RSS 中可能暂时只有标题、摘要和原文链接。
+
 ## 安全审查结论
 
 上游项目采用 MIT 许可证，但仓库根目录存在与 RSS 服务主链路无关的网络工具脚本。AlphaDesk 因此不复制、不导入、不执行上游 Python 模块。用户点击“启动本地 WeRSS”时，工作台只会运行 `integrations/werss/compose.yaml` 中固定镜像摘要的隔离容器。
