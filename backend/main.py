@@ -85,6 +85,9 @@ CHANNEL_LOGIN_PROCESSES: dict[str, subprocess.Popen] = {}
 CHANNEL_LOGIN_PROCESSES_LOCK = threading.Lock()
 MAX_MX_HAR_BYTES = 32 * 1024 * 1024
 MAX_MX_HAR_UPLOAD_BYTES = 60 * 1024 * 1024
+SNAPSHOT_LIST_PREVIEW_CHARS = 6_000
+SNAPSHOT_DETAIL_PREVIEW_CHARS = 120_000
+SNAPSHOT_DETAIL_PREVIEW_MAX_CHARS = 200_000
 MARKET_DATA_DEFAULT_CONFIG = {
     "adapter": "market_data_aggregate",
     "enable_akshare": True,
@@ -2882,7 +2885,8 @@ def source_job_snapshots(job_id: str) -> dict:
             dict(row)
             for row in conn.execute(
                 """
-                SELECT s.id,s.channel_id,c.name AS channel_name,s.occurred_at,s.collected_at,s.source_url,s.content,s.scope_type,s.scope_key,
+                SELECT s.id,s.channel_id,c.name AS channel_name,s.occurred_at,s.collected_at,s.source_url,
+                       substr(s.content,1,?) AS content_preview,length(s.content) AS content_length,s.scope_type,s.scope_key,
                        s.normalization_status,s.normalized_at,s.normalization_error,s.normalized_item_count
                 FROM source_job_snapshots js
                 JOIN source_snapshots s ON s.id=js.snapshot_id
@@ -2890,7 +2894,7 @@ def source_job_snapshots(job_id: str) -> dict:
                 WHERE js.job_id=?
                 ORDER BY s.occurred_at DESC
                 """,
-                (job_id,),
+                (SNAPSHOT_LIST_PREVIEW_CHARS, job_id),
             )
         ]
         if not snapshots and job["started_at"] and job["completed_at"]:
@@ -2901,16 +2905,19 @@ def source_job_snapshots(job_id: str) -> dict:
                     dict(row)
                     for row in conn.execute(
                         f"""
-                        SELECT s.id,s.channel_id,c.name AS channel_name,s.occurred_at,s.collected_at,s.source_url,s.content,s.scope_type,s.scope_key,
+                        SELECT s.id,s.channel_id,c.name AS channel_name,s.occurred_at,s.collected_at,s.source_url,
+                               substr(s.content,1,?) AS content_preview,length(s.content) AS content_length,s.scope_type,s.scope_key,
                                s.normalization_status,s.normalized_at,s.normalization_error,s.normalized_item_count
                         FROM source_snapshots s
                         LEFT JOIN channels c ON c.id=s.channel_id
                         WHERE s.channel_id IN ({placeholders}) AND s.collected_at BETWEEN ? AND ?
                         ORDER BY s.occurred_at DESC
                         """,
-                        [*channel_ids, job["started_at"], job["completed_at"]],
+                        [SNAPSHOT_LIST_PREVIEW_CHARS, *channel_ids, job["started_at"], job["completed_at"]],
                     )
                 ]
+    for snapshot in snapshots:
+        snapshot["content_truncated"] = snapshot["content_length"] > len(snapshot["content_preview"])
     return {
         "job": {
             "id": job["id"],
@@ -2923,6 +2930,45 @@ def source_job_snapshots(job_id: str) -> dict:
         },
         "snapshots": snapshots,
     }
+
+
+@app.get("/api/snapshots/{snapshot_id}")
+def source_snapshot_preview(
+    snapshot_id: str,
+    preview_chars: int = Query(SNAPSHOT_DETAIL_PREVIEW_CHARS, ge=2_000, le=SNAPSHOT_DETAIL_PREVIEW_MAX_CHARS),
+) -> dict:
+    preview_chars = max(2_000, min(SNAPSHOT_DETAIL_PREVIEW_MAX_CHARS, preview_chars))
+    with db() as conn:
+        snapshot = conn.execute(
+            """
+            SELECT s.id,s.channel_id,c.name AS channel_name,s.occurred_at,s.collected_at,s.source_url,
+                   substr(s.content,1,?) AS content_preview,length(s.content) AS content_length,s.scope_type,s.scope_key,
+                   s.normalization_status,s.normalized_at,s.normalization_error,s.normalized_item_count
+            FROM source_snapshots s
+            LEFT JOIN channels c ON c.id=s.channel_id
+            WHERE s.id=?
+            """,
+            (preview_chars, snapshot_id),
+        ).fetchone()
+    if not snapshot:
+        raise HTTPException(404, "信源快照不存在")
+    result = dict(snapshot)
+    result["content_truncated"] = result["content_length"] > len(result["content_preview"])
+    return result
+
+
+@app.get("/api/snapshots/{snapshot_id}/content")
+def download_source_snapshot_content(snapshot_id: str) -> Response:
+    with db() as conn:
+        snapshot = conn.execute("SELECT content FROM source_snapshots WHERE id=?", (snapshot_id,)).fetchone()
+    if not snapshot:
+        raise HTTPException(404, "信源快照不存在")
+    safe_snapshot_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", snapshot_id)[:80] or "snapshot"
+    return Response(
+        content=snapshot["content"],
+        media_type="text/plain",
+        headers={"Content-Disposition": f'attachment; filename="alphadesk-snapshot-{safe_snapshot_id}.txt"'},
+    )
 
 
 @app.get("/api/normalized-items")

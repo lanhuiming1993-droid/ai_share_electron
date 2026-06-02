@@ -17,6 +17,7 @@ const sourceJobFeedback = ref("");
 const sourceJobFeedbackType = ref("info");
 const snapshotModal = ref(false);
 const snapshotDetail = reactive({ job: null, snapshots: [] });
+const snapshotPreviewLoadingId = ref("");
 const normalizedModal = ref(false);
 const normalizedDetail = reactive({ title: "", items: [] });
 const saving = ref(false);
@@ -397,6 +398,13 @@ async function openJobReport(job) {
   } catch (error) { notice.value = error.message; }
 }
 
+async function exportJobReport(job) {
+  try {
+    const result = await request(`/api/source-jobs/${job.id}/report`);
+    downloadReportHtml(result.report, result.report_title || job.report_title);
+  } catch (error) { notice.value = error.message; }
+}
+
 function closeSnapshots() {
   snapshotModal.value = false;
   Object.assign(snapshotDetail, { job: null, snapshots: [] });
@@ -435,6 +443,25 @@ async function normalizeExistingChannel(channel) {
     notice.value = `${channelDisplayName(channel)} 已整理 ${result.snapshot_count} 份原始快照`;
     await refresh();
   } catch (error) { notice.value = error.message; }
+}
+
+function snapshotPreviewText(item) {
+  return item.content_preview || "";
+}
+
+function snapshotDownloadUrl(item) {
+  return `${API}/api/snapshots/${encodeURIComponent(item.id)}/content`;
+}
+
+async function loadLongerSnapshotPreview(item) {
+  snapshotPreviewLoadingId.value = item.id;
+  try {
+    Object.assign(item, await request(`/api/snapshots/${encodeURIComponent(item.id)}?preview_chars=200000`));
+  } catch (error) {
+    notice.value = error.message;
+  } finally {
+    snapshotPreviewLoadingId.value = "";
+  }
 }
 
 function formatSnapshotContent(content) {
@@ -963,17 +990,17 @@ function buildReportExportDocument(report) {
     : buildReportPreviewDocument(text);
 }
 
-function reportExportFilename() {
-  const stem = (selectedReportTitle.value || "AlphaDesk 报告")
+function reportExportFilename(title = selectedReportTitle.value) {
+  const stem = (title || "AlphaDesk 报告")
     .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_")
     .trim()
     .slice(0, 100) || "AlphaDesk 报告";
   return `${stem}.html`;
 }
 
-async function exportReportHtml() {
-  const filename = reportExportFilename();
-  const html = buildReportExportDocument(selectedReport.value);
+function downloadReportHtml(report, title = "AlphaDesk 报告") {
+  const filename = reportExportFilename(title);
+  const html = buildReportExportDocument(report);
   try {
     frontendLog("info", "report.export.clicked", "", { filename, report_chars: html.length });
     const url = URL.createObjectURL(new Blob([html], { type: "text/html;charset=utf-8" }));
@@ -988,6 +1015,14 @@ async function exportReportHtml() {
   } catch (error) {
     notice.value = `HTML 报告导出失败：${error.message}`;
   }
+}
+
+function exportReportHtml() {
+  downloadReportHtml(selectedReport.value, selectedReportTitle.value);
+}
+
+function exportTaskReport(item) {
+  downloadReportHtml(item.report, `${item.target} - ${item.title}`);
 }
 
 function closeTopmostModal(event) {
@@ -1129,7 +1164,10 @@ onUnmounted(() => {
                     <p class="text-sm font-medium text-white">{{ item.target }} · {{ item.title }}</p>
                     <p class="mt-1 text-xs text-slate-600">{{ item.created_at }} · {{ item.status }}</p>
                   </div>
-                  <button v-if="item.report" @click="openReport(item.report, `${item.target} - ${item.title}`)" class="report-action">查看报告</button>
+                  <div v-if="item.report" class="flex shrink-0 gap-2">
+                    <button @click="openReport(item.report, `${item.target} - ${item.title}`)" class="report-action">查看报告</button>
+                    <button @click="exportTaskReport(item)" class="report-action">导出报告</button>
+                  </div>
                   <button v-else-if="canRunTask(item)" @click="runTask(item.id)" class="secondary">{{ taskActionLabel(item) }}</button>
                   <span v-else class="status-warn">{{ taskActionLabel(item) }}</span>
                 </div>
@@ -1194,6 +1232,7 @@ onUnmounted(() => {
               </div>
               <div class="flex shrink-0 items-center gap-2">
                 <button v-if="item.report" @click="openReport(item.report, `${item.target} - ${item.title}`)" class="report-action">查看报告</button>
+                <button v-if="item.report" @click="exportTaskReport(item)" class="report-action">导出报告</button>
                 <button v-if="canRunTask(item)" @click="runTask(item.id)" class="secondary">{{ taskActionLabel(item) }}</button>
                 <span v-else-if="!item.report" class="status-warn">{{ taskActionLabel(item) }}</span>
                 <button @click="resetTask(item)" class="secondary">重置</button>
@@ -1258,6 +1297,7 @@ onUnmounted(() => {
               <div class="flex shrink-0 gap-2">
                 <button v-if="job.snapshot_count" @click="openSnapshots(job)" class="snapshot-action">查看快照</button>
                 <button v-if="job.has_report || job.report" @click="openJobReport(job)" class="report-action">查看报告</button>
+                <button v-if="job.has_report || job.report" @click="exportJobReport(job)" class="report-action">导出报告</button>
                 <span v-if="job.status==='generating_report'" class="status-warn">报告生成中</span>
                 <button v-if="canRetrySourceJob(job)" @click="retrySourceJob(job)" class="secondary">{{ retrySourceJobLabel(job) }}</button>
               </div>
@@ -1412,6 +1452,7 @@ onUnmounted(() => {
               <div class="flex shrink-0 gap-2">
                 <button v-if="job.snapshot_count" @click="openSnapshots(job)" class="snapshot-action">查看快照</button>
                 <button v-if="job.has_report || job.report" @click="openJobReport(job)" class="report-action">查看报告</button>
+                <button v-if="job.has_report || job.report" @click="exportJobReport(job)" class="report-action">导出报告</button>
                 <span v-if="job.status==='generating_report'" class="status-warn">报告生成中</span>
                 <button v-if="canRetrySourceJob(job)" @click="retrySourceJob(job)" class="secondary">{{ retrySourceJobLabel(job) }}</button>
               </div>
@@ -1575,9 +1616,12 @@ onUnmounted(() => {
             <div class="mt-3 flex gap-2">
               <button @click="normalizeSnapshot(item)" class="secondary">重新整理</button>
               <button v-if="item.normalized_item_count" @click="openNormalizedItems({ snapshotId: item.id, title: `${channelDisplayName({ id: item.channel_id, name: item.channel_name })} · 结构化条目` })" class="secondary">查看结构化内容</button>
+              <button v-if="item.content_truncated && item.content_preview.length < 200000" @click="loadLongerSnapshotPreview(item)" :disabled="snapshotPreviewLoadingId===item.id" class="secondary disabled:cursor-wait disabled:opacity-60">{{ snapshotPreviewLoadingId===item.id ? '加载中...' : '加载更多预览' }}</button>
+              <a :href="snapshotDownloadUrl(item)" class="secondary">下载完整原文</a>
             </div>
             <p v-if="item.normalization_error" class="mt-3 break-all text-xs leading-5 text-amber-300">{{ item.normalization_error }}</p>
-            <pre class="mt-4 max-h-[440px] overflow-auto whitespace-pre-wrap break-words rounded-xl bg-black/25 p-4 text-xs leading-6 text-slate-300">{{ formatSnapshotContent(item.content) }}</pre>
+            <p v-if="item.content_truncated" class="mt-3 text-xs text-amber-300">当前仅展示 {{ item.content_preview.length }} / {{ item.content_length }} 字符预览。完整内容请下载原文。</p>
+            <pre class="mt-4 max-h-[440px] overflow-auto whitespace-pre-wrap break-words rounded-xl bg-black/25 p-4 text-xs leading-6 text-slate-300">{{ formatSnapshotContent(snapshotPreviewText(item)) }}</pre>
           </article>
         </div>
       </section>

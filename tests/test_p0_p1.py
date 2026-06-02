@@ -269,6 +269,46 @@ class MainBehaviorTests(unittest.TestCase):
         self.assertEqual(stored["status"], "generating_report")
         self.assertIsNone(stored["report"])
 
+    def test_snapshot_view_uses_bounded_preview_and_preserves_full_download(self) -> None:
+        now = timestamp()
+        large_content = "A" * 250_000
+        with self.main.db() as conn:
+            conn.execute(
+                "INSERT INTO channels(id,name,type,url,collection_mode,status,updated_at) VALUES('large-test','large','test','','requests','online',?)",
+                (now,),
+            )
+            conn.execute(
+                """
+                INSERT INTO source_collection_jobs(id,action,channel_ids,windows,lookback_days,skill_name,report_title,status,created_at)
+                VALUES('large-job','collect','["large-test"]','[]',30,'skill','large preview','completed',?)
+                """,
+                (now,),
+            )
+            conn.execute(
+                """
+                INSERT INTO source_snapshots(id,channel_id,occurred_at,collected_at,source_url,content)
+                VALUES('large-snapshot','large-test',?,?,?,?)
+                """,
+                (now, now, "large://snapshot", large_content),
+            )
+            conn.execute(
+                "INSERT INTO source_job_snapshots(job_id,snapshot_id) VALUES('large-job','large-snapshot')"
+            )
+
+        listed = self.main.source_job_snapshots("large-job")["snapshots"][0]
+        self.assertNotIn("content", listed)
+        self.assertEqual(len(listed["content_preview"]), self.main.SNAPSHOT_LIST_PREVIEW_CHARS)
+        self.assertEqual(listed["content_length"], len(large_content))
+        self.assertTrue(listed["content_truncated"])
+
+        preview = self.main.source_snapshot_preview("large-snapshot", 200_000)
+        self.assertEqual(len(preview["content_preview"]), 200_000)
+        self.assertTrue(preview["content_truncated"])
+
+        download = self.main.download_source_snapshot_content("large-snapshot")
+        self.assertEqual(download.body.decode(), large_content)
+        self.assertIn("alphadesk-snapshot-large-snapshot.txt", download.headers["content-disposition"])
+
     def test_fixed_normalizers_parse_mx_and_telegram(self) -> None:
         base = {
             "channel_id": "test",
