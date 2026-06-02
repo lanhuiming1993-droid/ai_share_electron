@@ -2,11 +2,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
+import socket
+import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlsplit
 
+from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
+
+LOGIN_STATE_FILE = ".alphadesk-login-state.json"
+LOGIN_STATE_MAX_AGE_SECONDS = 5
+CHROMIUM_SINGLETON_FILES = ("SingletonLock", "SingletonCookie", "SingletonSocket")
 
 
 def visible_timestamps(text: str, timezone_info) -> list[datetime]:
@@ -21,7 +30,69 @@ def visible_timestamps(text: str, timezone_info) -> list[datetime]:
     return values
 
 
+def write_login_state(profile: Path, url: str, active: bool) -> None:
+    state_path = profile / LOGIN_STATE_FILE
+    temporary_path = profile / f"{LOGIN_STATE_FILE}.tmp"
+    temporary_path.write_text(
+        json.dumps({"url": url, "active": active, "updated_at": time.time()}),
+        encoding="utf-8",
+    )
+    temporary_path.replace(state_path)
+
+
+def read_login_state(profile: Path) -> dict:
+    try:
+        payload = json.loads((profile / LOGIN_STATE_FILE).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def cleanup_stale_chromium_singleton(profile: Path) -> bool:
+    try:
+        lock_target = os.readlink(profile / "SingletonLock")
+    except OSError:
+        return False
+    hostname, separator, pid_text = lock_target.rpartition("-")
+    if not separator or not pid_text.isdigit():
+        return False
+    if hostname == socket.gethostname():
+        try:
+            os.kill(int(pid_text), 0)
+        except OSError:
+            pass
+        else:
+            return False
+    for name in CHROMIUM_SINGLETON_FILES:
+        try:
+            (profile / name).unlink()
+        except FileNotFoundError:
+            pass
+    return True
+
+
+def is_profile_in_use_error(exc: PlaywrightError) -> bool:
+    detail = str(exc)
+    return "Opening in existing browser session" in detail or "profile appears to be in use" in detail
+
+
+def is_zsxq_group_url(url: str) -> bool:
+    parsed = urlsplit(url)
+    return parsed.hostname == "wx.zsxq.com" and re.match(r"^/group/\d+(?:/|$)", parsed.path) is not None
+
+
+def evaluate_login_url(final_url: str, success_url_contains: str, channel_id: str = "") -> tuple[bool, str]:
+    if channel_id == "zsxq" and is_zsxq_group_url(final_url):
+        return True, "已识别知识星球登录后的星球页面"
+    if success_url_contains:
+        available = success_url_contains in final_url
+        return available, f"当前页面 {'符合' if available else '不符合'}登录后 URL 规则"
+    available = not any(word in final_url.lower() for word in ("login", "signin", "passport"))
+    return available, "已按页面重定向结果完成基础检查"
+
+
 def login(profile: Path, url: str) -> None:
+    cleanup_stale_chromium_singleton(profile)
     with sync_playwright() as playwright:
         context = playwright.chromium.launch_persistent_context(
             str(profile),
@@ -30,14 +101,41 @@ def login(profile: Path, url: str) -> None:
             args=["--start-maximized"],
         )
         page = context.pages[0] if context.pages else context.new_page()
-        page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-        page.wait_for_event("close", timeout=0)
-        context.close()
+        last_url = url
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+            while not page.is_closed():
+                last_url = page.url
+                write_login_state(profile, last_url, active=True)
+                page.wait_for_timeout(1000)
+        except PlaywrightError:
+            if not page.is_closed():
+                raise
+        finally:
+            write_login_state(profile, last_url, active=False)
+            context.close()
 
 
-def check(profile: Path, url: str, success_url_contains: str, success_selector: str) -> None:
+def check(profile: Path, url: str, success_url_contains: str, success_selector: str, channel_id: str = "") -> None:
+    cleanup_stale_chromium_singleton(profile)
     with sync_playwright() as playwright:
-        context = playwright.chromium.launch_persistent_context(str(profile), headless=True)
+        try:
+            context = playwright.chromium.launch_persistent_context(str(profile), headless=True)
+        except PlaywrightError as exc:
+            if not is_profile_in_use_error(exc):
+                raise
+            state = read_login_state(profile)
+            final_url = str(state.get("url") or url)
+            updated_at = float(state.get("updated_at") or 0)
+            active = bool(state.get("active")) and time.time() - updated_at <= LOGIN_STATE_MAX_AGE_SECONDS
+            available, message = evaluate_login_url(final_url, success_url_contains, channel_id)
+            if not active:
+                available = False
+                message = "登录浏览器仍在启动，请稍候重试；如已完成登录，可关闭登录窗口后再次检查"
+            elif success_selector and not available:
+                message = "登录浏览器仍在运行，暂时无法检查页面选择器；请完成登录或关闭登录窗口后重试"
+            print(json.dumps({"available": available, "message": message, "final_url": final_url}))
+            return
         page = context.pages[0] if context.pages else context.new_page()
         page.goto(url, wait_until="domcontentloaded", timeout=30_000)
         page.wait_for_timeout(1200)
@@ -45,18 +143,15 @@ def check(profile: Path, url: str, success_url_contains: str, success_selector: 
         if success_selector:
             available = page.locator(success_selector).count() > 0
             message = f"页面选择器 {'已匹配' if available else '未匹配'}: {success_selector}"
-        elif success_url_contains:
-            available = success_url_contains in final_url
-            message = f"当前页面 {'符合' if available else '不符合'}登录后 URL 规则"
         else:
-            available = not any(word in final_url.lower() for word in ("login", "signin", "passport"))
-            message = "已按页面重定向结果完成基础检查"
+            available, message = evaluate_login_url(final_url, success_url_contains, channel_id)
         context.close()
     print(json.dumps({"available": available, "message": message, "final_url": final_url}))
 
 
 def collect(profile: Path, urls: list[str], window_start: str, window_end: str, query: str, max_scrolls: int) -> None:
     snapshots = []
+    cleanup_stale_chromium_singleton(profile)
     with sync_playwright() as playwright:
         context = playwright.chromium.launch_persistent_context(str(profile), headless=True)
         page = context.pages[0] if context.pages else context.new_page()
@@ -138,6 +233,7 @@ def main() -> None:
     parser.add_argument("--window-end", default="")
     parser.add_argument("--query", default="")
     parser.add_argument("--max-scrolls", type=int, default=8)
+    parser.add_argument("--channel-id", default="")
     parser.add_argument("--success-url-contains", default="")
     parser.add_argument("--success-selector", default="")
     args = parser.parse_args()
@@ -146,7 +242,7 @@ def main() -> None:
     if args.action == "login":
         login(profile, args.url)
     elif args.action == "check":
-        check(profile, args.url, args.success_url_contains, args.success_selector)
+        check(profile, args.url, args.success_url_contains, args.success_selector, args.channel_id)
     else:
         collect(profile, json.loads(args.urls_json), args.window_start, args.window_end, args.query, args.max_scrolls)
 

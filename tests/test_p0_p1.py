@@ -224,6 +224,7 @@ class MainBehaviorTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.original_db_path = self.main.DB_PATH
         self.main.DB_PATH = Path(self.temp_dir.name) / "main.db"
+        self.main.CHANNEL_LOGIN_PROCESSES.clear()
         self.main.init_db()
 
     def tearDown(self) -> None:
@@ -317,6 +318,61 @@ class MainBehaviorTests(unittest.TestCase):
             result = self.main.launch_channel_login("zsxq")
         self.assertEqual(result["login_url"], "http://127.0.0.1:7900/vnc.html")
         popen.assert_called_once()
+
+    def test_playwright_login_reuses_running_browser_process(self) -> None:
+        with self.main.db() as conn:
+            conn.execute(
+                "UPDATE channels SET url='https://wx.zsxq.com',collection_mode='playwright' WHERE id='zsxq'"
+            )
+        process = Mock()
+        process.poll.return_value = None
+        with patch.object(self.main.subprocess, "Popen", return_value=process) as popen:
+            self.main.launch_channel_login("zsxq")
+            result = self.main.launch_channel_login("zsxq")
+        self.assertEqual(result["status"], "opened")
+        popen.assert_called_once()
+
+    def test_zsxq_login_opens_configured_group_page(self) -> None:
+        with self.main.db() as conn:
+            conn.execute(
+                """
+                UPDATE channels
+                SET url='https://wx.zsxq.com',validation_url='',group_ids='["28888222124181"]',
+                    collection_mode='playwright'
+                WHERE id='zsxq'
+                """
+            )
+        with patch.object(self.main.subprocess, "Popen") as popen:
+            self.main.launch_channel_login("zsxq")
+        command = popen.call_args.args[0]
+        self.assertEqual(command[command.index("--url") + 1], "https://wx.zsxq.com/group/28888222124181")
+
+    def test_zsxq_check_uses_configured_group_page(self) -> None:
+        with self.main.db() as conn:
+            conn.execute(
+                """
+                UPDATE channels
+                SET url='https://wx.zsxq.com',validation_url='',success_url_contains='/group',
+                    group_ids='["28888222124181"]',collection_mode='playwright'
+                WHERE id='zsxq'
+                """
+            )
+        completed = Mock(
+            stdout=json.dumps(
+                {
+                    "available": True,
+                    "message": "已识别知识星球登录后的星球页面",
+                    "final_url": "https://wx.zsxq.com/group/28888222124181",
+                },
+                ensure_ascii=False,
+            )
+        )
+        with patch.object(self.main.subprocess, "run", return_value=completed) as run:
+            result = self.main.check_channel("zsxq")
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--url") + 1], "https://wx.zsxq.com/group/28888222124181")
+        self.assertEqual(command[command.index("--channel-id") + 1], "zsxq")
+        self.assertEqual(result["status"], "online")
 
     def test_werss_normalizer_preserves_specific_public_account(self) -> None:
         snapshot = {

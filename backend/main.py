@@ -81,6 +81,8 @@ MIN_COLLECTION_INTERVAL = timedelta(minutes=15)
 REPORT_DEDUP_INTERVAL = timedelta(minutes=2)
 MASKED_SECRET = "****************"
 BROWSER_WORKSPACE_PUBLIC_URL = os.environ.get("ALPHADESK_BROWSER_PUBLIC_URL", "").strip()
+CHANNEL_LOGIN_PROCESSES: dict[str, subprocess.Popen] = {}
+CHANNEL_LOGIN_PROCESSES_LOCK = threading.Lock()
 MARKET_DATA_DEFAULT_CONFIG = {
     "adapter": "market_data_aggregate",
     "enable_akshare": True,
@@ -2139,6 +2141,22 @@ def browser_profile(channel_id: str) -> Path:
     return DATA_DIR / "browser-profile" / channel_id
 
 
+def channel_validation_url(channel: sqlite3.Row | dict) -> str:
+    validation_url = str(channel["validation_url"] or "").strip()
+    if validation_url:
+        return validation_url
+    if channel["id"] == "zsxq":
+        try:
+            group_ids = json.loads(channel["group_ids"] or "[]")
+        except json.JSONDecodeError:
+            group_ids = []
+        for value in group_ids:
+            group_id = str(value).strip()
+            if re.fullmatch(r"\d+", group_id):
+                return f"https://wx.zsxq.com/group/{group_id}"
+    return str(channel["url"] or "").strip()
+
+
 def check_mx_channel(channel_id: str, request_config: dict) -> dict:
     checked_at = now()
     try:
@@ -2185,16 +2203,21 @@ def launch_channel_login(channel_id: str) -> dict:
         raise HTTPException(409, "请先填写渠道入口 URL")
     profile = browser_profile(channel_id)
     profile.mkdir(parents=True, exist_ok=True)
+    login_url = channel_validation_url(channel) if channel_id == "zsxq" else channel["url"]
     try:
-        subprocess.Popen(
-            [sys.executable, str(ROOT / "backend" / "browser_session.py"), "login", "--profile", str(profile), "--url", channel["url"]],
-            cwd=ROOT,
-            creationflags=hidden_window_creationflags(),
-        )
+        with CHANNEL_LOGIN_PROCESSES_LOCK:
+            process = CHANNEL_LOGIN_PROCESSES.get(channel_id)
+            if process is None or process.poll() is not None:
+                process = subprocess.Popen(
+                    [sys.executable, str(ROOT / "backend" / "browser_session.py"), "login", "--profile", str(profile), "--url", login_url],
+                    cwd=ROOT,
+                    creationflags=hidden_window_creationflags(),
+                )
+                CHANNEL_LOGIN_PROCESSES[channel_id] = process
     except OSError as exc:
         log_exception(logger, "channel.login.launch_failed", exc, channel_id=channel_id)
         raise HTTPException(502, f"登录工作区启动失败：{type(exc).__name__}") from exc
-    message = "登录浏览器已启动。请在登录工作区完成登录并关闭浏览器页签，再点击检查状态。"
+    message = "登录浏览器已启动。完成登录后可直接点击检查状态；开始采集前请关闭登录浏览器页签。"
     return {"status": "opened", "message": message, "login_url": BROWSER_WORKSPACE_PUBLIC_URL}
 
 
@@ -2239,7 +2262,7 @@ def check_channel(channel_id: str) -> dict:
         result = {"status": channel["status"], "message": "该渠道无需浏览器登录检查"}
         log_event(logger, "INFO", "channel.check.completed", channel_id=channel_id, **result)
         return result
-    validation_url = channel["validation_url"] or channel["url"]
+    validation_url = channel_validation_url(channel)
     if not validation_url:
         raise HTTPException(409, "请先填写检查 URL 或渠道入口 URL")
     profile = browser_profile(channel_id)
@@ -2249,6 +2272,7 @@ def check_channel(channel_id: str) -> dict:
             [
                 sys.executable, str(ROOT / "backend" / "browser_session.py"), "check",
                 "--profile", str(profile), "--url", validation_url,
+                "--channel-id", channel_id,
                 "--success-url-contains", channel["success_url_contains"],
                 "--success-selector", channel["success_selector"],
             ],
