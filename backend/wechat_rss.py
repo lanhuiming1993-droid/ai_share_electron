@@ -29,6 +29,7 @@ MASKED_SECRET = "****************"
 ATOM_NAMESPACE = "http://www.w3.org/2005/Atom"
 CONTENT_NAMESPACE = "http://purl.org/rss/1.0/modules/content/"
 MAX_FEED_RESPONSE_BYTES = 8 * 1024 * 1024
+WERSS_FEED_PAGE_SIZE = 10
 ROOT = Path(__file__).resolve().parents[1]
 WERSS_INTEGRATION_DIR = ROOT / "integrations" / "werss"
 WERSS_COMPOSE_PATH = WERSS_INTEGRATION_DIR / "compose.yaml"
@@ -379,12 +380,19 @@ def parse_werss_feed(xml_text: str) -> list[dict[str, str]]:
     raise ValueError("WeRSS 返回的内容不是受支持的 RSS 或 Atom XML")
 
 
-def fetch_werss_feed(config: dict[str, Any], feed_id: str, query: str = "", limit: int | None = None, session=None) -> tuple[str, list[dict[str, str]]]:
+def fetch_werss_feed(
+    config: dict[str, Any],
+    feed_id: str,
+    query: str = "",
+    limit: int | None = None,
+    offset: int = 0,
+    session=None,
+) -> tuple[str, list[dict[str, str]]]:
     url = feed_url(config, feed_id, query)
     session = session or browser_http_session()
     response = session.get(
         url,
-        params={"limit": limit or config["max_items_per_feed"], "offset": 0},
+        params={"limit": limit or config["max_items_per_feed"], "offset": max(int(offset), 0)},
         headers=werss_headers(config),
         timeout=config["timeout_seconds"],
     )
@@ -402,32 +410,55 @@ def collect_werss(channel: dict[str, Any], window: dict[str, str], query: str = 
     snapshots: list[dict[str, str]] = []
     session = browser_http_session()
     for feed_id in config["feed_ids"]:
-        request_url, articles = fetch_werss_feed(config, feed_id, query, session=session)
-        for article in articles:
-            occurred_at = parsed_timestamp(article["published_at"])
-            if not occurred_at or occurred_at < window_start or occurred_at > window_end:
-                continue
-            source_url = article["link"] or f"{request_url}#{quote(article['id'] or article['title'], safe='')}"
-            stable_key = (feed_id, article["id"] or source_url, occurred_at.isoformat(timespec="seconds"))
-            if stable_key in seen:
-                continue
-            seen.add(stable_key)
-            payload = {
-                "platform": "werss_external_rss",
-                "adapter": "external_sidecar",
-                "feed_id": feed_id,
-                "query": query,
-                "collection_window": window,
-                "article": article,
-            }
-            snapshots.append(
-                {
-                    "channel_id": channel["id"],
-                    "occurred_at": occurred_at.isoformat(timespec="seconds"),
-                    "source_url": source_url,
-                    "content": json.dumps(payload, ensure_ascii=False),
+        offset = 0
+        remaining = config["max_items_per_feed"]
+        while remaining > 0:
+            page_limit = min(WERSS_FEED_PAGE_SIZE, remaining)
+            while True:
+                try:
+                    request_url, articles = fetch_werss_feed(config, feed_id, query, limit=page_limit, offset=offset, session=session)
+                    break
+                except ValueError as exc:
+                    if "8 MB" not in str(exc) or page_limit == 1:
+                        raise
+                    page_limit = max(page_limit // 2, 1)
+            if not articles:
+                break
+            reached_window_start = False
+            for article in articles:
+                occurred_at = parsed_timestamp(article["published_at"])
+                if not occurred_at:
+                    continue
+                if occurred_at < window_start:
+                    reached_window_start = True
+                    continue
+                if occurred_at > window_end:
+                    continue
+                source_url = article["link"] or f"{request_url}#{quote(article['id'] or article['title'], safe='')}"
+                stable_key = (feed_id, article["id"] or source_url, occurred_at.isoformat(timespec="seconds"))
+                if stable_key in seen:
+                    continue
+                seen.add(stable_key)
+                payload = {
+                    "platform": "werss_external_rss",
+                    "adapter": "external_sidecar",
+                    "feed_id": feed_id,
+                    "query": query,
+                    "collection_window": window,
+                    "article": article,
                 }
-            )
+                snapshots.append(
+                    {
+                        "channel_id": channel["id"],
+                        "occurred_at": occurred_at.isoformat(timespec="seconds"),
+                        "source_url": source_url,
+                        "content": json.dumps(payload, ensure_ascii=False),
+                    }
+                )
+            offset += len(articles)
+            remaining -= len(articles)
+            if reached_window_start or len(articles) < page_limit:
+                break
     return snapshots
 
 

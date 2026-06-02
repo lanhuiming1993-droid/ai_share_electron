@@ -83,6 +83,46 @@ class FakeSession:
         return FakeResponse(self.text, url)
 
 
+def rss_xml(entries: list[tuple[str, str, str]]) -> str:
+    items = "".join(
+        f"""
+        <item>
+          <guid>{article_id}</guid>
+          <title>{article_id}</title>
+          <pubDate>{published_at}</pubDate>
+          <link>https://mp.weixin.qq.com/s/{article_id}</link>
+          <description>{article_id}</description>
+          <content:encoded>{content}</content:encoded>
+        </item>
+        """
+        for article_id, published_at, content in entries
+    )
+    return f'<rss version="2.0" xmlns:content="http://purl.org/rss/1.0/modules/content/"><channel>{items}</channel></rss>'
+
+
+class PagedFeedSession:
+    def __init__(self, pages: dict[int, str]) -> None:
+        self.pages = pages
+        self.calls: list[dict] = []
+
+    def get(self, url: str, **kwargs):
+        self.calls.append({"url": url, **kwargs})
+        offset = int(kwargs.get("params", {}).get("offset", 0))
+        return FakeResponse(self.pages.get(offset, rss_xml([])), url)
+
+
+class AdaptiveFeedSession:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    def get(self, url: str, **kwargs):
+        self.calls.append({"url": url, **kwargs})
+        limit = int(kwargs.get("params", {}).get("limit", 0))
+        if limit > 5:
+            return FakeResponse("x" * (8 * 1024 * 1024 + 1), url)
+        return FakeResponse(rss_xml([("article-1", "Sun, 31 May 2026 11:30:00 +0800", "full text")]), url)
+
+
 class WerssApiSession:
     def __init__(self, persistent_authorization: bool = False, qr_login_status: bool = True) -> None:
         self.calls: list[dict] = []
@@ -152,6 +192,32 @@ class WechatRssTests(unittest.TestCase):
         self.assertEqual(payload["platform"], "werss_external_rss")
         self.assertEqual(payload["article"]["title"], "产业链更新")
         self.assertEqual(session.calls[0]["headers"]["Authorization"], "AK-SK local-ak:local-sk")
+
+    def test_collect_werss_pages_until_strict_window_boundary(self) -> None:
+        recent = [(f"article-{index}", "Sun, 31 May 2026 11:30:00 +0800", "full text") for index in range(10)]
+        boundary = [
+            ("article-10", "Wed, 20 May 2026 11:30:00 +0800", "full text"),
+            ("article-11", "Tue, 19 May 2026 11:30:00 +0800", "full text"),
+            ("article-old", "Wed, 01 Apr 2026 11:30:00 +0800", "old"),
+        ]
+        session = PagedFeedSession({0: rss_xml(recent), 10: rss_xml(boundary)})
+        with patch("backend.wechat_rss.browser_http_session", return_value=session):
+            snapshots = collect_werss(
+                {"id": "wechat-mp-rss", "request_config": {"max_items_per_feed": 50}},
+                {"window_start": "2026-05-01T00:00:00+08:00", "window_end": "2026-06-01T00:00:00+08:00"},
+            )
+        self.assertEqual(len(snapshots), 12)
+        self.assertEqual([call["params"]["offset"] for call in session.calls], [0, 10])
+
+    def test_collect_werss_reduces_page_size_when_full_text_page_exceeds_limit(self) -> None:
+        session = AdaptiveFeedSession()
+        with patch("backend.wechat_rss.browser_http_session", return_value=session):
+            snapshots = collect_werss(
+                {"id": "wechat-mp-rss", "request_config": {"max_items_per_feed": 50}},
+                {"window_start": "2026-05-01T00:00:00+08:00", "window_end": "2026-06-01T00:00:00+08:00"},
+            )
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual([call["params"]["limit"] for call in session.calls], [10, 5])
 
     def test_parse_werss_feed_supports_atom(self) -> None:
         items = parse_werss_feed(ATOM_XML)
