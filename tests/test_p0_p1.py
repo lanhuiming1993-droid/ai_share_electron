@@ -405,6 +405,38 @@ class MainBehaviorTests(unittest.TestCase):
             )
         self.assertIn("<html>", report)
 
+    def test_general_source_report_repairs_non_html_provider_output(self) -> None:
+        now = timestamp()
+        with self.main.db() as conn:
+            conn.execute(
+                "INSERT INTO channels(id,name,type,url,collection_mode,status,updated_at) VALUES(?,?,?,?,?,?,?)",
+                ("repair-selected", "repair-selected", "test", "", "requests", "online", now),
+            )
+            conn.execute(
+                """
+                INSERT INTO source_snapshots(id,channel_id,occurred_at,collected_at,source_url,content,scope_type,scope_key)
+                VALUES(?,?,?,?,?,?,'general','')
+                """,
+                ("repair-snapshot", "repair-selected", now, now, "repair://item", "REPAIR_CONTENT"),
+            )
+
+        responses = [
+            "报告正文",
+            "<html><head><title>fixed</title></head><body>报告正文</body></html>",
+        ]
+        with patch.object(self.main, "call_provider", side_effect=responses) as provider:
+            report, _ = self.main.generate_source_report(
+                self.main.SourceJobInput(action="report", channel_ids=["repair-selected"], report_title="repair")
+            )
+        self.assertIn("<title>fixed</title>", report)
+        self.assertEqual(provider.call_args_list[0].kwargs["purpose"], "source_report")
+        self.assertEqual(provider.call_args_list[1].kwargs["purpose"], "source_report_html_repair")
+
+    def test_html_report_repair_still_rejects_invalid_result(self) -> None:
+        with patch.object(self.main, "call_provider", return_value="still not html"):
+            with self.assertRaisesRegex(self.main.HTTPException, "完整 HTML"):
+                self.main.require_or_repair_html_report("not html", purpose="source_report")
+
 
 class ModelGatewayBehaviorTests(unittest.TestCase):
     def test_responses_model_disables_remote_storage(self) -> None:

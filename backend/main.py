@@ -927,17 +927,64 @@ def research_red_lines() -> dict:
     return policy
 
 
+def html_report_shape(report: str) -> dict[str, object]:
+    text = (report or "").strip()
+    return {
+        "chars": len(text),
+        "starts_with_fence": text.startswith("```"),
+        "has_html": bool(re.search(r"<html(?:\s|>)", text, flags=re.IGNORECASE)),
+        "has_head": bool(re.search(r"<head(?:\s|>)", text, flags=re.IGNORECASE)),
+        "has_body": bool(re.search(r"<body(?:\s|>)", text, flags=re.IGNORECASE)),
+        "closes_body": bool(re.search(r"</body\s*>", text, flags=re.IGNORECASE)),
+        "closes_html": bool(re.search(r"</html\s*>", text, flags=re.IGNORECASE)),
+    }
+
+
+def is_complete_html_report(report: str) -> bool:
+    shape = html_report_shape(report)
+    return bool(
+        not shape["starts_with_fence"]
+        and shape["has_html"]
+        and shape["has_head"]
+        and shape["has_body"]
+        and shape["closes_body"]
+        and shape["closes_html"]
+    )
+
+
 def require_html_report(report: str) -> str:
     text = (report or "").strip()
-    if (
-        text.startswith("```")
-        or not re.search(r"<html(?:\s|>)", text, flags=re.IGNORECASE)
-        or not re.search(r"<body(?:\s|>)", text, flags=re.IGNORECASE)
-        or not re.search(r"</body\s*>", text, flags=re.IGNORECASE)
-        or not re.search(r"</html\s*>", text, flags=re.IGNORECASE)
-    ):
+    if not is_complete_html_report(text):
         raise HTTPException(502, "模型返回的报告不是完整 HTML 文档。已按核心红线拒绝保存，请重试生成。")
     return text
+
+
+def html_report_repair_system_prompt() -> str:
+    research_red_lines()
+    return """你是 HTML 报告格式修复器，不是研究分析模型。
+只能将用户提供的已有报告整理为一个完整 HTML 文档，保留原有事实、推断、待核验事项和结论，不得新增、删减或改写事实。
+必须输出且只输出 HTML 文档本身，包含 <html>、<head>、<body>、</body> 和 </html>。
+严禁输出 Markdown、Markdown 代码围栏、解释文字或 HTML 文档之外的内容。"""
+
+
+def require_or_repair_html_report(report: str, *, purpose: str, provider_id: str = "") -> str:
+    try:
+        return require_html_report(report)
+    except HTTPException:
+        log_event(logger, "WARNING", "report.html.invalid", purpose=purpose, **html_report_shape(report))
+    repair_prompt = f"""以下报告内容没有满足完整 HTML 文档约束。请只修复格式并返回完整 HTML 文档。
+不得新增、删减或改写事实，不得输出解释文字或 Markdown 代码围栏。
+
+待修复报告：
+{report}"""
+    repaired = call_provider(
+        repair_prompt,
+        provider_id=provider_id,
+        system_prompt=html_report_repair_system_prompt(),
+        purpose=f"{purpose}_html_repair",
+    )
+    log_event(logger, "INFO", "report.html.repair.completed", purpose=purpose, **html_report_shape(repaired))
+    return require_html_report(repaired)
 
 
 def analysis_system_prompt() -> str:
@@ -2365,7 +2412,10 @@ def generate_source_report(payload: SourceJobInput) -> tuple[str, str]:
 
 通用信源快照：
 {context}"""
-    return require_html_report(call_provider(prompt, system_prompt=source_report_system_prompt(), purpose="source_report")), anchor
+    return require_or_repair_html_report(
+        call_provider(prompt, system_prompt=source_report_system_prompt(), purpose="source_report"),
+        purpose="source_report",
+    ), anchor
 
 
 def report_after_collection(job: dict) -> tuple[str, str]:
@@ -3149,7 +3199,7 @@ def advance_analysis_task(task_id: str) -> dict:
         if decision["decision"] == "final":
             if decision.get("used_model_knowledge") and "model_knowledge" not in completed:
                 raise HTTPException(409, "模型试图提前使用自身知识库，已被红线阻止")
-            report = require_html_report(decision["report"])
+            report = require_or_repair_html_report(decision["report"], purpose="stock_report")
             with db() as conn:
                 conn.execute(
                     "UPDATE tasks SET status='review',report=?,report_anchor=?,agent_state=?,agent_error='' WHERE id=?",
