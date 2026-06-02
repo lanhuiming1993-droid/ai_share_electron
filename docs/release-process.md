@@ -11,6 +11,7 @@ AlphaDesk releases use semantic version tags such as `v0.2.0`.
 5. Run:
 
 ```powershell
+.\.venv\Scripts\python.exe scripts\audit_public_repo.py
 .\.venv\Scripts\python.exe -m unittest discover -s tests -v
 npm.cmd run build
 .\scripts\init.cmd

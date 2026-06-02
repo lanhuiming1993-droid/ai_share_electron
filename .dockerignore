@@ -6,9 +6,17 @@ frontend/dist
 data
 output
 *.har
+*.db
+*.sqlite
+*.sqlite3
+*.key
+*.pem
+*.p12
+*.pfx
 *.pyc
 __pycache__
 .env
+.env.*
 backups
 .compose-smoke-data
 .playwright-cli

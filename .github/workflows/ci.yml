@@ -14,6 +14,13 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  repository-hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Audit public repository contents
+        run: python scripts/audit_public_repo.py
+
   backend:
     runs-on: windows-latest
     steps:
