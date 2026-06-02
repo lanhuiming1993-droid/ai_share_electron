@@ -17,6 +17,7 @@ from bs4 import BeautifulSoup
 
 from backend.http_policy import browser_headers, browser_http_session
 from backend.industry_news_sources import collect_public_industry_news
+from backend.subprocess_utils import hidden_window_creationflags
 from backend.wechat_rss import collect_werss
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -153,7 +154,7 @@ def collect_akshare(channel: dict[str, Any], window: dict[str, str], query: str 
                 capture_output=True,
                 text=True,
                 timeout=component_timeout,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                creationflags=hidden_window_creationflags(),
                 check=True,
             )
             output_lines = [line for line in completed.stdout.splitlines() if line.strip()]
@@ -459,7 +460,7 @@ def collect_playwright(channel: dict[str, Any], window: dict[str, str], profile:
             capture_output=True,
             text=True,
             timeout=180,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=hidden_window_creationflags(),
             check=True,
         )
     except subprocess.CalledProcessError as exc:

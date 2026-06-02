@@ -35,6 +35,9 @@ sh ./scripts/start.sh
 
 启动后访问：[http://127.0.0.1:8080](http://127.0.0.1:8080)。
 
+需要登录知识星球等持久化浏览器信源时，AlphaDesk 会自动打开仅绑定本机的 noVNC 登录工作区：
+[http://127.0.0.1:7900/vnc.html](http://127.0.0.1:7900/vnc.html)。
+
 ## 服务结构
 
 ```text
@@ -43,11 +46,13 @@ sh ./scripts/start.sh
 web：Vue 3 dist + Nginx
   ↓ /api
 api：FastAPI + SQLite + collection worker
+  ↘ http://127.0.0.1:7900/vnc.html
+    noVNC：登录态信源浏览器工作区
   ↓ http://werss:8001
 werss：微信公众号扫码、订阅和 RSS
 ```
 
-默认只有 Nginx Web 端口绑定到宿主机 loopback。FastAPI 和 WeRSS 仅在 Compose 内部网络可见。
+默认只有 Nginx Web 端口和 noVNC 登录工作区绑定到宿主机 loopback。FastAPI 和 WeRSS 仅在 Compose 内部网络可见。
 
 ## 常用运维
 
@@ -125,13 +130,14 @@ npm.cmd run build
 
 ## 第三方组件
 
-微信公众号能力基于 [rachelos/we-mp-rss](https://github.com/rachelos/we-mp-rss)。AlphaDesk 通过固定上游镜像摘要构建薄运行时镜像，仅补齐上游扫码流程所需的 Playwright WebKit 浏览器，不复制其源码。
+微信公众号能力基于 [rachelos/we-mp-rss](https://github.com/rachelos/we-mp-rss)。AlphaDesk 通过固定上游镜像摘要构建薄运行时镜像，使用构建期兼容补丁处理上游扫码页长连接，并在启动时同步部署级管理员凭据；不复制整份上游源码。
 
 完整归属、许可证和升级策略见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
 
 ## 安全边界
 
 - 默认只绑定 `127.0.0.1`，不要直接改为 `0.0.0.0` 暴露到网络。
+- noVNC 登录工作区不应暴露到局域网或公网；它仅用于本机登录需要持久化浏览器 profile 的信源。
 - `api` 容器不会挂载 Docker socket。
 - API Key、token、cookie、密码和 HAR 原文不会写入日志。
 - 如需部署到私有服务器或公网，必须额外增加 HTTPS、登录认证、访问控制、CSRF 防护和备份策略。

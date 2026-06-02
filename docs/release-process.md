@@ -7,7 +7,7 @@ AlphaDesk releases use semantic version tags such as `v0.2.0`.
 1. Update `VERSION`.
 2. Move completed entries from `CHANGELOG.md` into the new version section.
 3. Review `THIRD_PARTY_NOTICES.md`.
-4. If the pinned WeRSS digest changes, verify upstream release notes and run WeRSS QR login, subscription, RSS, persistence, and backup-restore smoke tests.
+4. If the pinned WeRSS digest changes, verify upstream release notes, confirm the compatibility patch still applies, and run WeRSS QR login, subscription, RSS, persistence, and backup-restore smoke tests.
 5. Run:
 
 ```powershell
@@ -16,6 +16,8 @@ npm.cmd run build
 .\scripts\init.cmd
 docker compose --env-file .env config --quiet
 ```
+
+Also verify that `http://127.0.0.1:7900/vnc.html` is reachable locally and remains bound to loopback only.
 
 ## Publish
 

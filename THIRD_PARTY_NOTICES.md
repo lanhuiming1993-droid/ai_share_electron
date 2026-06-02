@@ -6,9 +6,10 @@ AlphaDesk uses third-party open-source software. Keep this file current when add
 
 - Project: [rachelos/we-mp-rss](https://github.com/rachelos/we-mp-rss)
 - Purpose: WeChat Official Account login, subscriptions, article collection, and RSS generation.
-- Integration: AlphaDesk builds a thin `alphadesk-werss` runtime image from the pinned upstream image. The wrapper installs the Playwright WebKit browser required by the upstream QR-login implementation. AlphaDesk does not vendor or copy the upstream application source.
+- Integration: AlphaDesk builds a thin `alphadesk-werss` runtime image from the pinned upstream image. The wrapper applies a narrowly scoped QR-login compatibility patch for the upstream long-lived login page and synchronizes deployment-level administrator credentials at startup. AlphaDesk does not vendor or copy the complete upstream application source.
 - Upstream image: `ghcr.io/rachelos/we-mp-rss@sha256:53912fcb3d523d1e640adcb7066cc18123f00e9510882a7982d0991f3113845f`
 - Wrapper: [`docker/werss.Dockerfile`](docker/werss.Dockerfile)
+- Compatibility patch: [`docker/patch_werss_runtime.py`](docker/patch_werss_runtime.py)
 - License: MIT License
 - License copy: [`LICENSES/we-mp-rss-MIT.txt`](LICENSES/we-mp-rss-MIT.txt)
 - Upgrade policy: update the pinned digest only after reviewing upstream changes and passing QR login, subscription, RSS, persistence, and backup-restore smoke tests.

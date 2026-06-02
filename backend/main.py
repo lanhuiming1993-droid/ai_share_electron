@@ -34,6 +34,7 @@ from backend.logging_config import (
     log_event,
     log_exception,
     recent_logs,
+    redact,
     reset_request_id,
     set_request_id,
 )
@@ -48,6 +49,7 @@ from backend.runtime_health import (
     worker_check,
 )
 from backend.source_registry import CANONICAL_CHANNEL_NAMES, source_catalog, tool_catalog
+from backend.subprocess_utils import hidden_window_creationflags
 from backend.wechat_rss import (
     add_werss_subscription,
     delete_werss_subscription,
@@ -78,6 +80,7 @@ RED_LINES_PATH = ROOT / "config" / "research-red-lines.toml"
 MIN_COLLECTION_INTERVAL = timedelta(minutes=15)
 REPORT_DEDUP_INTERVAL = timedelta(minutes=2)
 MASKED_SECRET = "****************"
+BROWSER_WORKSPACE_PUBLIC_URL = os.environ.get("ALPHADESK_BROWSER_PUBLIC_URL", "").strip()
 MARKET_DATA_DEFAULT_CONFIG = {
     "adapter": "market_data_aggregate",
     "enable_akshare": True,
@@ -2113,9 +2116,10 @@ def import_mx_har(channel_id: str, payload: MxHarImportInput) -> dict:
         result = import_har_text(payload.har_text)
         log_event(logger, "INFO", "channel.mx_har.imported", channel_id=channel_id, validated_snapshot_count=result.get("validated_snapshot_count", 0))
         return result
-    except RuntimeError as exc:
+    except Exception as exc:
         log_exception(logger, "channel.mx_har.failed", exc, channel_id=channel_id)
-        raise HTTPException(409, str(exc)[:600]) from exc
+        detail = str(redact(str(exc)))[:600]
+        raise HTTPException(409, f"MX HAR 验证失败：{detail}") from exc
 
 
 @app.delete("/api/channels/{channel_id}")
@@ -2181,12 +2185,17 @@ def launch_channel_login(channel_id: str) -> dict:
         raise HTTPException(409, "请先填写渠道入口 URL")
     profile = browser_profile(channel_id)
     profile.mkdir(parents=True, exist_ok=True)
-    subprocess.Popen(
-        [sys.executable, str(ROOT / "backend" / "browser_session.py"), "login", "--profile", str(profile), "--url", channel["url"]],
-        cwd=ROOT,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-    )
-    return {"status": "opened", "message": "登录窗口已打开。扫码或登录完成后关闭窗口，再点击检查状态。"}
+    try:
+        subprocess.Popen(
+            [sys.executable, str(ROOT / "backend" / "browser_session.py"), "login", "--profile", str(profile), "--url", channel["url"]],
+            cwd=ROOT,
+            creationflags=hidden_window_creationflags(),
+        )
+    except OSError as exc:
+        log_exception(logger, "channel.login.launch_failed", exc, channel_id=channel_id)
+        raise HTTPException(502, f"登录工作区启动失败：{type(exc).__name__}") from exc
+    message = "登录浏览器已启动。请在登录工作区完成登录并关闭浏览器页签，再点击检查状态。"
+    return {"status": "opened", "message": message, "login_url": BROWSER_WORKSPACE_PUBLIC_URL}
 
 
 @app.post("/api/channels/{channel_id}/check")
@@ -2247,7 +2256,7 @@ def check_channel(channel_id: str) -> dict:
             capture_output=True,
             text=True,
             timeout=45,
-            creationflags=subprocess.CREATE_NO_WINDOW,
+            creationflags=hidden_window_creationflags(),
             check=True,
         )
         detail = json.loads(result.stdout)
@@ -2277,8 +2286,8 @@ def refresh_browser_channel_states() -> None:
         if channel["id"] in ("web-rumors", "akshare", "industry-news", "wechat-mp-rss") or browser_profile(channel["id"]).exists():
             try:
                 check_channel(channel["id"])
-            except HTTPException as exc:
-                log_exception(logger, "channel.startup_check.failed", exc, channel_id=channel["id"], detail=exc.detail)
+            except Exception as exc:
+                log_exception(logger, "channel.startup_check.failed", exc, channel_id=channel["id"], detail=getattr(exc, "detail", str(exc)))
                 checked_at = now()
                 with db() as conn:
                     conn.execute("UPDATE channels SET status='offline',last_check=?,updated_at=? WHERE id=?", (checked_at, checked_at, channel["id"]))

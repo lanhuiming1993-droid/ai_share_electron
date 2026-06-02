@@ -6,6 +6,18 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- Loopback-only noVNC workspace for interactive Playwright channel login.
+- WeRSS startup synchronization for deployment-level administrator credentials.
+
+### Fixed
+
+- Linux container crashes caused by Windows-only subprocess creation flags.
+- WeRSS QR login when the upstream login page keeps long-lived network connections open.
+- WeRSS upstream startup logs exposing deployment environment variables.
+- MX HAR and other API failures returning HTML or plain text that the browser client attempted to parse as JSON.
+
 ## [0.2.0] - 2026-06-02
 
 ### Added

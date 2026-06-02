@@ -6,9 +6,9 @@ AlphaDesk 将 [rachelos/we-mp-rss](https://github.com/rachelos/we-mp-rss) 作为
 
 - WeRSS 负责微信扫码授权、公众号订阅、定时更新和 RSS 生成。
 - AlphaDesk FastAPI 负责代理扫码图片、搜索并加入公众号、同步订阅、展示状态和消费严格时间窗内的 RSS。
-- AlphaDesk 不 vendor、不复制、不导入也不直接执行上游 Python 源码。
+- AlphaDesk 不 vendor、不复制整份上游 Python 源码。
 - 上游镜像固定到已审核的 sha256 摘要，不跟随 `latest` 漂移。
-- AlphaDesk 的 `docker/werss.Dockerfile` 基于固定上游镜像构建薄运行时镜像，仅补齐上游扫码实现所需的 Playwright WebKit 浏览器。
+- AlphaDesk 的 `docker/werss.Dockerfile` 基于固定上游镜像构建薄运行时镜像：构建期补丁绕过登录页长连接导致的二维码截图等待超时，入口脚本在启动时同步部署级管理员凭据。
 
 第三方归属、许可证副本和升级策略见 [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md)。
 

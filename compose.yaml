@@ -29,6 +29,9 @@ services:
       ALPHADESK_WERSS_BASE_URL: http://werss:8001
       ALPHADESK_WERSS_USERNAME: ${WERSS_USERNAME:?Run scripts/init.ps1 or scripts/init.sh first}
       ALPHADESK_WERSS_PASSWORD: ${WERSS_PASSWORD:?Run scripts/init.ps1 or scripts/init.sh first}
+      ALPHADESK_BROWSER_PUBLIC_URL: http://127.0.0.1:${ALPHADESK_BROWSER_PORT:-7900}/vnc.html?autoconnect=true&resize=scale
+    ports:
+      - "127.0.0.1:${ALPHADESK_BROWSER_PORT:-7900}:7900"
     expose:
       - "8765"
     volumes:

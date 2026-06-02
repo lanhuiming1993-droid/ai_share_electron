@@ -366,6 +366,7 @@
             <div class="layer-name">用户浏览器<small>唯一交互入口</small></div>
             <div class="layer-content">
               <span class="node teal">http://127.0.0.1:8080</span>
+              <span class="node teal">http://127.0.0.1:7900/vnc.html</span>
               <span class="node">Vue SPA</span>
               <span class="node">报告下载</span>
               <span class="node">WeRSS 扫码弹窗</span>
@@ -389,6 +390,7 @@
               <span class="node">Fernet local.key</span>
               <span class="node">采集 worker</span>
               <span class="node">模型网关</span>
+              <span class="node">Xvfb + noVNC 登录工作区</span>
               <span class="node">日志</span>
             </div>
           </div>
@@ -407,14 +409,14 @@
             <div class="layer-content">
               <span class="node">./data/alphadesk</span>
               <span class="node">./data/werss</span>
-              <span class="node">./data/browser-profile（可选）</span>
+              <span class="node">./data/alphadesk/browser-profile</span>
               <span class="node">./.env</span>
             </div>
           </div>
         </div>
         <div class="callout" style="margin-top: 14px">
           <strong>关键原则：</strong>
-          浏览器只访问 Nginx。FastAPI 和 WeRSS 默认仅在 Compose 内部网络可见，不直接发布到宿主机或公网。
+          业务页面只访问 Nginx；交互式登录时，用户可访问仅绑定 loopback 的 noVNC 工作区。FastAPI 和 WeRSS 默认仅在 Compose 内部网络可见，不直接发布到宿主机或公网。
           需要排障时，可使用单独的运维 override 将 WeRSS 管理台临时绑定到
           <code>127.0.0.1:8001</code>。
         </div>
@@ -443,23 +445,23 @@
             <tr>
               <td><code>api</code></td>
               <td>项目内 Python 镜像，固定基础镜像版本并安装 <code>requirements.txt</code>。</td>
-              <td>FastAPI、SQLite、模型调用、采集任务、报告、日志、WeRSS API 编排。</td>
+              <td>FastAPI、SQLite、模型调用、采集任务、报告、日志、WeRSS API 编排和交互式登录工作区。</td>
               <td><code>./data/alphadesk:/app/data</code></td>
-              <td>只 <code>expose: 8765</code>，不映射宿主机端口。</td>
+              <td>API 只 <code>expose: 8765</code>；noVNC 工作区仅映射 <code>127.0.0.1:7900</code>。</td>
             </tr>
             <tr>
               <td><code>werss</code></td>
-              <td>基于固定上游 sha256 摘要构建薄运行时镜像，补齐 Playwright WebKit，不跟随 <code>latest</code> 漂移。</td>
+              <td>基于固定上游 sha256 摘要构建薄运行时镜像，应用二维码长连接兼容补丁并同步部署级管理员凭据，不跟随 <code>latest</code> 漂移。</td>
               <td>微信扫码、公众号订阅、定时更新、RSS 和管理 API。</td>
               <td><code>./data/werss:/app/data</code></td>
               <td>只 <code>expose: 8001</code>，由 <code>api</code> 内部访问。</td>
             </tr>
             <tr>
-              <td><code>browser-worker</code>（可选）</td>
-              <td>第二阶段按需增加，不能混入首版核心启动路径。</td>
+              <td><code>api</code> 内置 noVNC 登录工作区</td>
+              <td>已落地：由 API 容器内的 Xvfb、x11vnc 和 websockify 提供，仅绑定宿主机 loopback。</td>
               <td>承载需要交互登录的 Playwright 渠道，例如知识星球。</td>
-              <td><code>./data/browser-profile:/profiles</code></td>
-              <td>仅内部网络；调试入口必须单独鉴权。</td>
+              <td><code>./data/alphadesk:/app/data</code></td>
+              <td>本机访问 <code>127.0.0.1:7900/vnc.html</code>；不得暴露到局域网或公网。</td>
             </tr>
           </tbody>
         </table>
@@ -746,10 +748,10 @@ services:
               <td>最快，但功能需要在文档中明确标记。</td>
             </tr>
             <tr>
-              <td>增加 <code>browser-worker</code> + noVNC</td>
-              <td>单独容器运行浏览器和 profile，通过受保护的 noVNC 页面完成登录。</td>
-              <td>需要完整功能时。</td>
-              <td>可跨平台，但增加镜像体积、鉴权、网络和运维复杂度。</td>
+              <td>API 容器内置 noVNC 登录工作区</td>
+              <td>在 API 容器内运行浏览器和持久化 profile，通过 loopback noVNC 页面完成登录。</td>
+              <td>当前已落地。</td>
+              <td>适合单租户本机 Compose；若未来开放网络访问，需拆分服务并增加鉴权。</td>
             </tr>
             <tr>
               <td>宿主机浏览器桥接</td>
@@ -772,6 +774,7 @@ services:
             </div>
             <ul>
               <li>发布 <code>127.0.0.1:8080</code>，不向局域网暴露。</li>
+              <li>交互式登录工作区发布为 <code>127.0.0.1:7900</code>，同样仅允许本机访问。</li>
               <li>用户在同一台电脑浏览器中使用。</li>
               <li>无需新增账号系统；数据目录由用户自行备份。</li>
               <li>WeRSS 管理台默认不发布。</li>
@@ -869,15 +872,15 @@ services:
             <ul>
               <li>CI 验证镜像构建、Compose config、启动、页面、API 和 WeRSS 内网连通。</li>
               <li>验证删除并重建容器后数据不丢失。</li>
-              <li>验证默认宿主机只暴露 Web 端口。</li>
+              <li>验证默认宿主机只通过 loopback 暴露 Web 和 noVNC 登录工作区端口。</li>
             </ul>
             <span class="pill info">预计：2 - 3 天</span>
           </div>
         </div>
         <div class="callout" style="margin-top: 14px">
           <strong>首版总量：</strong>
-          约 <strong>8 - 13 工程日</strong>。若首版必须保留知识星球等交互式 Playwright 登录，
-          需要另行评估 <code>browser-worker</code> 和 noVNC，预计再增加 <strong>4 - 8 工程日</strong>。
+          约 <strong>8 - 13 工程日</strong>。知识星球等交互式 Playwright 登录已通过 API 容器内置 noVNC
+          工作区落地；若未来改为多人共享后端或公网部署，再拆分独立 browser worker 并增加鉴权。
         </div>
       </section>
 
@@ -897,7 +900,7 @@ services:
             </tr>
             <tr>
               <td>网络暴露</td>
-              <td>默认只有 <code>127.0.0.1:8080</code> 可见；<code>8765</code> 和 <code>8001</code> 不发布到宿主机。</td>
+              <td>默认只有 <code>127.0.0.1:8080</code> 和 <code>127.0.0.1:7900</code> 可见；<code>8765</code> 和 <code>8001</code> 不发布到宿主机。</td>
             </tr>
             <tr>
               <td>同源 API</td>
@@ -936,12 +939,12 @@ services:
       </section>
 
       <section class="section" id="decisions">
-        <h2>待确认项</h2>
+        <h2>已确认项与后续边界</h2>
         <ol>
-          <li><strong>首版部署范围：</strong>是否只支持用户本机运行？建议先限定本机 loopback。</li>
-          <li><strong>发布方式：</strong>交付源码并本地构建，还是发布固定版本的 <code>web</code>、<code>api</code> 镜像？</li>
-          <li><strong>WeRSS 管理台：</strong>是否只通过可选运维 override 暴露到 <code>127.0.0.1:8001</code>？建议是。</li>
-          <li><strong>Playwright 渠道：</strong>知识星球等交互式登录是否属于首版必须功能？如果是，需要增加 browser-worker 设计。</li>
+          <li><strong>首版部署范围：</strong>已限定为用户本机单租户运行，默认仅绑定 loopback。</li>
+          <li><strong>发布方式：</strong>当前支持源码本地构建；后续 Release 发布固定版本的 <code>web</code>、<code>api</code> 和 <code>werss</code> 镜像。</li>
+          <li><strong>WeRSS 管理台：</strong>仅通过可选运维 override 暴露到 <code>127.0.0.1:8001</code>。</li>
+          <li><strong>Playwright 渠道：</strong>知识星球等交互式登录已通过 API 容器内置 noVNC 工作区落地；未来共享后端或公网部署时再拆分独立 browser worker。</li>
           <li><strong>备份：</strong>首版是否提供脚本式备份恢复，还是同时提供定时任务模板？</li>
           <li><strong>平台化预留：</strong>未来是否仍可能建设集中式平台？若可能，当前代码应保留环境变量和服务边界，但不提前引入多租户 schema。</li>
         </ol>

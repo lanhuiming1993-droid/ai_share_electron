@@ -298,6 +298,26 @@ class MainBehaviorTests(unittest.TestCase):
         self.assertEqual(tg_items[0]["content"], "world")
         self.assertGreaterEqual(tg_items[0]["quality_score"], 80)
 
+    def test_mx_har_import_wraps_validation_errors_as_json_http_conflict(self) -> None:
+        with patch("backend.import_mx_har.import_har_text", side_effect=ValueError("upstream failed")):
+            with self.assertRaises(self.main.HTTPException) as raised:
+                self.main.import_mx_har("web-rumors", self.main.MxHarImportInput(har_text="{}"))
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertIn("MX HAR 验证失败", raised.exception.detail)
+
+    def test_playwright_login_returns_browser_workspace_url(self) -> None:
+        with self.main.db() as conn:
+            conn.execute(
+                "UPDATE channels SET url='https://wx.zsxq.com',collection_mode='playwright' WHERE id='zsxq'"
+            )
+        with patch.object(self.main, "BROWSER_WORKSPACE_PUBLIC_URL", "http://127.0.0.1:7900/vnc.html"), patch.object(
+            self.main.subprocess,
+            "Popen",
+        ) as popen:
+            result = self.main.launch_channel_login("zsxq")
+        self.assertEqual(result["login_url"], "http://127.0.0.1:7900/vnc.html")
+        popen.assert_called_once()
+
     def test_werss_normalizer_preserves_specific_public_account(self) -> None:
         snapshot = {
             "channel_id": "wechat-mp-rss",

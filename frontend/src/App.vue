@@ -20,10 +20,10 @@ const snapshotDetail = reactive({ job: null, snapshots: [] });
 const normalizedModal = ref(false);
 const normalizedDetail = reactive({ title: "", items: [] });
 const saving = ref(false);
+const providerModal = ref(false);
 const channelModal = ref(false);
 const editingChannel = ref(null);
 const editingProviderId = ref("");
-const providerFormInitialized = ref(false);
 const channelForm = reactive({ name: "", type: "", url: "", collection_mode: "playwright", status: "pending", notes: "", validation_url: "", success_url_contains: "", success_selector: "", group_ids: [], parsing_strategy: "hybrid", normalization_quality_threshold: 60, max_scrolls: 8, research_enabled: false });
 const marketDataForm = reactive({ enable_akshare: true, enable_baostock: true, enable_tushare: true, tushare_token: "", tushare_token_configured: false, clear_tushare_token: false, component_timeout_seconds: 35 });
 const wechatRssForm = reactive({ base_url: "http://127.0.0.1:8001", feed_ids_text: "all", access_key: "", secret_key: "", credentials_configured: false, admin_username: "admin", admin_password: "", admin_password_configured: false, clear_credentials: false, timeout_seconds: 20, max_items_per_feed: 100 });
@@ -185,7 +185,15 @@ async function request(path, options = {}) {
   const startedAt = performance.now();
   try {
     const response = await fetch(API + path, { headers: { "Content-Type": "application/json", "X-Request-ID": requestId }, ...options });
-    const body = await response.json();
+    const responseText = await response.text();
+    let body = {};
+    try {
+      body = responseText ? JSON.parse(responseText) : {};
+    } catch {
+      const plainText = responseText.replace(/\s+/g, " ").trim();
+      const readableText = plainText && !/<(?:!doctype|html|head|body)\b/i.test(plainText) ? `：${plainText.slice(0, 240)}` : "";
+      body = { detail: `服务返回 HTTP ${response.status}，但响应格式无法识别${readableText}` };
+    }
     const correlatedId = response.headers.get("X-Request-ID") || requestId;
     if (!response.ok) {
       frontendLog("error", "api.request.failed", body.detail || "请求失败", { method, path, status_code: response.status, request_id: correlatedId, latency_ms: Math.round(performance.now() - startedAt) });
@@ -233,10 +241,6 @@ function formatDiagnosticFields(fields) {
 async function refresh() {
   const [dashboard, audit] = await Promise.all([request("/api/dashboard"), request("/api/audit")]);
   Object.assign(data, dashboard, { audit });
-  if (!providerFormInitialized.value && data.provider) {
-    editProvider(data.provider);
-    providerFormInitialized.value = true;
-  }
 }
 
 async function saveProvider() {
@@ -248,7 +252,7 @@ async function saveProvider() {
     const path = editingProviderId.value ? `/api/providers/${editingProviderId.value}` : "/api/providers";
     await request(path, { method: editingProviderId.value ? "PUT" : "POST", body: JSON.stringify(payload) });
     notice.value = "模型通道已加密保存";
-    resetProviderForm();
+    closeProviderModal();
     await refresh();
   } catch (error) { notice.value = error instanceof SyntaxError ? "额外参数必须是合法 JSON" : error.message; }
   saving.value = false;
@@ -265,15 +269,24 @@ async function testProvider(id) {
 }
 
 function resetProviderForm() {
-  providerFormInitialized.value = true;
   editingProviderId.value = "";
   Object.assign(provider, { name: "", base_url: "", model: "", api_key: "", protocol: "openai_chat_completions", enabled: true, extra_body_text: "{}" });
 }
 
 function editProvider(item) {
-  providerFormInitialized.value = true;
   editingProviderId.value = item.id;
   Object.assign(provider, { ...item, extra_body_text: JSON.stringify(item.extra_body || {}, null, 2) });
+}
+
+function openProviderModal(item = null) {
+  if (item) editProvider(item);
+  else resetProviderForm();
+  providerModal.value = true;
+}
+
+function closeProviderModal() {
+  providerModal.value = false;
+  resetProviderForm();
 }
 
 async function activateProvider(id) {
@@ -297,7 +310,7 @@ async function deleteProvider(item) {
   if (!window.confirm(`确认删除模型通道“${item.name}”吗？`)) return;
   try {
     await request(`/api/providers/${item.id}`, { method: "DELETE" });
-    if (editingProviderId.value === item.id) resetProviderForm();
+    if (editingProviderId.value === item.id) closeProviderModal();
     notice.value = "模型通道已删除";
     await refresh();
   } catch (error) { notice.value = error.message; }
@@ -591,7 +604,7 @@ async function saveWechatRssConfiguration() {
   });
 }
 
-async function saveChannel(openLoginAfterSave = false) {
+async function saveChannel(openLoginAfterSave = false, loginWindow = null) {
   if (!channelForm.name.trim() || !channelForm.type.trim()) {
     notice.value = "请填写渠道名称和渠道类型";
     return;
@@ -612,8 +625,17 @@ async function saveChannel(openLoginAfterSave = false) {
     if (openLoginAfterSave) {
       const result = await request(`/api/channels/${saved.id}/login`, { method: "POST" });
       notice.value = result.message;
+      if (result.login_url) {
+        if (loginWindow && !loginWindow.closed) loginWindow.location.href = result.login_url;
+        else window.open(result.login_url, "_blank", "noopener,noreferrer");
+      } else if (loginWindow && !loginWindow.closed) {
+        loginWindow.close();
+      }
     }
-  } catch (error) { notice.value = error.message; }
+  } catch (error) {
+    if (loginWindow && !loginWindow.closed) loginWindow.close();
+    notice.value = error.message;
+  }
 }
 
 async function deleteChannel() {
@@ -627,7 +649,8 @@ async function deleteChannel() {
 }
 
 async function openChannelLogin() {
-  await saveChannel(true);
+  const loginWindow = window.open("", "_blank");
+  await saveChannel(true, loginWindow);
 }
 
 async function checkChannel(channel) {
@@ -969,6 +992,7 @@ function closeTopmostModal(event) {
   else if (normalizedModal.value) closeNormalizedItems();
   else if (snapshotModal.value) closeSnapshots();
   else if (channelModal.value) closeChannelModal();
+  else if (providerModal.value) closeProviderModal();
   else return;
   event.preventDefault();
 }
@@ -1237,59 +1261,33 @@ onUnmounted(() => {
         </template>
 
         <template v-else-if="activePage==='providers'">
-          <section class="grid grid-cols-[1.25fr_.75fr] gap-5">
-            <div class="panel overflow-hidden">
-              <div class="flex items-center justify-between border-b border-white/[.06] p-5">
-                <div>
-                  <h2 class="section-title">模型通道</h2>
-                  <p class="mt-1 text-xs text-slate-500">支持多个 OpenAI-compatible 模型。默认通道用于 Agent 编排与报告分析。</p>
-                </div>
-                <button @click="resetProviderForm" class="primary">添加模型</button>
+          <section class="panel overflow-hidden">
+            <div class="flex items-center justify-between border-b border-white/[.06] p-5">
+              <div>
+                <h2 class="section-title">模型供应商</h2>
+                <p class="mt-1 text-xs text-slate-500">每个供应商独立维护模型、协议和加密 API Key。默认供应商用于 Agent 编排与报告分析。</p>
               </div>
-              <div v-if="!data.providers.length" class="empty m-5">尚未配置模型通道</div>
-              <div v-for="item in data.providers" :key="item.id" class="setting-row px-5 py-4">
-                <span class="min-w-0">
-                  <span class="flex items-center gap-2">
-                    <strong>{{ item.name }}</strong>
-                    <b v-if="item.is_default" class="status-good">默认</b>
-                    <b :class="item.status==='online'?'status-good':item.status==='failed'?'status-warn':'text-slate-600'" class="text-xs">{{ item.status }}</b>
-                    <b v-if="item.latency_ms" class="text-xs text-amber-300">{{ item.latency_ms }} ms</b>
-                  </span>
-                  <small class="truncate">{{ item.base_url }} · {{ item.model }} · {{ item.protocol === 'openai_responses' ? 'Responses API' : 'Chat Completions' }}</small>
-                </span>
-                <div class="flex shrink-0 items-center gap-2">
-                  <button v-if="!item.is_default" @click="activateProvider(item.id)" class="secondary">设为默认</button>
-                  <button @click="testProvider(item.id)" class="secondary">测试</button>
-                  <button @click="editProvider(item)" class="secondary">编辑</button>
-                  <button @click="deleteProvider(item)" class="rounded-xl px-3 py-2 text-xs font-semibold text-rose-300 transition hover:bg-rose-400/10">删除</button>
-                  <button @click="toggleProvider(item)" class="relative h-6 w-11 rounded-full transition" :class="item.enabled?'bg-teal-400':'bg-white/[.1]'">
-                    <span class="absolute top-1 h-4 w-4 rounded-full bg-slate-950 transition" :class="item.enabled?'left-6':'left-1'"></span>
-                  </button>
-                </div>
-              </div>
+              <button @click="openProviderModal()" class="primary">添加供应商</button>
             </div>
-            <div class="panel overflow-hidden">
-              <div class="border-b border-white/[.06] p-5">
-                <h2 class="section-title">{{ editingProviderId ? '编辑模型通道' : '添加模型通道' }}</h2>
-                <p class="mt-1 text-xs text-slate-500">API Key 仅在本地加密保存，读取时始终显示密文占位。</p>
-              </div>
-              <div class="space-y-4 p-5">
-                <label class="block"><span class="form-label">名称</span><input v-model="provider.name" placeholder="例如 DeepSeek" class="field mt-2 w-full" /></label>
-                <label class="block"><span class="form-label">Base URL</span><input v-model="provider.base_url" placeholder="https://api.deepseek.com" class="field mt-2 w-full" /></label>
-                <label class="block"><span class="form-label">API Key（密文占位）</span><input v-model="provider.api_key" type="password" autocomplete="new-password" placeholder="输入新的 API Key" class="field mt-2 w-full" /></label>
-                <label class="block"><span class="form-label">模型名称</span><input v-model="provider.model" placeholder="例如 deepseek-chat" class="field mt-2 w-full" /></label>
-                <label class="block"><span class="form-label">协议</span>
-                  <select v-model="provider.protocol" class="field mt-2 w-full">
-                    <option value="openai_chat_completions">OpenAI Chat Completions</option>
-                    <option value="openai_responses">OpenAI Responses API</option>
-                  </select>
-                </label>
-                <label class="block"><span class="form-label">额外参数 JSON</span><textarea v-model="provider.extra_body_text" rows="4" class="field mt-2 w-full"></textarea></label>
-                <label class="flex items-center gap-2 text-xs text-slate-400"><input v-model="provider.enabled" type="checkbox" /> 启用该模型通道</label>
-              </div>
-              <div class="flex gap-3 border-t border-white/[.06] p-5">
-                <button @click="saveProvider" :disabled="saving" class="primary">加密保存</button>
-                <button @click="resetProviderForm" class="secondary">清空</button>
+            <div v-if="!data.providers.length" class="empty m-5">尚未配置模型供应商</div>
+            <div v-for="item in data.providers" :key="item.id" class="setting-row px-5 py-4">
+              <span class="min-w-0">
+                <span class="flex items-center gap-2">
+                  <strong>{{ item.name }}</strong>
+                  <b v-if="item.is_default" class="status-good">默认</b>
+                  <b :class="item.status==='online'?'status-good':item.status==='failed'?'status-warn':'text-slate-600'" class="text-xs">{{ item.status }}</b>
+                  <b v-if="item.latency_ms" class="text-xs text-amber-300">{{ item.latency_ms }} ms</b>
+                </span>
+                <small class="truncate">{{ item.base_url }} · {{ item.model }} · {{ item.protocol === 'openai_responses' ? 'Responses API' : 'Chat Completions' }}</small>
+              </span>
+              <div class="flex shrink-0 items-center gap-2">
+                <button v-if="!item.is_default" @click="activateProvider(item.id)" class="secondary">设为默认</button>
+                <button @click="testProvider(item.id)" class="secondary">测试</button>
+                <button @click="openProviderModal(item)" class="secondary">配置</button>
+                <button @click="deleteProvider(item)" class="rounded-xl px-3 py-2 text-xs font-semibold text-rose-300 transition hover:bg-rose-400/10">删除</button>
+                <button @click="toggleProvider(item)" class="relative h-6 w-11 rounded-full transition" :class="item.enabled?'bg-teal-400':'bg-white/[.1]'">
+                  <span class="absolute top-1 h-4 w-4 rounded-full bg-slate-950 transition" :class="item.enabled?'left-6':'left-1'"></span>
+                </button>
               </div>
             </div>
           </section>
@@ -1658,6 +1656,39 @@ onUnmounted(() => {
             <button type="button" @click="closeWechatRssLogin" class="secondary">{{ wechatRssLogin.authorized ? '完成' : '取消' }}</button>
           </div>
         </div>
+      </section>
+    </div>
+
+    <div v-if="providerModal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-6 backdrop-blur-sm" @click.self="closeProviderModal">
+      <section class="flex max-h-[94vh] w-full max-w-xl flex-col overflow-hidden rounded-3xl border border-white/[.12] bg-[#101a2a] shadow-2xl shadow-black/40">
+        <header class="flex items-center justify-between border-b border-white/[.08] px-6 py-5">
+          <div>
+            <h2 class="text-lg font-semibold text-white">{{ editingProviderId ? '配置模型供应商' : '添加模型供应商' }}</h2>
+            <p class="mt-1 text-xs text-slate-500">独立维护当前供应商的模型服务地址、协议和加密凭据</p>
+          </div>
+          <button @click="closeProviderModal" class="flex h-8 w-8 items-center justify-center rounded-full text-lg text-slate-500 transition hover:bg-white/[.06] hover:text-white">×</button>
+        </header>
+
+        <div class="space-y-4 overflow-y-auto p-6">
+          <label class="block"><span class="form-label">供应商名称</span><input v-model="provider.name" placeholder="例如 DeepSeek" class="field mt-2 w-full" /></label>
+          <label class="block"><span class="form-label">Base URL</span><input v-model="provider.base_url" placeholder="https://api.deepseek.com" class="field mt-2 w-full" /></label>
+          <label class="block"><span class="form-label">API Key（密文占位）</span><input v-model="provider.api_key" type="password" autocomplete="new-password" placeholder="输入新的 API Key" class="field mt-2 w-full" /></label>
+          <label class="block"><span class="form-label">模型名称</span><input v-model="provider.model" placeholder="例如 deepseek-chat" class="field mt-2 w-full" /></label>
+          <label class="block"><span class="form-label">协议</span>
+            <select v-model="provider.protocol" class="field mt-2 w-full">
+              <option value="openai_chat_completions">OpenAI Chat Completions</option>
+              <option value="openai_responses">OpenAI Responses API</option>
+            </select>
+          </label>
+          <label class="block"><span class="form-label">额外参数 JSON</span><textarea v-model="provider.extra_body_text" rows="4" class="field mt-2 w-full"></textarea></label>
+          <label class="flex items-center gap-2 text-xs text-slate-400"><input v-model="provider.enabled" type="checkbox" /> 启用该模型通道</label>
+          <p class="text-xs leading-5 text-slate-600">API Key 仅在本机加密保存，页面读取时始终显示密文占位。</p>
+        </div>
+
+        <footer class="flex justify-end gap-3 border-t border-white/[.08] px-6 py-4">
+          <button @click="closeProviderModal" class="secondary">取消</button>
+          <button @click="saveProvider" :disabled="saving" class="primary disabled:cursor-wait disabled:opacity-60">{{ saving ? '保存中...' : '加密保存' }}</button>
+        </footer>
       </section>
     </div>
 
