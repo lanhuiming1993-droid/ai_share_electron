@@ -298,6 +298,28 @@ class MainBehaviorTests(unittest.TestCase):
         self.assertEqual(tg_items[0]["content"], "world")
         self.assertGreaterEqual(tg_items[0]["quality_score"], 80)
 
+    def test_werss_normalizer_preserves_specific_public_account(self) -> None:
+        snapshot = {
+            "channel_id": "wechat-mp-rss",
+            "occurred_at": timestamp(),
+            "collected_at": timestamp(),
+            "source_url": "https://mp.weixin.qq.com/s/article",
+            "content": json.dumps(
+                {
+                    "platform": "werss_external_rss",
+                    "adapter": "external_sidecar",
+                    "feed_id": "MP_WXS_3865156629",
+                    "source_account": {"id": "MP_WXS_3865156629", "name": "调研纪要"},
+                    "article": {"id": "article", "title": "行业更新", "content": "正文"},
+                },
+                ensure_ascii=False,
+            ),
+        }
+        items, _ = self.main.fixed_normalized_items(snapshot)
+        self.assertEqual(items[0]["author"], "调研纪要")
+        self.assertEqual(items[0]["metadata"]["source_account"]["id"], "MP_WXS_3865156629")
+        self.assertEqual(self.main.normalized_source_label(items[0]), "微信公众号：调研纪要")
+
     def test_provider_calls_pydantic_gateway_with_encrypted_runtime_config(self) -> None:
         provider = {
             "id": "provider-test",

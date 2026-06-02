@@ -26,6 +26,7 @@ RSS_XML = """<?xml version="1.0" encoding="UTF-8"?>
   <channel>
     <title>WeRSS</title>
     <item>
+      <id>3865156629-article-1</id>
       <guid>article-1</guid>
       <title>产业链更新</title>
       <author>研究团队</author>
@@ -192,6 +193,21 @@ class WechatRssTests(unittest.TestCase):
         self.assertEqual(payload["platform"], "werss_external_rss")
         self.assertEqual(payload["article"]["title"], "产业链更新")
         self.assertEqual(session.calls[0]["headers"]["Authorization"], "AK-SK local-ak:local-sk")
+
+    def test_collect_werss_expands_all_feed_and_preserves_account_attribution(self) -> None:
+        session = FakeSession(RSS_XML)
+        with patch("backend.wechat_rss.browser_http_session", return_value=session), patch(
+            "backend.wechat_rss.fetch_werss_subscriptions",
+            return_value=[{"id": "MP_WXS_3865156629", "name": "调研纪要", "enabled": True}],
+        ):
+            snapshots = collect_werss(
+                {"id": "wechat-mp-rss", "request_config": {"feed_ids": ["all"]}},
+                {"window_start": "2026-05-01T00:00:00+08:00", "window_end": "2026-06-01T00:00:00+08:00"},
+            )
+        payload = json.loads(snapshots[0]["content"])
+        self.assertIn("/feed/MP_WXS_3865156629.rss", session.calls[0]["url"])
+        self.assertEqual(payload["source_account"], {"id": "MP_WXS_3865156629", "name": "调研纪要"})
+        self.assertEqual(payload["article"]["source_account_name"], "调研纪要")
 
     def test_collect_werss_pages_until_strict_window_boundary(self) -> None:
         recent = [(f"article-{index}", "Sun, 31 May 2026 11:30:00 +0800", "full text") for index in range(10)]

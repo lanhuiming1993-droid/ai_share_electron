@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -315,6 +316,35 @@ def feed_url(config: dict[str, Any], feed_id: str, query: str = "") -> str:
     return f"{config['base_url']}/feed/{encoded_feed_id}.rss"
 
 
+def collection_feed_accounts(config: dict[str, Any], session=None) -> list[dict[str, str]]:
+    subscriptions: list[dict[str, Any]] = []
+    try:
+        subscriptions = fetch_werss_subscriptions(config, session=session)
+    except Exception:
+        pass
+    enabled = [subscription for subscription in subscriptions if subscription.get("enabled", True)]
+    by_id = {str(subscription.get("id") or ""): subscription for subscription in enabled}
+    feeds: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for requested_feed_id in config["feed_ids"]:
+        requested_feed_id = str(requested_feed_id or "").strip()
+        candidates = enabled if requested_feed_id == "all" and enabled else [by_id.get(requested_feed_id, {"id": requested_feed_id})]
+        for candidate in candidates:
+            feed_id = str(candidate.get("id") or "").strip()
+            if not feed_id or feed_id in seen:
+                continue
+            seen.add(feed_id)
+            feeds.append({"id": feed_id, "name": str(candidate.get("name") or "").strip()})
+    return feeds or [{"id": "all", "name": ""}]
+
+
+def inferred_account_id(feed_id: str, article: dict[str, str]) -> str:
+    if feed_id and feed_id != "all":
+        return feed_id
+    match = re.match(r"^(\d+)-", str(article.get("feed_item_id") or ""))
+    return f"MP_WXS_{match.group(1)}" if match else ""
+
+
 def parsed_timestamp(value: str) -> datetime | None:
     text = (value or "").strip()
     if not text:
@@ -345,10 +375,13 @@ def parse_werss_feed(xml_text: str) -> list[dict[str, str]]:
     root = ElementTree.fromstring(xml_text)
     items: list[dict[str, str]] = []
     if root.tag.rsplit("}", 1)[-1].lower() == "rss":
+        feed_title = child_text(root, "./channel/title")
         for entry in root.findall("./channel/item"):
             items.append(
                 {
                     "id": child_text(entry, "guid"),
+                    "feed_item_id": child_text(entry, "id"),
+                    "feed_title": feed_title,
                     "title": child_text(entry, "title"),
                     "author": child_text(entry, "author", "{http://purl.org/dc/elements/1.1/}creator"),
                     "published_at": child_text(entry, "pubDate", "{http://purl.org/dc/elements/1.1/}date"),
@@ -359,6 +392,7 @@ def parse_werss_feed(xml_text: str) -> list[dict[str, str]]:
             )
         return items
     if root.tag == f"{{{ATOM_NAMESPACE}}}feed":
+        feed_title = child_text(root, f"{{{ATOM_NAMESPACE}}}title")
         for entry in root.findall(f"{{{ATOM_NAMESPACE}}}entry"):
             link = ""
             for link_element in entry.findall(f"{{{ATOM_NAMESPACE}}}link"):
@@ -368,6 +402,8 @@ def parse_werss_feed(xml_text: str) -> list[dict[str, str]]:
             items.append(
                 {
                     "id": child_text(entry, f"{{{ATOM_NAMESPACE}}}id"),
+                    "feed_item_id": child_text(entry, f"{{{ATOM_NAMESPACE}}}id"),
+                    "feed_title": feed_title,
                     "title": child_text(entry, f"{{{ATOM_NAMESPACE}}}title"),
                     "author": child_text(entry, f"{{{ATOM_NAMESPACE}}}author/{{{ATOM_NAMESPACE}}}name"),
                     "published_at": child_text(entry, f"{{{ATOM_NAMESPACE}}}published", f"{{{ATOM_NAMESPACE}}}updated"),
@@ -409,7 +445,10 @@ def collect_werss(channel: dict[str, Any], window: dict[str, str], query: str = 
     seen: set[tuple[str, str, str]] = set()
     snapshots: list[dict[str, str]] = []
     session = browser_http_session()
-    for feed_id in config["feed_ids"]:
+    account_feeds = collection_feed_accounts(config, session=session)
+    account_names = {feed["id"]: feed["name"] for feed in account_feeds}
+    for account_feed in account_feeds:
+        feed_id = account_feed["id"]
         offset = 0
         remaining = config["max_items_per_feed"]
         while remaining > 0:
@@ -439,13 +478,23 @@ def collect_werss(channel: dict[str, Any], window: dict[str, str], query: str = 
                 if stable_key in seen:
                     continue
                 seen.add(stable_key)
+                account_id = inferred_account_id(feed_id, article)
+                account_name = account_names.get(account_id, "") or str(article.get("feed_title") or "").strip()
+                if account_name.lower() == "werss":
+                    account_name = ""
+                source_account = {"id": account_id, "name": account_name}
                 payload = {
                     "platform": "werss_external_rss",
                     "adapter": "external_sidecar",
                     "feed_id": feed_id,
+                    "source_account": source_account,
                     "query": query,
                     "collection_window": window,
-                    "article": article,
+                    "article": {
+                        **article,
+                        "source_account_id": account_id,
+                        "source_account_name": account_name,
+                    },
                 }
                 snapshots.append(
                     {

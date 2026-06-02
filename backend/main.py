@@ -1009,7 +1009,8 @@ def source_report_system_prompt() -> str:
 3. 禁止发起新的采集，禁止使用模型自身知识库补写事实，禁止虚构数据。
 4. 严格区分事实、推断和待核验事项。
 5. 只输出完整 HTML 文档，必须包含 <html>、<head> 和 <body>；严禁 Markdown、Markdown 代码围栏和 HTML 文档之外的解释文字。
-6. 报告重点是产业趋势、政策、供需、技术迭代、产能、订单、价格、上下游和公司公告。严禁输出技术面分析、交易策略或买卖点。"""
+6. 报告重点是产业趋势、政策、供需、技术迭代、产能、订单、价格、上下游和公司公告。严禁输出技术面分析、交易策略或买卖点。
+7. 每项事实和事件都要尽量标注具体信源。对于微信公众号文章，当输入提供 source_account 或 author 时，必须标注具体公众号名称，不得退化为笼统的“微信公众号”。"""
 
 
 def normalization_system_prompt() -> str:
@@ -1244,6 +1245,9 @@ def fixed_normalized_items(snapshot: sqlite3.Row, mode: str = "fixed") -> tuple[
         ], ""
     if isinstance(payload, dict) and payload.get("platform") == "werss_external_rss":
         article = payload.get("article") if isinstance(payload.get("article"), dict) else {}
+        source_account = payload.get("source_account") if isinstance(payload.get("source_account"), dict) else {}
+        account_id = str(source_account.get("id") or article.get("source_account_id") or "").strip()
+        account_name = str(source_account.get("name") or article.get("source_account_name") or "").strip()
         title = str(article.get("title") or "").strip()
         item_content = str(article.get("content") or article.get("description") or title).strip()
         item_source_url = str(article.get("link") or source_url).strip()
@@ -1253,7 +1257,7 @@ def fixed_normalized_items(snapshot: sqlite3.Row, mode: str = "fixed") -> tuple[
             {
                 "item_key": stable_item_key(snapshot["channel_id"], item_source_url, occurred_at, title, item_content),
                 "occurred_at": occurred_at,
-                "author": str(article.get("author") or "")[:255],
+                "author": str(account_name or article.get("author") or "")[:255],
                 "title": title[:500],
                 "content": item_content,
                 "source_url": item_source_url,
@@ -1262,6 +1266,7 @@ def fixed_normalized_items(snapshot: sqlite3.Row, mode: str = "fixed") -> tuple[
                     "platform": payload["platform"],
                     "adapter": payload.get("adapter", ""),
                     "feed_id": payload.get("feed_id", ""),
+                    "source_account": {"id": account_id, "name": account_name},
                     "article_id": article.get("id", ""),
                     "query": payload.get("query", ""),
                     "collection_window": payload.get("collection_window", {}),
@@ -2274,6 +2279,21 @@ def latest_reserved_at(conn: sqlite3.Connection, channel_id: str, scope_key: str
     return max((datetime.fromisoformat(value) for value in values), default=None)
 
 
+def normalized_source_label(item: dict[str, Any]) -> str:
+    metadata = item.get("metadata")
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except json.JSONDecodeError:
+            metadata = {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    source_account = metadata.get("source_account") if isinstance(metadata.get("source_account"), dict) else {}
+    account_name = str(source_account.get("name") or "").strip()
+    if account_name:
+        return f"微信公众号：{account_name}"
+    return str(item.get("author") or item.get("channel_id") or "").strip()
+
+
 def local_snapshot_context(
     channel_ids: list[str],
     lookback_days: int,
@@ -2310,7 +2330,7 @@ def local_snapshot_context(
             dict(row)
             for row in conn.execute(
                 f"""
-                SELECT n.channel_id,n.occurred_at,n.author,n.title,n.content,n.source_url,n.quality_score,n.normalization_mode
+                SELECT n.channel_id,n.occurred_at,n.author,n.title,n.content,n.source_url,n.metadata,n.quality_score,n.normalization_mode
                 FROM normalized_source_items n
                 JOIN source_snapshots s ON s.id=n.snapshot_id
                 WHERE n.channel_id IN ({placeholders}) AND n.occurred_at BETWEEN ? AND ?{normalized_general_filter}
@@ -2348,7 +2368,7 @@ def local_snapshot_context(
     normalized_chunks = [
         (
             f"[normalized:{item['channel_id']}] {item['occurred_at']} quality={item['quality_score']} "
-            f"mode={item['normalization_mode']} author={item['author']} title={item['title']} {item['source_url']}\n"
+            f"mode={item['normalization_mode']} source={normalized_source_label(item)} title={item['title']} {item['source_url']}\n"
             f"{item['content'][:8_000]}"
         )
         for item in normalized_items
@@ -2403,6 +2423,7 @@ def generate_source_report(payload: SourceJobInput) -> tuple[str, str]:
     prompt = f"""请基于以下通用信源快照生成独立的信源聚合报告，不要发起新的数据采集，不要补写不存在的事实。
 不得读取或继承个股研究任务中的股票代码、研究目标、Skill 和临时补采证据。
 报告应围绕快照中明确出现的产业趋势、事件脉络、主题分组、来源和待核验事项展开。
+每项事实和事件尽量标注具体信源名称。微信公众号文章必须优先使用输入中的 source_account 或 source 字段标注具体公众号，不得只写“微信公众号”。
 仅输出完整 HTML 文档，必须包含 <html>、<head> 和 <body>。可以使用内联 CSS 优化排版。
 严禁输出 Markdown，严禁使用 Markdown 代码围栏，严禁输出 HTML 文档以外的解释文字。
 报告名称：{payload.report_title}
