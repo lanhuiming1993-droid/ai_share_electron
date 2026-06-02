@@ -4,9 +4,14 @@ dist/
 frontend/dist/
 data/*.db
 data/*.key
+data/alphadesk/
 data/browser-profile/
 data/logs/
 data/werss/
+backups/
+.env
 __pycache__/
 *.pyc
 *.har
+.compose-smoke-data/
+.playwright-cli/

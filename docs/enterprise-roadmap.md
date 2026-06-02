@@ -14,7 +14,7 @@ Inspired by Alembic's ordered migration model, `backend/db_migrations.py` record
 
 Following common liveness and readiness conventions, the API exposes:
 
-- `GET /health/live`: process-level liveness for Electron startup.
+- `GET /health/live`: process-level liveness for Docker and reverse-proxy probes.
 - `GET /health/ready`: SQLite schema, red-line policy, skills directory, collection worker and telemetry readiness.
 
 ### Optional OpenTelemetry export
@@ -23,13 +23,13 @@ JSONL logs remain the default local diagnostic path. Install `requirements-obser
 
 ### Repository governance
 
-GitHub Actions validates backend tests, Python compilation and the Vue production build. Dependabot checks Python, npm and GitHub Actions dependencies weekly.
+GitHub Actions validates backend tests, Python compilation, the Vue production build, Docker images, Compose configuration and a container smoke test. Dependabot checks Python, npm, Docker and GitHub Actions dependencies weekly.
 
 ## Evaluated for later
 
 ### Langfuse
 
-Langfuse is useful for model traces, prompt management and evaluation. Its self-hosted deployment is intentionally not bundled into the desktop application because it introduces a separate service stack. Add it as an optional remote observability integration when multi-user deployment begins.
+Langfuse is useful for model traces, prompt management and evaluation. Its self-hosted deployment is intentionally not bundled into the default Compose package because it introduces a separate service stack. Add it as an optional remote observability integration when needed.
 
 ### Dedicated migration framework
 
@@ -37,7 +37,7 @@ If the SQLite schema grows beyond the current local-workstation scope, move the 
 
 ### Durable job queue
 
-The in-process collection worker is sufficient for one local desktop instance. A server edition should move jobs to a durable queue with explicit leases, retry policy and dead-letter handling.
+The in-process collection worker is sufficient for one single-tenant Compose instance. A server edition should move jobs to a durable queue with explicit leases, retry policy and dead-letter handling.
 
 ## Primary references
 

@@ -1,0 +1,979 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AlphaDesk Docker Compose 单租户交付方案</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #07111f;
+        --panel: rgba(15, 29, 47, 0.9);
+        --line: rgba(148, 163, 184, 0.2);
+        --text: #dce8f7;
+        --muted: #9aafc5;
+        --soft: #667b92;
+        --teal: #5eead4;
+        --blue: #93c5fd;
+        --violet: #c4b5fd;
+        --amber: #fcd34d;
+        --green: #86efac;
+        --rose: #fda4af;
+        --code: #0b1727;
+      }
+      * { box-sizing: border-box; }
+      html { scroll-behavior: smooth; }
+      body {
+        margin: 0;
+        color: var(--text);
+        background:
+          radial-gradient(circle at 9% 2%, rgba(13, 148, 136, 0.17), transparent 28rem),
+          radial-gradient(circle at 92% 6%, rgba(59, 130, 246, 0.15), transparent 30rem),
+          var(--bg);
+        font-family: Inter, "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+        line-height: 1.72;
+      }
+      a { color: var(--blue); text-decoration: none; }
+      a:hover { text-decoration: underline; }
+      code {
+        border: 1px solid rgba(148, 163, 184, 0.16);
+        border-radius: 0.35rem;
+        background: var(--code);
+        padding: 0.08rem 0.36rem;
+        color: #d8e7fb;
+        font-family: "Cascadia Code", Consolas, monospace;
+        font-size: 0.88em;
+      }
+      pre {
+        max-width: 100%;
+        overflow-x: auto;
+        border: 1px solid rgba(148, 163, 184, 0.18);
+        border-radius: 14px;
+        background: #06101d;
+        padding: 16px;
+        color: #d4e6fb;
+        font-family: "Cascadia Code", Consolas, monospace;
+        font-size: 12px;
+        line-height: 1.6;
+      }
+      .page { width: min(1320px, calc(100% - 40px)); margin: 0 auto; padding: 42px 0 72px; }
+      .hero, .section, .card {
+        border: 1px solid var(--line);
+        background: var(--panel);
+        box-shadow: 0 20px 65px rgba(0, 0, 0, 0.2);
+        backdrop-filter: blur(18px);
+      }
+      .hero {
+        overflow: hidden;
+        border-radius: 28px;
+        padding: 42px;
+        background:
+          linear-gradient(135deg, rgba(45, 212, 191, 0.13), transparent 48%),
+          linear-gradient(315deg, rgba(124, 58, 237, 0.12), transparent 45%),
+          var(--panel);
+      }
+      .eyebrow {
+        margin: 0 0 8px;
+        color: var(--teal);
+        font-size: 12px;
+        font-weight: 750;
+        letter-spacing: 0.18em;
+        text-transform: uppercase;
+      }
+      h1, h2, h3, h4, p { margin-top: 0; }
+      h1 {
+        max-width: 1080px;
+        margin-bottom: 13px;
+        color: #f8fbff;
+        font-size: clamp(34px, 6vw, 58px);
+        line-height: 1.08;
+        letter-spacing: -0.04em;
+      }
+      h2 { margin-bottom: 16px; color: #f5f9ff; font-size: 25px; letter-spacing: -0.02em; }
+      h3 { margin-bottom: 8px; color: #eef6ff; font-size: 17px; }
+      h4 { margin-bottom: 6px; color: #dcecff; font-size: 14px; }
+      .subtitle { max-width: 1040px; margin-bottom: 25px; color: #bdd0e5; font-size: 17px; }
+      .meta, .toc, .flow, .tags { display: flex; flex-wrap: wrap; gap: 9px; align-items: center; }
+      .tag, .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 5px;
+        border: 1px solid rgba(148, 163, 184, 0.22);
+        border-radius: 999px;
+        background: rgba(15, 23, 42, 0.42);
+        padding: 5px 10px;
+        color: #bdd0e5;
+        font-size: 12px;
+      }
+      .pill.good { border-color: rgba(134, 239, 172, 0.25); color: var(--green); }
+      .pill.warn { border-color: rgba(252, 211, 77, 0.25); color: var(--amber); }
+      .pill.info { border-color: rgba(147, 197, 253, 0.28); color: var(--blue); }
+      .pill.risk { border-color: rgba(253, 164, 175, 0.26); color: var(--rose); }
+      .section { margin-top: 22px; border-radius: 22px; padding: 26px; }
+      .section-lead { max-width: 1060px; color: var(--muted); }
+      .toc { margin-top: 18px; }
+      .toc a {
+        border: 1px solid rgba(148, 163, 184, 0.18);
+        border-radius: 10px;
+        background: rgba(15, 23, 42, 0.38);
+        padding: 7px 10px;
+        color: #b9cde2;
+        font-size: 12px;
+      }
+      .toc a:hover {
+        border-color: rgba(94, 234, 212, 0.35);
+        color: var(--teal);
+        text-decoration: none;
+      }
+      .grid { display: grid; gap: 14px; }
+      .cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+      .cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .card { border-radius: 16px; padding: 17px; box-shadow: none; }
+      .card p:last-child, .card ul:last-child, .card ol:last-child { margin-bottom: 0; }
+      .metric { color: #f3f8ff; font-size: 29px; font-weight: 750; line-height: 1.1; }
+      .metric-label { margin-top: 7px; color: var(--muted); font-size: 12px; }
+      .callout {
+        border-left: 3px solid var(--teal);
+        border-radius: 8px;
+        background: rgba(13, 148, 136, 0.09);
+        padding: 13px 15px;
+        color: #c6e8e2;
+      }
+      .callout.warn { border-left-color: var(--amber); background: rgba(217, 119, 6, 0.09); color: #f4ddb1; }
+      .callout.rose { border-left-color: var(--rose); background: rgba(225, 29, 72, 0.08); color: #f6c5cc; }
+      table {
+        display: block;
+        width: 100%;
+        max-width: 100%;
+        overflow-x: auto;
+        border-collapse: collapse;
+        margin-top: 14px;
+        font-size: 13px;
+      }
+      th, td {
+        border-bottom: 1px solid rgba(148, 163, 184, 0.15);
+        padding: 11px 10px;
+        text-align: left;
+        vertical-align: top;
+      }
+      th { color: #b9cee3; font-size: 12px; font-weight: 750; }
+      td { color: #afc0d3; }
+      tr:last-child td { border-bottom: 0; }
+      ul, ol { margin: 8px 0 0; padding-left: 20px; color: #afc0d3; }
+      li + li { margin-top: 5px; }
+      .architecture { display: grid; gap: 10px; margin-top: 17px; }
+      .layer { display: grid; grid-template-columns: 190px 1fr; gap: 12px; }
+      .layer-name, .layer-content {
+        border: 1px solid rgba(148, 163, 184, 0.18);
+        border-radius: 14px;
+        background: rgba(3, 12, 23, 0.3);
+        padding: 14px;
+      }
+      .layer-name {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        color: #f1f7ff;
+        font-size: 14px;
+        font-weight: 750;
+      }
+      .layer-name small { margin-top: 2px; color: var(--soft); font-size: 11px; font-weight: 500; }
+      .layer-content { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+      .node, .step {
+        border: 1px solid rgba(96, 165, 250, 0.24);
+        border-radius: 10px;
+        background: rgba(30, 64, 175, 0.11);
+        padding: 7px 10px;
+        color: #cfe2fb;
+        font-size: 12px;
+      }
+      .node.teal, .step.focus {
+        border-color: rgba(45, 212, 191, 0.26);
+        background: rgba(13, 148, 136, 0.1);
+        color: #bdf8ed;
+      }
+      .node.violet {
+        border-color: rgba(167, 139, 250, 0.25);
+        background: rgba(124, 58, 237, 0.1);
+        color: #ddd6fe;
+      }
+      .node.amber {
+        border-color: rgba(252, 211, 77, 0.23);
+        background: rgba(217, 119, 6, 0.1);
+        color: #fde68a;
+      }
+      .arrow { color: #67809a; font-size: 13px; }
+      .flow { margin: 13px 0 4px; }
+      .phase {
+        display: grid;
+        grid-template-columns: 108px 1fr;
+        gap: 14px;
+        border-top: 1px solid rgba(148, 163, 184, 0.15);
+        padding: 16px 0;
+      }
+      .phase:first-child { border-top: 0; padding-top: 0; }
+      .phase-id { color: var(--teal); font-size: 13px; font-weight: 750; }
+      .phase-id span { display: block; margin-top: 3px; color: var(--soft); font-size: 11px; font-weight: 500; }
+      .small { color: var(--soft); font-size: 12px; }
+      .accent-teal { color: var(--teal); }
+      .accent-blue { color: var(--blue); }
+      .accent-violet { color: var(--violet); }
+      .accent-amber { color: var(--amber); }
+      footer { padding: 25px 5px 0; color: var(--soft); font-size: 12px; text-align: center; }
+      @media (max-width: 900px) {
+        .cols-2, .cols-3, .cols-4 { grid-template-columns: 1fr; }
+        .layer, .phase { grid-template-columns: 1fr; }
+        .hero { padding: 28px 22px; }
+        .section { padding: 20px; }
+      }
+      @media print {
+        :root { color-scheme: light; }
+        body { color: #1f2937; background: #fff; }
+        .page { width: 100%; padding: 0; }
+        .hero, .section, .card, .layer-name, .layer-content { color: #1f2937; background: #fff; box-shadow: none; }
+        .section { break-inside: avoid; }
+        a { color: #1d4ed8; }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <header class="hero">
+        <p class="eyebrow">AlphaDesk / Self-Hosted Delivery Proposal</p>
+        <h1>Docker Compose 单租户交付方案</h1>
+        <p class="subtitle">
+          将 AlphaDesk 视为一个完整产品包交付给用户。每位用户运行自己的一套 Compose 实例：
+          Vue 3 构建产物由 Nginx 提供，FastAPI 作为内部后端服务，WeRSS 作为固定镜像的内部信源组件。
+          该方案替代“共享后端多租户平台”路线，优先保留本地数据主权、简单运维和清晰的安全边界。
+        </p>
+        <div class="meta">
+          <span class="tag">方案日期：2026-06-02</span>
+          <span class="tag">交付单位：一位用户 / 一套实例</span>
+          <span class="tag">运行方式：Docker Compose</span>
+          <span class="tag">默认网络：仅绑定本机 loopback</span>
+        </div>
+      </header>
+
+      <section class="section">
+        <h2>阅读导航</h2>
+        <nav class="toc">
+          <a href="#decision">方案结论</a>
+          <a href="#boundary">边界变化</a>
+          <a href="#target">目标架构</a>
+          <a href="#services">服务职责</a>
+          <a href="#routing">同源路由</a>
+          <a href="#compose">Compose 骨架</a>
+          <a href="#storage">持久化与备份</a>
+          <a href="#changes">代码改造</a>
+          <a href="#browser">Playwright 兼容性</a>
+          <a href="#profiles">部署模式</a>
+          <a href="#delivery">交付物</a>
+          <a href="#phases">实施阶段</a>
+          <a href="#tests">验收矩阵</a>
+          <a href="#decisions">待确认项</a>
+          <a href="#references">参考资料</a>
+        </nav>
+      </section>
+
+      <section class="section" id="decision">
+        <h2>方案结论</h2>
+        <div class="callout">
+          <strong>推荐采用：</strong>
+          AlphaDesk 不建设一个集中式共享后端，而是向每位用户交付完整的单租户 Compose 部署包。
+          用户只需准备 Docker Compose，执行一次启动命令，再使用浏览器访问本机 Web 入口。
+        </div>
+        <div class="grid cols-4" style="margin-top: 15px">
+          <article class="card">
+            <div class="metric accent-teal">3</div>
+            <div class="metric-label">首版核心服务：web、api、werss</div>
+          </article>
+          <article class="card">
+            <div class="metric accent-blue">1</div>
+            <div class="metric-label">默认对外入口：Nginx Web 端口</div>
+          </article>
+          <article class="card">
+            <div class="metric accent-violet">0</div>
+            <div class="metric-label">首版不需要平台级租户数据库和 RLS</div>
+          </article>
+          <article class="card">
+            <div class="metric accent-amber">SQLite</div>
+            <div class="metric-label">AlphaDesk 与 WeRSS 可各自保留单实例本地数据库</div>
+          </article>
+        </div>
+        <div class="callout warn" style="margin-top: 14px">
+          <strong>重要限定：</strong>
+          这是“单租户自托管”方案，不等于“允许匿名暴露到公网”。默认 Compose 仅绑定
+          <code>127.0.0.1</code>。如果用户需要跨设备或公网访问，必须使用单独的 server override，
+          增加 HTTPS、身份认证、访问控制和备份策略。
+        </div>
+      </section>
+
+      <section class="section" id="boundary">
+        <h2>边界变化</h2>
+        <p class="section-lead">
+          前一版共享后端方案试图在一个平台中承载多个用户，因此需要 workspace、对象级授权、PostgreSQL RLS
+          和 WeRSS runtime 调度。新方案将隔离边界前移到部署实例：每位用户拥有自己的容器组和数据目录。
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>领域</th>
+              <th>共享后端平台路线</th>
+              <th>Compose 单租户路线</th>
+              <th>结论</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>用户隔离</td>
+              <td>应用内 workspace、membership、对象级授权、数据库 RLS。</td>
+              <td>实例级隔离：不同用户运行不同 Compose project 和数据目录。</td>
+              <td>首版复杂度显著下降。</td>
+            </tr>
+            <tr>
+              <td>WeRSS</td>
+              <td>平台需要管理连接级状态、runtime 调度和容量配额。</td>
+              <td>每套 AlphaDesk 实例固定一个 WeRSS 容器和一份 WeRSS 数据卷。</td>
+              <td>与当前 WeRSS 单实例使用方式一致。</td>
+            </tr>
+            <tr>
+              <td>数据库</td>
+              <td>推荐 PostgreSQL，使用 RLS 做纵深防御。</td>
+              <td>继续使用 SQLite；一套实例只有一个数据所有者。</td>
+              <td>首版无需数据库迁移。</td>
+            </tr>
+            <tr>
+              <td>密钥</td>
+              <td>推荐集中式 Secret Store、KMS 和轮换机制。</td>
+              <td>本地数据卷保存 AlphaDesk Fernet key；WeRSS 密码从本实例 <code>.env</code> 注入。</td>
+              <td>适合本机自托管；公网服务器仍需加固。</td>
+            </tr>
+            <tr>
+              <td>升级</td>
+              <td>平台统一滚动升级。</td>
+              <td>用户拉取新的镜像或部署包，再执行 Compose 升级。</td>
+              <td>需要版本化发布与数据备份说明。</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="section" id="target">
+        <h2>目标架构</h2>
+        <div class="architecture">
+          <div class="layer">
+            <div class="layer-name">用户浏览器<small>唯一交互入口</small></div>
+            <div class="layer-content">
+              <span class="node teal">http://127.0.0.1:8080</span>
+              <span class="node">Vue SPA</span>
+              <span class="node">报告下载</span>
+              <span class="node">WeRSS 扫码弹窗</span>
+            </div>
+          </div>
+          <div class="layer">
+            <div class="layer-name">web 容器<small>Nginx gateway</small></div>
+            <div class="layer-content">
+              <span class="node teal">静态 frontend/dist</span>
+              <span class="node">SPA fallback</span>
+              <span class="node">/api → api:8765</span>
+              <span class="node">/health → api:8765</span>
+              <span class="node">二维码受控代理</span>
+            </div>
+          </div>
+          <div class="layer">
+            <div class="layer-name">api 容器<small>FastAPI + worker</small></div>
+            <div class="layer-content">
+              <span class="node violet">FastAPI :8765</span>
+              <span class="node">SQLite workbench.db</span>
+              <span class="node">Fernet local.key</span>
+              <span class="node">采集 worker</span>
+              <span class="node">模型网关</span>
+              <span class="node">日志</span>
+            </div>
+          </div>
+          <div class="layer">
+            <div class="layer-name">werss 容器<small>公众号信源组件</small></div>
+            <div class="layer-content">
+              <span class="node amber">werss:8001</span>
+              <span class="node">微信扫码授权</span>
+              <span class="node">公众号订阅</span>
+              <span class="node">RSS 输出</span>
+              <span class="node">独立 data/werss</span>
+            </div>
+          </div>
+          <div class="layer">
+            <div class="layer-name">持久化目录<small>用户可备份</small></div>
+            <div class="layer-content">
+              <span class="node">./data/alphadesk</span>
+              <span class="node">./data/werss</span>
+              <span class="node">./data/browser-profile（可选）</span>
+              <span class="node">./.env</span>
+            </div>
+          </div>
+        </div>
+        <div class="callout" style="margin-top: 14px">
+          <strong>关键原则：</strong>
+          浏览器只访问 Nginx。FastAPI 和 WeRSS 默认仅在 Compose 内部网络可见，不直接发布到宿主机或公网。
+          需要排障时，可使用单独的运维 override 将 WeRSS 管理台临时绑定到
+          <code>127.0.0.1:8001</code>。
+        </div>
+      </section>
+
+      <section class="section" id="services">
+        <h2>服务职责</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>服务</th>
+              <th>镜像策略</th>
+              <th>职责</th>
+              <th>持久化</th>
+              <th>默认网络</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>web</code></td>
+              <td>项目内多阶段构建：Node 构建 Vue 3，Nginx 仅保存 <code>dist</code>。</td>
+              <td>静态资源、SPA fallback、同源反向代理、缓存头和基础安全头。</td>
+              <td>无。</td>
+              <td>宿主机仅发布 <code>127.0.0.1:${ALPHADESK_PORT:-8080}:80</code>。</td>
+            </tr>
+            <tr>
+              <td><code>api</code></td>
+              <td>项目内 Python 镜像，固定基础镜像版本并安装 <code>requirements.txt</code>。</td>
+              <td>FastAPI、SQLite、模型调用、采集任务、报告、日志、WeRSS API 编排。</td>
+              <td><code>./data/alphadesk:/app/data</code></td>
+              <td>只 <code>expose: 8765</code>，不映射宿主机端口。</td>
+            </tr>
+            <tr>
+              <td><code>werss</code></td>
+              <td>基于固定上游 sha256 摘要构建薄运行时镜像，补齐 Playwright WebKit，不跟随 <code>latest</code> 漂移。</td>
+              <td>微信扫码、公众号订阅、定时更新、RSS 和管理 API。</td>
+              <td><code>./data/werss:/app/data</code></td>
+              <td>只 <code>expose: 8001</code>，由 <code>api</code> 内部访问。</td>
+            </tr>
+            <tr>
+              <td><code>browser-worker</code>（可选）</td>
+              <td>第二阶段按需增加，不能混入首版核心启动路径。</td>
+              <td>承载需要交互登录的 Playwright 渠道，例如知识星球。</td>
+              <td><code>./data/browser-profile:/profiles</code></td>
+              <td>仅内部网络；调试入口必须单独鉴权。</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="section" id="routing">
+        <h2>同源路由与二维码</h2>
+        <p class="section-lead">
+          当前前端将 API 固定为 <code>http://127.0.0.1:8765</code>，后端将 WeRSS 默认固定为
+          <code>http://127.0.0.1:8001</code>。进入容器后，<code>127.0.0.1</code> 只表示当前容器，
+          因此必须改用同源路由和 Compose 服务名。
+        </p>
+        <table>
+          <thead>
+            <tr>
+              <th>链路</th>
+              <th>容器化前</th>
+              <th>容器化后</th>
+              <th>注意事项</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>浏览器 → AlphaDesk API</td>
+              <td><code>http://127.0.0.1:8765/api/...</code></td>
+              <td><code>/api/...</code>，由 Nginx 转发到 <code>api:8765</code>。</td>
+              <td>前端不再感知后端端口，也不再依赖宽泛 CORS。</td>
+            </tr>
+            <tr>
+              <td>api → WeRSS</td>
+              <td><code>http://127.0.0.1:8001</code></td>
+              <td><code>http://werss:8001</code></td>
+              <td>通过环境变量覆盖默认值；数据库中的旧默认值需要迁移。</td>
+            </tr>
+            <tr>
+              <td>浏览器 → WeRSS 二维码</td>
+              <td>后端返回宿主机 WeRSS URL。</td>
+              <td>后端提供受控二维码代理，例如 <code>/api/channels/wechat-mp-rss/qr-image</code>。</td>
+              <td>不能把 <code>http://werss:8001</code> 返回给浏览器，也不应公开整个管理台。</td>
+            </tr>
+            <tr>
+              <td>浏览器 → WeRSS 管理台</td>
+              <td>直接打开 <code>127.0.0.1:8001</code>。</td>
+              <td>默认关闭；排障时通过运维 override 临时绑定 loopback 端口。</td>
+              <td>避免普通使用流程暴露 WeRSS 原生管理入口。</td>
+            </tr>
+          </tbody>
+        </table>
+        <pre><code># docker/nginx.conf 核心示意
+server {
+  listen 80;
+  root /usr/share/nginx/html;
+
+  location / {
+    try_files $uri $uri/ /index.html;
+  }
+
+  location /api/ {
+    proxy_pass http://api:8765;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Request-ID $request_id;
+  }
+
+  location = /health {
+    proxy_pass http://api:8765/health;
+  }
+}</code></pre>
+      </section>
+
+      <section class="section" id="compose">
+        <h2>Compose 骨架</h2>
+        <p class="section-lead">
+          以下为已经落地的核心骨架。发布时由 GitHub Actions 为三个镜像生成版本标签；WeRSS 薄运行时镜像继续基于仓库当前已审核的固定摘要构建。
+        </p>
+        <pre><code>name: alphadesk
+
+services:
+  web:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    ports:
+      - "127.0.0.1:${ALPHADESK_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    environment:
+      ALPHADESK_WERSS_BASE_URL: http://werss:8001
+      ALPHADESK_WERSS_USERNAME: ${WERSS_USERNAME}
+      ALPHADESK_WERSS_PASSWORD: ${WERSS_PASSWORD}
+    expose:
+      - "8765"
+    volumes:
+      - ./data/alphadesk:/app/data
+    depends_on:
+      werss:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/health/ready', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+
+  werss:
+    build:
+      context: .
+      dockerfile: docker/werss.Dockerfile
+    environment:
+      DB: sqlite:///data/we_mp_rss.db
+      USERNAME: ${WERSS_USERNAME}
+      PASSWORD: ${WERSS_PASSWORD}
+      SECRET_KEY: ${WERSS_SECRET_KEY}
+      GATHER.CONTENT: "True"
+      GATHER.CONTENT_AUTO_CHECK: "True"
+      GATHER.CONTENT_AUTO_INTERVAL: "15"
+      RSS_FULL_CONTEXT: "True"
+    expose:
+      - "8001"
+    volumes:
+      - ./data/werss:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8001/feed/all.rss"]
+    restart: unless-stopped</code></pre>
+        <div class="callout warn">
+          <strong>不要做：</strong>
+          不要为了让 FastAPI 延续当前“手工启动 sidecar”接口，就把
+          <code>/var/run/docker.sock</code> 挂入 <code>api</code> 容器。Docker socket 基本等价于宿主机高权限控制面。
+          Compose 应在宿主机统一启动 WeRSS；FastAPI 只负责探测状态和返回清晰提示。
+        </div>
+      </section>
+
+      <section class="section" id="storage">
+        <h2>持久化、备份与升级</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>路径</th>
+              <th>内容</th>
+              <th>备份级别</th>
+              <th>恢复说明</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>./data/alphadesk</code></td>
+              <td><code>workbench.db</code>、<code>local.key</code>、日志、可选浏览器 profile。</td>
+              <td>必须整体备份。</td>
+              <td><code>workbench.db</code> 与 <code>local.key</code> 必须成对恢复，否则模型 Key、TuShare token 等无法解密。</td>
+            </tr>
+            <tr>
+              <td><code>./data/werss</code></td>
+              <td>WeRSS SQLite、授权状态、公众号订阅和文章库存。</td>
+              <td>必须整体备份。</td>
+              <td>升级 WeRSS 前先备份；恢复后执行扫码状态和 RSS 可用性检查。</td>
+            </tr>
+            <tr>
+              <td><code>./.env</code></td>
+              <td>WeRSS 管理账号、密码、SECRET_KEY、端口等部署参数。</td>
+              <td>必须备份，但不得提交 Git。</td>
+              <td>提供 <code>.env.example</code>，首次启动生成强随机值。</td>
+            </tr>
+            <tr>
+              <td><code>./backups</code>（建议）</td>
+              <td>升级前自动生成的时间戳备份包。</td>
+              <td>按保留策略轮换。</td>
+              <td>升级脚本先备份，再拉取镜像、启动和执行健康检查。</td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="callout rose" style="margin-top: 14px">
+          <strong>密钥边界：</strong>
+          当前 <code>local.key</code> 与 SQLite 同目录保存，适合作为本机数据卷中的便携式加密封装，
+          但不能抵御“整份数据目录被复制”的攻击。若支持公网服务器部署，应提供 Docker secrets、外部 Secret Store
+          或至少分离挂载目录的加固选项。
+        </div>
+      </section>
+
+      <section class="section" id="changes">
+        <h2>代码改造清单</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>位置</th>
+              <th>当前行为</th>
+              <th>需要调整</th>
+              <th>优先级</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>frontend/src/App.vue</code></td>
+              <td><code>const API = "http://127.0.0.1:8765"</code>。</td>
+              <td>改为同源 API 前缀，例如空字符串或构建变量；界面中的本地服务提示改为 Web 入口。</td>
+              <td><span class="pill risk">P0</span></td>
+            </tr>
+            <tr>
+              <td><code>backend/wechat_rss.py</code></td>
+              <td>默认连接 <code>127.0.0.1:8001</code>，并检测 Docker、执行嵌套 <code>docker compose up</code>。</td>
+              <td>支持环境变量 <code>ALPHADESK_WERSS_BASE_URL=http://werss:8001</code>；Compose 模式禁用嵌套启动，只做状态探测。</td>
+              <td><span class="pill risk">P0</span></td>
+            </tr>
+            <tr>
+              <td><code>backend/main.py</code></td>
+              <td>登录接口在 WeRSS 离线时尝试启动 sidecar；二维码 URL 可能来自内部地址。</td>
+              <td>增加受控二维码代理；离线时提示用户检查 Compose 状态；数据库初始化和旧默认 URL 迁移到内部服务名。</td>
+              <td><span class="pill risk">P0</span></td>
+            </tr>
+            <tr>
+              <td>旧桌面客户端</td>
+              <td>曾负责启动 FastAPI、创建桌面窗口、保存 HTML、打开外链。</td>
+              <td>完整删除。HTML 下载和外链打开统一使用浏览器能力。</td>
+              <td><span class="pill good">P0</span></td>
+            </tr>
+            <tr>
+              <td><code>docker/frontend.Dockerfile</code></td>
+              <td>不存在。</td>
+              <td>新增 Node 构建阶段和 Nginx runtime；复制 <code>frontend/dist</code>。</td>
+              <td><span class="pill good">P0</span></td>
+            </tr>
+            <tr>
+              <td><code>docker/backend.Dockerfile</code></td>
+              <td>不存在。</td>
+              <td>新增 FastAPI 镜像；安装 Python 依赖；设置 <code>uvicorn --host 0.0.0.0 --port 8765</code>。</td>
+              <td><span class="pill good">P0</span></td>
+            </tr>
+            <tr>
+              <td><code>docker/nginx.conf</code></td>
+              <td>不存在。</td>
+              <td>新增 SPA fallback、API 代理、健康检查代理、安全头和静态缓存策略。</td>
+              <td><span class="pill good">P0</span></td>
+            </tr>
+            <tr>
+              <td><code>compose.yaml</code></td>
+              <td>当前仅 <code>integrations/werss/compose.yaml</code> 管理单独 WeRSS。</td>
+              <td>仓库根目录新增整套 Compose；原 WeRSS Compose 保留为开发兼容入口或删除前标注 deprecated。</td>
+              <td><span class="pill good">P0</span></td>
+            </tr>
+            <tr>
+              <td><code>README.md</code></td>
+              <td>以旧桌面客户端本机开发方式为主。</td>
+              <td>将 Docker Compose 设为首选用户安装方式；保留源码开发流程。</td>
+              <td><span class="pill info">P1</span></td>
+            </tr>
+            <tr>
+              <td><code>.github/workflows/ci.yml</code></td>
+              <td>后端测试和前端构建。</td>
+              <td>增加 Docker 镜像构建、<code>docker compose config</code>、启动冒烟、健康检查和页面访问测试。</td>
+              <td><span class="pill info">P1</span></td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="section" id="browser">
+        <h2>Playwright 渠道兼容性</h2>
+        <div class="callout rose">
+          <strong>必须单独处理：</strong>
+          微信公众号 WeRSS 扫码不受影响，因为二维码可以展示在 AlphaDesk Web 页面中。
+          但现有知识星球等渠道通过 <code>backend/browser_session.py</code> 启动可见 Chromium 窗口并写入 persistent profile。
+          FastAPI 进入 Linux 容器后，容器内浏览器无法自然弹到用户桌面。
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>选择</th>
+              <th>说明</th>
+              <th>适用阶段</th>
+              <th>取舍</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>首版暂不承诺交互式 Playwright 渠道</td>
+              <td>先交付 AkShare、BaoStock、TuShare、HTTP、MX HAR、industry-news 和 WeRSS。</td>
+              <td>MVP 推荐。</td>
+              <td>最快，但功能需要在文档中明确标记。</td>
+            </tr>
+            <tr>
+              <td>增加 <code>browser-worker</code> + noVNC</td>
+              <td>单独容器运行浏览器和 profile，通过受保护的 noVNC 页面完成登录。</td>
+              <td>需要完整功能时。</td>
+              <td>可跨平台，但增加镜像体积、鉴权、网络和运维复杂度。</td>
+            </tr>
+            <tr>
+              <td>宿主机浏览器桥接</td>
+              <td>由本机辅助程序完成登录和 profile 导入，再由容器采集。</td>
+              <td>桌面增强版。</td>
+              <td>用户体验更自然，但重新引入宿主机组件。</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="section" id="profiles">
+        <h2>部署模式</h2>
+        <div class="grid cols-2">
+          <article class="card">
+            <h3>默认：本机自托管</h3>
+            <div class="tags">
+              <span class="pill good">推荐首版</span>
+              <span class="pill info">loopback only</span>
+            </div>
+            <ul>
+              <li>发布 <code>127.0.0.1:8080</code>，不向局域网暴露。</li>
+              <li>用户在同一台电脑浏览器中使用。</li>
+              <li>无需新增账号系统；数据目录由用户自行备份。</li>
+              <li>WeRSS 管理台默认不发布。</li>
+            </ul>
+          </article>
+          <article class="card">
+            <h3>可选：私有服务器</h3>
+            <div class="tags">
+              <span class="pill warn">需要加固</span>
+              <span class="pill info">server override</span>
+            </div>
+            <ul>
+              <li>通过 Caddy、Traefik 或现有网关提供 HTTPS。</li>
+              <li>增加 AlphaDesk 登录认证、速率限制和 CSRF 防护。</li>
+              <li>限制 WeRSS 管理台，仅允许运维网络访问。</li>
+              <li>增加定时备份、恢复演练和更新窗口。</li>
+            </ul>
+          </article>
+        </div>
+        <div class="callout warn" style="margin-top: 14px">
+          <strong>不要混用：</strong>
+          本机模式可以依赖 loopback 边界；只要将端口映射从 <code>127.0.0.1</code> 改为
+          <code>0.0.0.0</code>，就必须按服务器模式处理。即使每套实例只有一个用户，也不能把无认证 API 直接暴露到网络。
+        </div>
+      </section>
+
+      <section class="section" id="delivery">
+        <h2>用户交付物</h2>
+        <pre><code>alphadesk/
+├─ compose.yaml
+├─ compose.admin.yaml              # 可选：临时暴露 WeRSS 管理台到 loopback
+├─ .env.example
+├─ scripts/
+│  ├─ init.ps1 / init.sh           # 生成 .env 强随机值、创建数据目录
+│  ├─ start.ps1 / start.sh         # docker compose up -d
+│  ├─ stop.ps1 / stop.sh           # docker compose down
+│  ├─ backup.ps1 / backup.sh       # 备份 data 与 .env
+│  └─ update.ps1 / update.sh       # 备份、拉取、重启、健康检查
+├─ data/
+│  ├─ alphadesk/
+│  └─ werss/
+└─ docs/
+   ├─ quick-start.md
+   ├─ backup-restore.md
+   └─ troubleshooting.md</code></pre>
+        <p class="section-lead">
+          若采用镜像仓库发布，用户包无需包含源码；若采用源码交付，则 Compose 可本地构建
+          <code>web</code> 与 <code>api</code>。无论哪种方式，WeRSS 应继续固定镜像摘要，并记录升级验证结果。
+        </p>
+      </section>
+
+      <section class="section" id="phases">
+        <h2>实施阶段</h2>
+        <p class="section-lead">以下为单工程师粗略估算，目标是先交付稳定的本机 Compose 版本。</p>
+        <div class="phase">
+          <div class="phase-id">阶段 A<span>容器骨架</span></div>
+          <div>
+            <h3>构建 web、api、werss 和根目录 Compose</h3>
+            <ul>
+              <li>新增三份 Dockerfile、Nginx 配置、<code>.dockerignore</code> 和 <code>.env.example</code>。</li>
+              <li>固定 WeRSS 摘要，创建 AlphaDesk 与 WeRSS 数据目录。</li>
+              <li>增加容器健康检查和 loopback 默认端口。</li>
+            </ul>
+            <span class="pill info">预计：2 - 3 天</span>
+          </div>
+        </div>
+        <div class="phase">
+          <div class="phase-id">阶段 B<span>路由改造</span></div>
+          <div>
+            <h3>将旧桌面入口替换为浏览器同源入口</h3>
+            <ul>
+              <li>前端 API 改为相对路径。</li>
+              <li>后端 WeRSS base URL 改为环境变量，移除嵌套 Docker 启动依赖。</li>
+              <li>增加二维码受控代理和旧配置迁移。</li>
+            </ul>
+            <span class="pill info">预计：2 - 4 天</span>
+          </div>
+        </div>
+        <div class="phase">
+          <div class="phase-id">阶段 C<span>交付体验</span></div>
+          <div>
+            <h3>增加初始化、备份、更新和排障脚本</h3>
+            <ul>
+              <li>自动生成 WeRSS 强随机密码与 SECRET_KEY。</li>
+              <li>升级前备份数据，升级后检查 <code>/health/ready</code>、WeRSS 和首页。</li>
+              <li>更新 README 和快速开始文档。</li>
+            </ul>
+            <span class="pill info">预计：2 - 3 天</span>
+          </div>
+        </div>
+        <div class="phase">
+          <div class="phase-id">阶段 D<span>质量门禁</span></div>
+          <div>
+            <h3>增加 Compose 冒烟与升级恢复测试</h3>
+            <ul>
+              <li>CI 验证镜像构建、Compose config、启动、页面、API 和 WeRSS 内网连通。</li>
+              <li>验证删除并重建容器后数据不丢失。</li>
+              <li>验证默认宿主机只暴露 Web 端口。</li>
+            </ul>
+            <span class="pill info">预计：2 - 3 天</span>
+          </div>
+        </div>
+        <div class="callout" style="margin-top: 14px">
+          <strong>首版总量：</strong>
+          约 <strong>8 - 13 工程日</strong>。若首版必须保留知识星球等交互式 Playwright 登录，
+          需要另行评估 <code>browser-worker</code> 和 noVNC，预计再增加 <strong>4 - 8 工程日</strong>。
+        </div>
+      </section>
+
+      <section class="section" id="tests">
+        <h2>验收矩阵</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>测试域</th>
+              <th>必须验证</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>一键启动</td>
+              <td>新目录执行初始化和 <code>docker compose up -d</code> 后，浏览器可访问首页，<code>/health/ready</code> 返回 ready。</td>
+            </tr>
+            <tr>
+              <td>网络暴露</td>
+              <td>默认只有 <code>127.0.0.1:8080</code> 可见；<code>8765</code> 和 <code>8001</code> 不发布到宿主机。</td>
+            </tr>
+            <tr>
+              <td>同源 API</td>
+              <td>前端所有请求使用相对路径；页面不再依赖 CORS 放行 <code>null</code> 或 Vite 开发端口。</td>
+            </tr>
+            <tr>
+              <td>WeRSS 扫码</td>
+              <td>用户可在 AlphaDesk 页面看到二维码，扫码、搜索公众号、加入订阅和采集 RSS；浏览器不访问 <code>werss:8001</code>。</td>
+            </tr>
+            <tr>
+              <td>WeRSS 隔离</td>
+              <td>两个不同 Compose project 使用不同数据目录启动后，授权、订阅和库存互不影响。</td>
+            </tr>
+            <tr>
+              <td>容器重建</td>
+              <td>执行 <code>docker compose down</code>、重新创建容器后，AlphaDesk 任务、加密配置、WeRSS 授权和订阅仍存在。</td>
+            </tr>
+            <tr>
+              <td>备份恢复</td>
+              <td>在新目录恢复 <code>data</code> 与 <code>.env</code> 后，健康检查、模型配置解密、WeRSS RSS 和历史快照可用。</td>
+            </tr>
+            <tr>
+              <td>升级</td>
+              <td>升级脚本先备份，再更新镜像；失败时可恢复前一版本镜像和数据备份。</td>
+            </tr>
+            <tr>
+              <td>安全</td>
+              <td><code>api</code> 不挂载 Docker socket；日志不输出 API Key、WeRSS 密码、HAR 原文或 token。</td>
+            </tr>
+            <tr>
+              <td>旧桌面客户端清理</td>
+              <td>源码、依赖、生产启动、构建和文档不再依赖旧桌面客户端；浏览器下载 HTML 报告和打开外链正常。</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="section" id="decisions">
+        <h2>待确认项</h2>
+        <ol>
+          <li><strong>首版部署范围：</strong>是否只支持用户本机运行？建议先限定本机 loopback。</li>
+          <li><strong>发布方式：</strong>交付源码并本地构建，还是发布固定版本的 <code>web</code>、<code>api</code> 镜像？</li>
+          <li><strong>WeRSS 管理台：</strong>是否只通过可选运维 override 暴露到 <code>127.0.0.1:8001</code>？建议是。</li>
+          <li><strong>Playwright 渠道：</strong>知识星球等交互式登录是否属于首版必须功能？如果是，需要增加 browser-worker 设计。</li>
+          <li><strong>备份：</strong>首版是否提供脚本式备份恢复，还是同时提供定时任务模板？</li>
+          <li><strong>平台化预留：</strong>未来是否仍可能建设集中式平台？若可能，当前代码应保留环境变量和服务边界，但不提前引入多租户 schema。</li>
+        </ol>
+      </section>
+
+      <section class="section" id="references">
+        <h2>参考资料</h2>
+        <ul>
+          <li>
+            上游项目：
+            <a href="https://github.com/rachelos/we-mp-rss">rachelos/we-mp-rss</a>。
+            官方 README 提供 <code>docker run -p 8001:8001 -v ./data:/app/data</code> 的快速启动方式，并说明默认 SQLite、可选 MySQL。
+          </li>
+          <li>
+            上游 SQLite Compose：
+            <a href="https://github.com/rachelos/we-mp-rss/blob/main/compose/docker-compose-sqlite.yaml">docker-compose-sqlite.yaml</a>。
+            可见 WeRSS 数据目录挂载、管理账号和密码环境变量。
+          </li>
+          <li>
+            上游完整 Compose：
+            <a href="https://github.com/rachelos/we-mp-rss/blob/main/compose/docker-compose.yaml">docker-compose.yaml</a>。
+            可见 WeRSS 也支持 MySQL、Redis 和代理组件扩展。
+          </li>
+          <li>
+            上游最新发布：
+            <a href="https://github.com/rachelos/we-mp-rss/releases/tag/v1.5.2">v1.5.2</a>，
+            GitHub 页面显示发布时间为 2026-04-16。AlphaDesk 交付仍建议固定经过验证的 sha256 摘要，而不是直接跟随 <code>latest</code>。
+          </li>
+        </ul>
+      </section>
+
+      <footer>AlphaDesk Docker Compose 单租户交付方案 · 生成于 2026-06-02 · 用于内部技术评审</footer>
+    </main>
+  </body>
+</html>

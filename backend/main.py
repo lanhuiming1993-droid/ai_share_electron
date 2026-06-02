@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import importlib.util
+import os
 import re
 import sqlite3
 import subprocess
@@ -50,7 +51,9 @@ from backend.source_registry import CANONICAL_CHANNEL_NAMES, source_catalog, too
 from backend.wechat_rss import (
     add_werss_subscription,
     delete_werss_subscription,
+    fetch_werss_qr_image,
     managed_werss_status,
+    managed_werss_start_available,
     normalize_werss_config,
     public_werss_config,
     search_werss_public_accounts,
@@ -61,7 +64,12 @@ from backend.wechat_rss import (
 from backend.worker import CollectionWorker
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT / "data"
+VERSION_PATH = ROOT / "VERSION"
+APP_VERSION = (
+    os.environ.get("ALPHADESK_VERSION", "").strip()
+    or (VERSION_PATH.read_text(encoding="utf-8").strip() if VERSION_PATH.exists() else "0.2.0")
+)
+DATA_DIR = Path(os.environ.get("ALPHADESK_DATA_DIR", str(ROOT / "data"))).expanduser().resolve()
 DB_PATH = DATA_DIR / "workbench.db"
 KEY_PATH = DATA_DIR / "local.key"
 SKILLS_DIR = ROOT / "skills"
@@ -78,7 +86,7 @@ MARKET_DATA_DEFAULT_CONFIG = {
     "tushare_token": "",
     "component_timeout_seconds": 35,
 }
-DATA_DIR.mkdir(exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 logger = get_logger("api")
 frontend_logger = get_logger("frontend")
 
@@ -95,7 +103,7 @@ async def lifespan(_app: FastAPI):
         collection_worker.stop()
 
 
-app = FastAPI(title="A股成长猎手本地服务", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="A股成长猎手本地服务", version=APP_VERSION, lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://127.0.0.1:5173", "http://localhost:5173", "null"],
@@ -1853,7 +1861,7 @@ def update_wechat_rss_config(payload: WechatRssConfigInput) -> dict:
     try:
         config = normalize_werss_config(
             {
-                "base_url": payload.base_url,
+                "base_url": payload.base_url.strip() or str(existing.get("base_url") or ""),
                 "feed_ids": payload.feed_ids,
                 "access_key": access_key,
                 "secret_key": secret_key,
@@ -1904,6 +1912,8 @@ def start_wechat_rss_login() -> dict:
     config = wechat_rss_config()
     status = managed_werss_status(config)
     if not status["service_online"]:
+        if not managed_werss_start_available():
+            raise HTTPException(409, "WeRSS 组件尚未就绪。请在项目目录执行启动脚本，并确认 werss 容器健康。")
         hostname = str(urlsplit(config["base_url"]).hostname or "").lower()
         if hostname not in {"127.0.0.1", "localhost", "::1"}:
             raise HTTPException(409, "WeRSS 服务不可用，请检查高级配置中的服务地址")
@@ -1925,8 +1935,20 @@ def start_wechat_rss_login() -> dict:
     except Exception as exc:
         log_exception(logger, "channel.wechat_rss.login.failed", exc, channel_id="wechat-mp-rss")
         raise HTTPException(409, str(exc)) from exc
+    if result.get("qr_image_url"):
+        result["qr_image_url"] = "/api/channels/wechat-mp-rss/qr-image"
     log_event(logger, "INFO", "channel.wechat_rss.login.qr_created", channel_id="wechat-mp-rss")
     return result
+
+
+@app.get("/api/channels/wechat-mp-rss/qr-image")
+def wechat_rss_qr_image() -> Response:
+    try:
+        content, content_type = fetch_werss_qr_image(wechat_rss_config())
+    except Exception as exc:
+        log_exception(logger, "channel.wechat_rss.login.qr_image_failed", exc, channel_id="wechat-mp-rss")
+        raise HTTPException(409, str(exc)) from exc
+    return Response(content=content, media_type=content_type, headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/channels/wechat-mp-rss/wechat-login/status")

@@ -31,3 +31,11 @@ updates:
       day: monday
       timezone: Asia/Hong_Kong
     open-pull-requests-limit: 5
+
+  - package-ecosystem: docker
+    directory: /docker
+    schedule:
+      interval: weekly
+      day: monday
+      timezone: Asia/Hong_Kong
+    open-pull-requests-limit: 5

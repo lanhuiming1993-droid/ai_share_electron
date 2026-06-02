@@ -10,6 +10,7 @@ from backend.wechat_rss import (
     check_werss,
     collect_werss,
     delete_werss_subscription,
+    fetch_werss_qr_image,
     fetch_werss_subscriptions,
     managed_werss_status,
     parse_werss_feed,
@@ -62,11 +63,13 @@ ATOM_XML = """<?xml version="1.0" encoding="UTF-8"?>
 
 
 class FakeResponse:
-    def __init__(self, text: str, url: str = "http://127.0.0.1:8001/feed/all.rss?limit=100&offset=0", json_payload=None) -> None:
+    def __init__(self, text: str, url: str = "http://127.0.0.1:8001/feed/all.rss?limit=100&offset=0", json_payload=None, content_type: str = "application/xml") -> None:
         self.text = text
         self.url = url
         self.status_code = 200
         self.json_payload = json_payload
+        self.content = text.encode()
+        self.headers = {"Content-Type": content_type}
 
     def raise_for_status(self) -> None:
         return None
@@ -130,6 +133,7 @@ class WerssApiSession:
         self.calls: list[dict] = []
         self.persistent_authorization = persistent_authorization
         self.qr_login_status = qr_login_status
+        self.qr_generated = False
 
     def post(self, url: str, **kwargs):
         self.calls.append({"method": "POST", "url": url, **kwargs})
@@ -144,9 +148,10 @@ class WerssApiSession:
     def get(self, url: str, **kwargs):
         self.calls.append({"method": "GET", "url": url, **kwargs})
         if url.endswith("/auth/qr/code"):
+            self.qr_generated = True
             payload = {"code": 0, "data": {"code": "/static/wx_qrcode.png?t=1", "is_exists": True}}
         elif url.endswith("/auth/qr/status"):
-            payload = {"code": 0, "data": {"login_status": self.qr_login_status, "qr_code": True}}
+            payload = {"code": 0, "data": {"login_status": self.persistent_authorization or (self.qr_login_status and self.qr_generated), "qr_code": self.qr_generated}}
         elif "/mps/search/" in url:
             payload = {
                 "code": 0,
@@ -253,6 +258,11 @@ class WechatRssTests(unittest.TestCase):
         self.assertEqual(config["secret_key"], "****************")
         self.assertEqual(config["admin_password"], "****************")
 
+    def test_public_config_hides_compose_internal_base_url(self) -> None:
+        config = public_werss_config({"base_url": "http://werss:8001"})
+        self.assertEqual(config["base_url"], "")
+        self.assertEqual(config["management_url"], "")
+
     def test_headers_omit_auth_when_credentials_are_empty(self) -> None:
         self.assertNotIn("Authorization", werss_headers({"access_key": "", "secret_key": ""}))
 
@@ -288,6 +298,25 @@ class WechatRssTests(unittest.TestCase):
         self.assertEqual(login_call["data"]["username"], "admin")
         self.assertEqual(login_call["data"]["password"], "admin@123")
 
+    def test_qr_image_is_fetched_from_werss_for_same_origin_proxy(self) -> None:
+        session = FakeSession("png-bytes")
+        with patch.object(session, "get", return_value=FakeResponse("png-bytes", content_type="image/png")):
+            content, content_type = fetch_werss_qr_image({"base_url": "http://127.0.0.1:8123"}, session=session)
+        self.assertEqual(content, b"png-bytes")
+        self.assertEqual(content_type, "image/png")
+
+    def test_qr_image_proxy_retries_while_werss_generates_the_file(self) -> None:
+        missing = FakeResponse("missing", content_type="text/plain")
+        missing.status_code = 404
+        ready = FakeResponse("png-bytes", content_type="image/png")
+        session = FakeSession("png-bytes")
+        with patch.object(session, "get", side_effect=[missing, ready]) as get, patch("backend.wechat_rss.time.sleep") as sleep:
+            content, content_type = fetch_werss_qr_image({"base_url": "http://127.0.0.1:8126"}, session=session)
+        self.assertEqual(content, b"png-bytes")
+        self.assertEqual(content_type, "image/png")
+        self.assertEqual(get.call_count, 2)
+        sleep.assert_called_once_with(1)
+
     def test_persistent_authorization_avoids_replacing_successful_login_with_new_qr_code(self) -> None:
         session = WerssApiSession(persistent_authorization=True, qr_login_status=False)
         config = {"base_url": "http://127.0.0.1:8124"}
@@ -320,6 +349,11 @@ class WechatRssTests(unittest.TestCase):
     def test_managed_start_explains_stopped_docker_engine(self) -> None:
         with patch("backend.wechat_rss.shutil.which", return_value="docker"), patch("backend.wechat_rss.docker_engine_available", return_value=False):
             with self.assertRaisesRegex(RuntimeError, "引擎未运行"):
+                start_managed_werss()
+
+    def test_compose_runtime_disables_nested_docker_start(self) -> None:
+        with patch("backend.wechat_rss.WERSS_RUNTIME_MODE", "compose"):
+            with self.assertRaisesRegex(RuntimeError, "Docker Compose"):
                 start_managed_werss()
 
 

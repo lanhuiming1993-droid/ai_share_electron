@@ -1,0 +1,14 @@
+.git
+.github
+.venv
+node_modules
+frontend/dist
+data
+output
+*.har
+*.pyc
+__pycache__
+.env
+backups
+.compose-smoke-data
+.playwright-cli

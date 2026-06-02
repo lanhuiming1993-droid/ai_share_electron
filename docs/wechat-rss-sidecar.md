@@ -1,14 +1,49 @@
-# 微信公众号 WeRSS Sidecar 接入
+# 微信公众号 WeRSS 组件接入
 
 ## 接入边界
 
-AlphaDesk 将 [rachelos/we-mp-rss](https://github.com/rachelos/we-mp-rss) 作为隔离 sidecar 服务使用。WeRSS 负责微信扫码授权、公众号订阅、定时更新和 RSS 生成；AlphaDesk 负责自动启动本地组件、代理扫码登录、搜索并加入公众号、同步已订阅公众号、展示可用状态和消费严格时间窗内的 RSS。当前项目不会 vendor、导入或直接执行第三方 Python 模块。
+AlphaDesk 将 [rachelos/we-mp-rss](https://github.com/rachelos/we-mp-rss) 作为独立容器使用。
 
-在使用前，请确认公众号内容采集和保存方式符合你的授权范围、平台规则和适用法律。
+- WeRSS 负责微信扫码授权、公众号订阅、定时更新和 RSS 生成。
+- AlphaDesk FastAPI 负责代理扫码图片、搜索并加入公众号、同步订阅、展示状态和消费严格时间窗内的 RSS。
+- AlphaDesk 不 vendor、不复制、不导入也不直接执行上游 Python 源码。
+- 上游镜像固定到已审核的 sha256 摘要，不跟随 `latest` 漂移。
+- AlphaDesk 的 `docker/werss.Dockerfile` 基于固定上游镜像构建薄运行时镜像，仅补齐上游扫码实现所需的 Playwright WebKit 浏览器。
+
+第三方归属、许可证副本和升级策略见 [`THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md)。
+
+## Docker Compose 运行方式
+
+用户运行 AlphaDesk 根目录的一键启动脚本：
+
+```powershell
+.\scripts\start.cmd
+```
+
+或：
+
+```bash
+sh ./scripts/start.sh
+```
+
+脚本会统一启动：
+
+- `web`：Vue 3 构建产物和 Nginx。
+- `api`：FastAPI、SQLite 和采集 worker。
+- `werss`：微信公众号组件。
+
+FastAPI 通过 Compose 内部地址 `http://werss:8001` 访问 WeRSS。默认不会将 WeRSS 原生管理端口发布到宿主机。
+
+## 用户扫码流程
+
+1. 打开 [http://127.0.0.1:8080](http://127.0.0.1:8080)。
+2. 在“信源渠道 -> 微信公众号（WeRSS）”中点击“登录微信公众号”。
+3. AlphaDesk 调用 WeRSS 管理 API 生成二维码。
+4. 浏览器从 AlphaDesk 同源 API `/api/channels/wechat-mp-rss/qr-image` 获取二维码，不直接访问内部容器地址。
+5. 微信扫码成功后，在同一弹窗中搜索并加入公众号。
+6. 采集任务按 RSS 发布时间和任务时间窗保存文章快照。
 
 ## 已核对接口
-
-本次核对基于上游提交 `cf8b407bc0234127992336de96980c6c65f8f72b`：
 
 - RSS 输出：`GET /feed/{feed_id}.rss`
 - RSS 搜索：`GET /feed/search/{kw}/{feed_id}.rss`
@@ -18,36 +53,33 @@ AlphaDesk 将 [rachelos/we-mp-rss](https://github.com/rachelos/we-mp-rss) 作为
 - 检查扫码状态：`GET /api/v1/wx/auth/qr/status`
 - 搜索公众号：`GET /api/v1/wx/mps/search/{kw}`
 - 添加公众号订阅：`POST /api/v1/wx/mps`
-- 读取已订阅公众号：`GET /api/v1/wx/mps`
+- 读取公众号订阅：`GET /api/v1/wx/mps`
 - 原生管理台：`GET /`
 
-AlphaDesk 默认请求 `GET /feed/all.rss`，也支持配置一个或多个 Feed ID。采集器只保存 RSS 中发布时间落在任务时间窗内的文章。
+## 运维管理台
 
-本地托管容器默认启用正文抓取、全文 RSS 和每 15 分钟一次的缺失正文补抓。WeRSS 会先同步公众号文章索引，再在受控频率下补充正文；正文尚未回填时，RSS 中可能暂时只有标题、摘要和原文链接。AlphaDesk 将默认的 `all` Feed 展开为已订阅公众号的独立 Feed，按小页读取全文 RSS，单页保留 8 MB 防护，并在越过任务时间窗后停止翻页。每篇快照会保留具体公众号 ID 和名称，供整理记录与报告证据标注使用。
+日常使用无需访问 WeRSS 原生管理台。排障时可以临时启用 loopback 端口：
 
-## 安全审查结论
+```powershell
+docker compose --env-file .env -f compose.yaml -f compose.admin.yaml up -d
+```
 
-上游项目采用 MIT 许可证，但仓库根目录存在与 RSS 服务主链路无关的网络工具脚本。AlphaDesk 因此不复制、不导入、不执行上游 Python 模块。用户点击“启动本地 WeRSS”时，工作台只会运行 `integrations/werss/compose.yaml` 中固定镜像摘要的隔离容器。
+然后访问 [http://127.0.0.1:8001](http://127.0.0.1:8001)。
 
-生产部署建议：
+不要将 WeRSS 管理台直接暴露到局域网或公网。
 
-1. 安装并启动 Docker Desktop，或准备独立主机上的 WeRSS 服务。
-2. 在 AlphaDesk 的“微信公众号（WeRSS）”渠道中点击“配置”。
-3. 点击“登录微信公众号”。本地 sidecar 未启动时，AlphaDesk 会自动启动固定镜像摘要对应的容器。
-4. 在 AlphaDesk 弹窗中使用微信扫码。工作台会自动轮询授权状态。
-5. 在同一个弹窗中搜索并加入需要采集的公众号。WeRSS 无法枚举个人微信的全部关注列表；只会展示已加入 WeRSS 的订阅。
-6. 确认“组件”“微信登录”“已订阅公众号”“采集状态”均可用后发起采集。
-7. 仅在排障或跨主机部署时展开高级配置；原生管理台、Feed ID、AK/SK 和反向代理 HTTPS 均属于高级能力。
+## 数据与备份
 
-## 运行时行为
+- AlphaDesk 数据：`data/alphadesk/`
+- WeRSS 数据：`data/werss/`
+- 部署凭据：`.env`
 
-- WeRSS 掉线时，AlphaDesk 巡检会将渠道标记为 `offline`。
-- 本地 sidecar 仅在用户点击“登录微信公众号”或高级配置中的启动按钮后执行；不会在 AlphaDesk 启动时自动拉取镜像。
-- WeRSS 管理密码只保存在 AlphaDesk 本机加密配置表中；管理 JWT 仅在后端内存中短期缓存。
-- AK/SK 只保存在 AlphaDesk 本机加密配置表中，前端接口只获得掩码。
-- RSS 或 Atom XML 会转换为原始快照，再按固定规则整理为文章条目。
-- 没有明确发布时间的文章不会进入快照，避免越过严格时间窗。
-- 个股研究可以读取该渠道的一般快照；通用信源报告只使用用户当次选择的渠道。
+备份和恢复必须覆盖以上三部分。使用仓库内置脚本：
+
+```powershell
+.\scripts\backup.cmd
+.\scripts\restore.cmd -Archive .\backups\alphadesk-backup-YYYYMMDD-HHMMSS.zip
+```
 
 ## 上游参考
 

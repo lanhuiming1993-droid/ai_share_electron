@@ -1,7 +1,8 @@
 <script setup>
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 
-const API = "http://127.0.0.1:8765";
+const API = import.meta.env.VITE_API_BASE_URL || "";
+const webOrigin = window.location.origin;
 const data = reactive({ tools: [], channels: [], skills: [], tasks: [], source_jobs: [], provider: null, providers: [], codex_policy: null, research_red_lines: null, audit: { jobs: [], watermarks: [], snapshots: [], normalized: [], events: [], inventory: { snapshot_count: 0, normalized_item_count: 0, source_report_count: 0, research_report_count: 0 } } });
 const provider = reactive({ name: "", base_url: "", model: "", api_key: "", protocol: "openai_chat_completions", enabled: true, extra_body_text: "{}" });
 const task = reactive({ title: "成长股六维研究", target: "", objective: "识别财务拐点、赛道卡位、客户订单、产能交付、机构变化和未来催化", skill_name: "a-share-growth-hunter", lookback_days: 30 });
@@ -26,7 +27,7 @@ const providerFormInitialized = ref(false);
 const channelForm = reactive({ name: "", type: "", url: "", collection_mode: "playwright", status: "pending", notes: "", validation_url: "", success_url_contains: "", success_selector: "", group_ids: [], parsing_strategy: "hybrid", normalization_quality_threshold: 60, max_scrolls: 8, research_enabled: false });
 const marketDataForm = reactive({ enable_akshare: true, enable_baostock: true, enable_tushare: true, tushare_token: "", tushare_token_configured: false, clear_tushare_token: false, component_timeout_seconds: 35 });
 const wechatRssForm = reactive({ base_url: "http://127.0.0.1:8001", feed_ids_text: "all", access_key: "", secret_key: "", credentials_configured: false, admin_username: "admin", admin_password: "", admin_password_configured: false, clear_credentials: false, timeout_seconds: 20, max_items_per_feed: 100 });
-const wechatRssComponent = reactive({ status: "pending", message: "尚未检查", ready: false, service_online: false, rss_online: false, subscription_count: 0, subscriptions: [], subscription_error: "", docker_available: false, docker_engine_available: false, managed_setup_available: false, management_url: "http://127.0.0.1:8001/", onboarding_steps: [] });
+const wechatRssComponent = reactive({ status: "pending", message: "尚未检查", ready: false, service_online: false, rss_online: false, subscription_count: 0, subscriptions: [], subscription_error: "", docker_available: false, docker_engine_available: false, managed_setup_available: false, management_url: "", onboarding_steps: [] });
 const wechatRssComponentLoading = ref(false);
 const wechatRssStarting = ref(false);
 const wechatRssLoginModal = ref(false);
@@ -650,19 +651,20 @@ async function checkAllChannels() {
 }
 
 function wechatRssConsoleUrl(path = "", baseUrlOverride = "") {
-  const baseUrl = (baseUrlOverride || wechatRssForm.base_url || "http://127.0.0.1:8001").replace(/\/+$/, "");
+  const baseUrl = (baseUrlOverride || wechatRssComponent.management_url || "").replace(/\/+$/, "");
+  if (!baseUrl) return "";
   return `${baseUrl}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
 async function openWechatRssConsole(path = "", baseUrlOverride = "") {
   const url = wechatRssConsoleUrl(path, baseUrlOverride);
+  if (!url) {
+    notice.value = "WeRSS 原生管理台默认不对外暴露。如需排障，请使用运维 Compose override 临时启用本机管理端口。";
+    return;
+  }
   frontendLog("info", "channel.wechat_rss.console.opened", "", { path: path || "/" });
   try {
-    if (window.alphadesk?.openExternalUrl) {
-      await window.alphadesk.openExternalUrl({ url });
-    } else {
-      window.open(url, "_blank", "noopener,noreferrer");
-    }
+    window.open(url, "_blank", "noopener,noreferrer");
     notice.value = "已打开 WeRSS 原生管理台。这里仅用于高级排障和订阅维护；日常登录请使用 AlphaDesk 的扫码弹窗。";
   } catch (error) {
     notice.value = `打开 WeRSS 管理台失败：${error.message}`;
@@ -946,12 +948,6 @@ async function exportReportHtml() {
   const html = buildReportExportDocument(selectedReport.value);
   try {
     frontendLog("info", "report.export.clicked", "", { filename, report_chars: html.length });
-    if (window.alphadesk?.saveHtmlReport) {
-      const result = await window.alphadesk.saveHtmlReport({ filename, html });
-      if (result.status === "cancelled") return;
-      notice.value = `HTML 报告已导出：${result.filePath}`;
-      return;
-    }
     const url = URL.createObjectURL(new Blob([html], { type: "text/html;charset=utf-8" }));
     const anchor = document.createElement("a");
     anchor.href = url;
@@ -1041,7 +1037,7 @@ onUnmounted(() => {
           <span class="h-2 w-2 rounded-full bg-emerald-400 shadow-[0_0_12px_#34d399]"></span>
           <p class="text-xs text-slate-300">本地服务运行中</p>
         </div>
-        <p class="mt-2 text-[10px] tracking-wide text-slate-600">127.0.0.1:8765</p>
+        <p class="mt-2 text-[10px] tracking-wide text-slate-600">{{ webOrigin }}</p>
       </div>
     </aside>
 
@@ -1528,7 +1524,7 @@ onUnmounted(() => {
             <h2 class="mb-3 text-sm font-semibold text-slate-500">关于</h2>
             <div class="panel overflow-hidden">
               <div class="setting-row px-5 py-4"><span><strong>应用版本</strong><small>AShareHunter</small></span><b>0.1.0</b></div>
-              <div class="setting-row px-5 py-4"><span><strong>本地服务</strong><small>FastAPI Agent 编排服务</small></span><b class="text-emerald-300">127.0.0.1:8765</b></div>
+              <div class="setting-row px-5 py-4"><span><strong>Web 服务</strong><small>Nginx 同源代理 FastAPI Agent 编排服务</small></span><b class="text-emerald-300">{{ webOrigin }}</b></div>
             </div>
           </section>
         </template>
@@ -1773,9 +1769,9 @@ onUnmounted(() => {
             <details class="mt-3 rounded-xl border border-white/[.07] bg-black/10 p-3">
               <summary class="cursor-pointer text-xs font-semibold text-slate-300">高级配置与维护</summary>
               <div class="mt-3 flex flex-wrap gap-2">
-                <button type="button" @click="startWechatRssSidecar" :disabled="wechatRssStarting" class="secondary disabled:cursor-wait disabled:opacity-60">{{ wechatRssStarting ? '正在启动...' : '手工启动本地组件' }}</button>
+                <button v-if="wechatRssComponent.managed_setup_available" type="button" @click="startWechatRssSidecar" :disabled="wechatRssStarting" class="secondary disabled:cursor-wait disabled:opacity-60">{{ wechatRssStarting ? '正在启动...' : '手工启动本地组件' }}</button>
                 <button type="button" @click="refreshWechatRssComponentStatus" :disabled="wechatRssComponentLoading" class="secondary">{{ wechatRssComponentLoading ? '正在检查...' : '检查组件状态' }}</button>
-                <button type="button" @click="openWechatRssConsole()" class="secondary">打开原生管理台</button>
+                <button v-if="wechatRssComponent.management_url" type="button" @click="openWechatRssConsole()" class="secondary">打开原生管理台</button>
               </div>
               <p class="mt-2 text-xs leading-5 text-slate-500">{{ wechatRssComponent.message }}</p>
               <label class="mt-3 block">

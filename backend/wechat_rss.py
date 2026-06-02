@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -15,14 +16,19 @@ from xml.etree import ElementTree
 
 from backend.http_policy import browser_http_session
 
+DEFAULT_WERSS_BASE_URL = os.environ.get("ALPHADESK_WERSS_BASE_URL", "http://127.0.0.1:8001").strip().rstrip("/")
+DEFAULT_WERSS_PUBLIC_URL = os.environ.get("ALPHADESK_WERSS_PUBLIC_URL", "").strip().rstrip("/")
+DEFAULT_WERSS_ADMIN_USERNAME = os.environ.get("ALPHADESK_WERSS_USERNAME", "admin").strip()
+DEFAULT_WERSS_ADMIN_PASSWORD = os.environ.get("ALPHADESK_WERSS_PASSWORD", "admin@123").strip()
+WERSS_RUNTIME_MODE = os.environ.get("ALPHADESK_WERSS_MODE", "managed").strip().casefold()
 DEFAULT_WERSS_CONFIG = {
     "adapter": "werss_external_rss",
-    "base_url": "http://127.0.0.1:8001",
+    "base_url": DEFAULT_WERSS_BASE_URL,
     "feed_ids": ["all"],
     "access_key": "",
     "secret_key": "",
-    "admin_username": "admin",
-    "admin_password": "admin@123",
+    "admin_username": DEFAULT_WERSS_ADMIN_USERNAME,
+    "admin_password": DEFAULT_WERSS_ADMIN_PASSWORD,
     "timeout_seconds": 20,
     "max_items_per_feed": 100,
 }
@@ -38,12 +44,20 @@ WERSS_API_PREFIX = "/api/v1/wx"
 WERSS_TOKEN_TTL_SECONDS = 25 * 60
 WERSS_WECHAT_AUTH_TRUE_TTL_SECONDS = 5 * 60
 WERSS_WECHAT_AUTH_FALSE_TTL_SECONDS = 10
+WERSS_QR_IMAGE_RETRY_COUNT = 15
 _WERSS_ADMIN_TOKENS: dict[str, tuple[str, float]] = {}
 _WERSS_WECHAT_AUTH: dict[str, tuple[bool, float]] = {}
+_WERSS_QR_IMAGE_URLS: dict[str, str] = {}
 
 
 def normalize_werss_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
     merged = {**DEFAULT_WERSS_CONFIG, **(config or {}), "adapter": "werss_external_rss"}
+    if os.environ.get("ALPHADESK_WERSS_BASE_URL", "").strip():
+        merged["base_url"] = DEFAULT_WERSS_BASE_URL
+    if os.environ.get("ALPHADESK_WERSS_USERNAME", "").strip():
+        merged["admin_username"] = DEFAULT_WERSS_ADMIN_USERNAME
+    if os.environ.get("ALPHADESK_WERSS_PASSWORD", "").strip():
+        merged["admin_password"] = DEFAULT_WERSS_ADMIN_PASSWORD
     base_url = str(merged.get("base_url") or "").strip().rstrip("/")
     parsed = urlsplit(base_url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -80,13 +94,23 @@ def normalize_werss_config(config: dict[str, Any] | None = None) -> dict[str, An
     }
 
 
+def public_werss_base_url(config: dict[str, Any] | None = None) -> str:
+    normalized = normalize_werss_config(config)
+    if DEFAULT_WERSS_PUBLIC_URL:
+        return DEFAULT_WERSS_PUBLIC_URL
+    hostname = str(urlsplit(normalized["base_url"]).hostname or "").casefold()
+    return normalized["base_url"] if hostname in {"127.0.0.1", "localhost", "::1"} else ""
+
+
 def public_werss_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
     normalized = normalize_werss_config(config)
+    public_base_url = public_werss_base_url(normalized)
     configured = bool(normalized["access_key"] and normalized["secret_key"])
     admin_password_configured = bool(normalized["admin_password"])
     return {
         **normalized,
-        "management_url": f"{normalized['base_url']}/",
+        "base_url": public_base_url,
+        "management_url": f"{public_base_url}/" if public_base_url else "",
         "credentials_configured": configured,
         "access_key": MASKED_SECRET if configured else "",
         "secret_key": MASKED_SECRET if configured else "",
@@ -288,10 +312,10 @@ def probe_werss_wechat_authorization(config: dict[str, Any] | None = None, sessi
     if not force_refresh and cached and cached[1] > time.time():
         return cached[0]
     try:
-        search_werss_public_accounts(normalized, "证券", session=session, limit=1)
+        data = werss_admin_get(normalized, "auth/qr/status", session=session)
     except Exception:
         return remember_werss_wechat_authorization(normalized, False)
-    return remember_werss_wechat_authorization(normalized, True)
+    return remember_werss_wechat_authorization(normalized, bool(data.get("login_status")) if isinstance(data, dict) else False)
 
 
 def start_werss_wechat_login(config: dict[str, Any] | None = None, session=None) -> dict[str, Any]:
@@ -307,12 +331,40 @@ def start_werss_wechat_login(config: dict[str, Any] | None = None, session=None)
     qr_path = str(data.get("code") if isinstance(data, dict) else "").strip()
     if not qr_path:
         raise RuntimeError("WeRSS 尚未生成微信扫码二维码，请稍后重试")
+    qr_image_url = urljoin(f"{normalized['base_url']}/", qr_path.lstrip("/"))
+    _WERSS_QR_IMAGE_URLS[normalized["base_url"]] = qr_image_url
     return {
         "login_state": "waiting_scan",
         "message": "请使用微信扫描二维码完成授权",
         "authorized": False,
-        "qr_image_url": urljoin(f"{normalized['base_url']}/", qr_path.lstrip("/")),
+        "qr_image_url": qr_image_url,
     }
+
+
+def fetch_werss_qr_image(config: dict[str, Any] | None = None, session=None) -> tuple[bytes, str]:
+    normalized = normalize_werss_config(config)
+    session = session or browser_http_session()
+    qr_image_url = _WERSS_QR_IMAGE_URLS.get(normalized["base_url"]) or urljoin(
+        f"{normalized['base_url']}/",
+        "static/wx_qrcode.png",
+    )
+    for attempt in range(WERSS_QR_IMAGE_RETRY_COUNT):
+        response = session.get(
+            qr_image_url,
+            params={"alphadesk": int(time.time())},
+            timeout=normalized["timeout_seconds"],
+        )
+        if response.status_code != 404 or attempt == WERSS_QR_IMAGE_RETRY_COUNT - 1:
+            break
+        time.sleep(1)
+    response.raise_for_status()
+    content_type = str(response.headers.get("Content-Type") or "image/png").split(";", 1)[0].strip().casefold()
+    if not content_type.startswith("image/"):
+        raise RuntimeError("WeRSS 二维码响应不是图片")
+    content = bytes(response.content)
+    if not content:
+        raise RuntimeError("WeRSS 尚未生成微信登录二维码，请稍后重试")
+    return content, content_type
 
 
 def werss_wechat_login_status(config: dict[str, Any] | None = None, session=None) -> dict[str, Any]:
@@ -575,7 +627,8 @@ def managed_werss_status(config: dict[str, Any] | None = None) -> dict[str, Any]
         except Exception as exc:
             subscription_error = f"{type(exc).__name__}: {exc}"
     rss_status = check_werss(normalized)
-    docker_available = shutil.which("docker") is not None
+    docker_available = managed_werss_start_available() and shutil.which("docker") is not None
+    public_base_url = public_werss_base_url(normalized)
     ready = service_online and rss_status["status"] == "online" and bool(subscriptions)
     return {
         "status": "online" if ready else ("pending" if service_online else "offline"),
@@ -589,11 +642,11 @@ def managed_werss_status(config: dict[str, Any] | None = None) -> dict[str, Any]
         "subscription_error": subscription_error,
         "docker_available": docker_available,
         "docker_engine_available": docker_engine_available() if docker_available else False,
-        "managed_setup_available": WERSS_COMPOSE_PATH.exists(),
-        "management_url": f"{normalized['base_url']}/",
-        "wechat_status_url": f"{normalized['base_url']}/wechat-status",
-        "subscription_url": f"{normalized['base_url']}/wechat/mp",
-        "add_subscription_url": f"{normalized['base_url']}/add-subscription",
+        "managed_setup_available": managed_werss_start_available() and WERSS_COMPOSE_PATH.exists(),
+        "management_url": f"{public_base_url}/" if public_base_url else "",
+        "wechat_status_url": f"{public_base_url}/wechat-status" if public_base_url else "",
+        "subscription_url": f"{public_base_url}/wechat/mp" if public_base_url else "",
+        "add_subscription_url": f"{public_base_url}/add-subscription" if public_base_url else "",
         "onboarding_steps": [
             "点击登录微信公众号",
             "使用微信扫描弹窗中的二维码",
@@ -620,7 +673,13 @@ def docker_engine_available() -> bool:
     return completed.returncode == 0
 
 
+def managed_werss_start_available() -> bool:
+    return WERSS_RUNTIME_MODE not in {"compose", "external"}
+
+
 def start_managed_werss() -> None:
+    if not managed_werss_start_available():
+        raise RuntimeError("WeRSS 由 Docker Compose 统一管理。请在项目目录执行启动脚本，并确认 werss 容器健康。")
     if shutil.which("docker") is None:
         raise RuntimeError("未检测到 Docker。请先安装并启动 Docker Desktop，再启动本地 WeRSS 组件。")
     if not docker_engine_available():

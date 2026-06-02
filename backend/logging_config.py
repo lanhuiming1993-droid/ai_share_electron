@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
 from collections import deque
@@ -14,7 +15,8 @@ from typing import Any
 from zipfile import ZIP_DEFLATED, ZipFile
 
 ROOT = Path(__file__).resolve().parents[1]
-LOG_DIR = ROOT / "data" / "logs"
+DATA_DIR = Path(os.environ.get("ALPHADESK_DATA_DIR", str(ROOT / "data"))).expanduser().resolve()
+LOG_DIR = DATA_DIR / "logs"
 LOG_PATH = LOG_DIR / "alphadesk.jsonl"
 MAX_LOG_BYTES = 8 * 1024 * 1024
 LOG_BACKUP_COUNT = 12

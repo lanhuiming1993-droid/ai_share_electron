@@ -1,0 +1,70 @@
+name: ${COMPOSE_PROJECT_NAME:-alphadesk}
+
+services:
+  web:
+    image: ${ALPHADESK_WEB_IMAGE:-ghcr.io/lanhuiming1993-droid/alphadesk-web:${ALPHADESK_VERSION:-latest}}
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    ports:
+      - "127.0.0.1:${ALPHADESK_PORT:-8080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+
+  api:
+    image: ${ALPHADESK_API_IMAGE:-ghcr.io/lanhuiming1993-droid/alphadesk-api:${ALPHADESK_VERSION:-latest}}
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    environment:
+      ALPHADESK_DATA_DIR: /app/data
+      ALPHADESK_WERSS_MODE: compose
+      ALPHADESK_WERSS_BASE_URL: http://werss:8001
+      ALPHADESK_WERSS_USERNAME: ${WERSS_USERNAME:?Run scripts/init.ps1 or scripts/init.sh first}
+      ALPHADESK_WERSS_PASSWORD: ${WERSS_PASSWORD:?Run scripts/init.ps1 or scripts/init.sh first}
+    expose:
+      - "8765"
+    volumes:
+      - ${ALPHADESK_DATA_ROOT:-./data}/alphadesk:/app/data
+    depends_on:
+      werss:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/health/ready', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 9
+      start_period: 20s
+    restart: unless-stopped
+
+  werss:
+    image: ${ALPHADESK_WERSS_IMAGE:-ghcr.io/lanhuiming1993-droid/alphadesk-werss:${ALPHADESK_VERSION:-latest}}
+    build:
+      context: .
+      dockerfile: docker/werss.Dockerfile
+    environment:
+      USERNAME: ${WERSS_USERNAME:?Run scripts/init.ps1 or scripts/init.sh first}
+      PASSWORD: ${WERSS_PASSWORD:?Run scripts/init.ps1 or scripts/init.sh first}
+      SECRET_KEY: ${WERSS_SECRET_KEY:?Run scripts/init.ps1 or scripts/init.sh first}
+      GATHER.CONTENT: "True"
+      GATHER.CONTENT_AUTO_CHECK: "True"
+      GATHER.CONTENT_AUTO_INTERVAL: "15"
+      RSS_FULL_CONTEXT: "True"
+    expose:
+      - "8001"
+    volumes:
+      - ${ALPHADESK_DATA_ROOT:-./data}/werss:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8001/feed/all.rss"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 20s
+    restart: unless-stopped
