@@ -302,9 +302,28 @@ class MainBehaviorTests(unittest.TestCase):
     def test_mx_har_import_wraps_validation_errors_as_json_http_conflict(self) -> None:
         with patch("backend.import_mx_har.import_har_text", side_effect=ValueError("upstream failed")):
             with self.assertRaises(self.main.HTTPException) as raised:
-                self.main.import_mx_har("web-rumors", self.main.MxHarImportInput(har_text="{}"))
+                self.main.import_mx_har_text("web-rumors", "{}")
         self.assertEqual(raised.exception.status_code, 409)
         self.assertIn("MX HAR 验证失败", raised.exception.detail)
+
+    def test_mx_har_upload_accepts_raw_text_without_json_wrapping(self) -> None:
+        self.assertEqual(
+            self.main.mx_har_text_from_upload("text/plain; charset=utf-8", b'{"log":{"entries":[]}}'),
+            '{"log":{"entries":[]}}',
+        )
+
+    def test_mx_har_upload_preserves_legacy_json_envelope_compatibility(self) -> None:
+        self.assertEqual(
+            self.main.mx_har_text_from_upload("application/json", b'{"har_text":"{\\\"log\\\":{}}"}'),
+            '{"log":{}}',
+        )
+
+    def test_mx_har_upload_rejects_oversized_raw_har_with_readable_http_413(self) -> None:
+        with patch.object(self.main, "MAX_MX_HAR_BYTES", 4):
+            with self.assertRaises(self.main.HTTPException) as raised:
+                self.main.mx_har_text_from_upload("text/plain", b"12345")
+        self.assertEqual(raised.exception.status_code, 413)
+        self.assertIn("HAR 文件过大", raised.exception.detail)
 
     def test_playwright_login_returns_browser_workspace_url(self) -> None:
         with self.main.db() as conn:

@@ -184,7 +184,8 @@ async function request(path, options = {}) {
   const method = options.method || "GET";
   const startedAt = performance.now();
   try {
-    const response = await fetch(API + path, { headers: { "Content-Type": "application/json", "X-Request-ID": requestId }, ...options });
+    const headers = { "Content-Type": "application/json", "X-Request-ID": requestId, ...(options.headers || {}) };
+    const response = await fetch(API + path, { ...options, headers });
     const responseText = await response.text();
     let body = {};
     try {
@@ -193,6 +194,9 @@ async function request(path, options = {}) {
       const plainText = responseText.replace(/\s+/g, " ").trim();
       const readableText = plainText && !/<(?:!doctype|html|head|body)\b/i.test(plainText) ? `：${plainText.slice(0, 240)}` : "";
       body = { detail: `服务返回 HTTP ${response.status}，但响应格式无法识别${readableText}` };
+    }
+    if (response.status === 413 && (!body.detail || body.detail.startsWith("服务返回 HTTP"))) {
+      body.detail = "上传内容超过服务限制（HTTP 413），请精简文件后重试";
     }
     const correlatedId = response.headers.get("X-Request-ID") || requestId;
     if (!response.ok) {
@@ -889,7 +893,8 @@ async function importMxHar() {
     frontendLog("info", "channel.mx_har.import.clicked", "", { channel_id: editingChannel.value.id, file_size: mxHarFile.value.size });
     const result = await request(`/api/channels/${editingChannel.value.id}/import-mx-har`, {
       method: "POST",
-      body: JSON.stringify({ har_text: await mxHarFile.value.text() }),
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+      body: await mxHarFile.value.text(),
     });
     notice.value = `MX 会话已更新并通过验活，抽样读取 ${result.validated_snapshot_count} 条消息`;
     closeChannelModal();
@@ -1880,7 +1885,7 @@ onUnmounted(() => {
           </div>
           <div v-if="editingChannel?.id==='web-rumors'" class="col-span-2 rounded-2xl border border-teal-400/20 bg-teal-400/[.04] p-4">
             <span class="form-label">MX 登录会话 HAR 导入</span>
-            <p class="mt-1 text-xs leading-5 text-slate-500">MX 掉线后，在浏览器重新登录并导出 HAR。这里会先实时验活，再加密替换本地会话；失败文件不会覆盖当前配置。</p>
+            <p class="mt-1 text-xs leading-5 text-slate-500">MX 掉线后，在浏览器重新登录并导出 HAR。这里会先实时验活，再加密替换本地会话；失败文件不会覆盖当前配置。支持最大 32 MB HAR。</p>
             <div class="mt-3 flex flex-wrap items-center gap-3">
               <label class="secondary cursor-pointer">
                 <input type="file" accept=".har,application/json" class="hidden" @change="selectMxHar" />

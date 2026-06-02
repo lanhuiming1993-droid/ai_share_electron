@@ -23,7 +23,7 @@ from cryptography.fernet import Fernet
 from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from backend.agent_runtime import AgentDecision, build_agent_step_prompt
 from backend.db_migrations import LATEST_SCHEMA_REVISION, ensure_migration_ledger, migration_status
@@ -83,6 +83,8 @@ MASKED_SECRET = "****************"
 BROWSER_WORKSPACE_PUBLIC_URL = os.environ.get("ALPHADESK_BROWSER_PUBLIC_URL", "").strip()
 CHANNEL_LOGIN_PROCESSES: dict[str, subprocess.Popen] = {}
 CHANNEL_LOGIN_PROCESSES_LOCK = threading.Lock()
+MAX_MX_HAR_BYTES = 32 * 1024 * 1024
+MAX_MX_HAR_UPLOAD_BYTES = 60 * 1024 * 1024
 MARKET_DATA_DEFAULT_CONFIG = {
     "adapter": "market_data_aggregate",
     "enable_akshare": True,
@@ -2106,22 +2108,42 @@ def update_channel(channel_id: str, payload: ChannelInput) -> dict:
     return {**channel, "group_ids": json.loads(channel["group_ids"])}
 
 
-@app.post("/api/channels/{channel_id}/import-mx-har")
-def import_mx_har(channel_id: str, payload: MxHarImportInput) -> dict:
+def mx_har_text_from_upload(content_type: str, body: bytes) -> str:
+    if len(body) > MAX_MX_HAR_UPLOAD_BYTES:
+        raise HTTPException(413, "HAR 上传内容过大，请只保留 MX 登录和消息请求")
+    try:
+        if content_type.partition(";")[0].strip().lower() == "application/json":
+            har_text = MxHarImportInput.model_validate_json(body).har_text
+        else:
+            har_text = body.decode("utf-8-sig")
+    except (UnicodeDecodeError, ValidationError) as exc:
+        raise HTTPException(422, "HAR 上传格式无法识别，请选择浏览器导出的 HAR 文件") from exc
+    if len(har_text.encode("utf-8")) > MAX_MX_HAR_BYTES:
+        raise HTTPException(413, "HAR 文件过大，请只保留 MX 登录和消息请求")
+    return har_text
+
+
+def import_mx_har_text(channel_id: str, har_text: str) -> dict:
     if channel_id != "web-rumors":
         raise HTTPException(409, "HAR import is only available for the MX source channel")
-    if len(payload.har_text.encode("utf-8")) > 32 * 1024 * 1024:
-        raise HTTPException(413, "HAR file is too large; keep only the MX login and message-list requests")
     try:
         from backend.import_mx_har import import_har_text
 
-        result = import_har_text(payload.har_text)
+        result = import_har_text(har_text)
         log_event(logger, "INFO", "channel.mx_har.imported", channel_id=channel_id, validated_snapshot_count=result.get("validated_snapshot_count", 0))
         return result
     except Exception as exc:
         log_exception(logger, "channel.mx_har.failed", exc, channel_id=channel_id)
         detail = str(redact(str(exc)))[:600]
         raise HTTPException(409, f"MX HAR 验证失败：{detail}") from exc
+
+
+@app.post("/api/channels/{channel_id}/import-mx-har")
+async def import_mx_har(channel_id: str, request: Request) -> dict:
+    return import_mx_har_text(
+        channel_id,
+        mx_har_text_from_upload(request.headers.get("content-type", ""), await request.body()),
+    )
 
 
 @app.delete("/api/channels/{channel_id}")
