@@ -479,7 +479,7 @@ def collect_channel(channel: dict[str, Any], window: dict[str, str], profile: Pa
     if mode == "wechat_rss":
         return collect_werss(channel, window, query)
     if mode == "ima_knowledge_base":
-        return collect_ima_knowledge_base(channel["id"], window, query)
+        return collect_ima_knowledge_base(channel["id"], window, query, channel.get("request_config") or {})
     if mode == "requests":
         if (channel.get("request_config") or {}).get("adapter") == "mx_authorized_request_replay":
             return collect_mx(channel, window, query)

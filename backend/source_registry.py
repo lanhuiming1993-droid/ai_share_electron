@@ -62,7 +62,7 @@ SOURCES = (
         category="private_knowledge_base",
         collection_mode="ima_knowledge_base",
         capabilities=("knowledge_base_search", "knowledge_base_browse", "private_knowledge_retrieval"),
-        credential_mode="openapi_key",
+        credential_mode="encrypted_openapi_key",
         risk_level="medium",
         detail="通过 IMA OpenAPI 搜索可访问知识库，默认覆盖全部可访问知识库，也可用环境变量限定范围。",
     ),

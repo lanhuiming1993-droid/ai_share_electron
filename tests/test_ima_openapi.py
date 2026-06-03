@@ -9,7 +9,9 @@ from backend import ima_openapi
 
 class ImaOpenApiTests(unittest.TestCase):
     def test_collect_ima_knowledge_base_uses_public_metadata_only(self) -> None:
-        def fake_request(api_path: str, body: dict, timeout: int | None = None) -> dict:
+        def fake_request(api_path: str, body: dict, timeout: int | None = None, config: dict | None = None) -> dict:
+            self.assertEqual(config["client_id"], "cid")
+            self.assertEqual(config["api_key"], "secret")
             if api_path == "openapi/wiki/v1/search_knowledge_base":
                 return {
                     "info_list": [
@@ -41,6 +43,7 @@ class ImaOpenApiTests(unittest.TestCase):
                 "ima-knowledge",
                 {"window_start": "2026-06-01T00:00:00+00:00", "window_end": "2026-06-02T00:00:00+00:00"},
                 "卓胜微",
+                {"client_id": "cid", "api_key": "secret"},
             )
         self.assertEqual(len(snapshots), 1)
         payload = json.loads(snapshots[0]["content"])

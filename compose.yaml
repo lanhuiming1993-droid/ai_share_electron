@@ -30,9 +30,6 @@ services:
       ALPHADESK_WERSS_USERNAME: ${WERSS_USERNAME:?Run scripts/init.ps1 or scripts/init.sh first}
       ALPHADESK_WERSS_PASSWORD: ${WERSS_PASSWORD:?Run scripts/init.ps1 or scripts/init.sh first}
       ALPHADESK_BROWSER_PUBLIC_URL: http://127.0.0.1:${ALPHADESK_BROWSER_PORT:-7900}/vnc.html?autoconnect=true&resize=scale
-      ALPHADESK_IMA_CLIENT_ID: ${IMA_OPENAPI_CLIENTID:-}
-      ALPHADESK_IMA_API_KEY: ${IMA_OPENAPI_APIKEY:-}
-      ALPHADESK_IMA_KNOWLEDGE_BASE_IDS: ${IMA_KNOWLEDGE_BASE_IDS:-}
     ports:
       - "127.0.0.1:${ALPHADESK_BROWSER_PORT:-7900}:7900"
     expose:

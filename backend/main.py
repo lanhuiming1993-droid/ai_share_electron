@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from backend.agent_runtime import AgentDecision, build_agent_step_prompt
 from backend.db_migrations import LATEST_SCHEMA_REVISION, ensure_migration_ledger, migration_status
-from backend.ima_openapi import ima_status
+from backend.ima_openapi import DEFAULT_IMA_SKILL_DOWNLOAD_URL, ima_status, normalize_ima_config
 from backend.logging_config import (
     diagnostics_config,
     export_log_bundle,
@@ -268,6 +268,13 @@ class WechatRssConfigInput(BaseModel):
     max_items_per_feed: int = Field(default=100, ge=1, le=500)
 
 
+class ImaConfigInput(BaseModel):
+    client_id: str = Field(default="", max_length=255)
+    api_key: str = Field(default="", repr=False)
+    skill_download_url: str = Field(default=DEFAULT_IMA_SKILL_DOWNLOAD_URL, max_length=1_000)
+    clear_credentials: bool = False
+
+
 class WechatRssSubscriptionInput(BaseModel):
     id: str = Field(min_length=1, max_length=255)
     name: str = Field(min_length=1, max_length=255)
@@ -445,6 +452,21 @@ def wechat_rss_config() -> dict:
 
 def wechat_rss_config_public() -> dict:
     return public_werss_config(wechat_rss_config())
+
+
+def ima_channel_config(include_fallback: bool = True) -> dict:
+    return normalize_ima_config(channel_request_config("ima-knowledge"), include_fallback=include_fallback)
+
+
+def ima_channel_config_public() -> dict:
+    config = ima_channel_config()
+    configured = bool(config.get("client_id") and config.get("api_key"))
+    return {
+        "client_id": config.get("client_id", ""),
+        "api_key": MASKED_SECRET if configured else "",
+        "api_key_configured": configured,
+        "skill_download_url": config.get("skill_download_url") or DEFAULT_IMA_SKILL_DOWNLOAD_URL,
+    }
 
 
 def init_db() -> None:
@@ -1683,6 +1705,8 @@ def dashboard() -> dict:
             channel["market_data_config"] = market_data_config_public()
         if channel["id"] == "wechat-mp-rss":
             channel["wechat_rss_config"] = wechat_rss_config_public()
+        if channel["id"] == "ima-knowledge":
+            channel["ima_config"] = ima_channel_config_public()
     skills = [
         {"name": item.name, "path": str(item.relative_to(ROOT)), "status": "loaded"}
         for item in SKILLS_DIR.iterdir()
@@ -1969,6 +1993,46 @@ def update_wechat_rss_config(payload: WechatRssConfigInput) -> dict:
         credentials_configured=bool(config["access_key"]),
     )
     return {"status": "saved", "config": public_werss_config(config)}
+
+
+@app.put("/api/channels/ima-knowledge/config")
+def update_ima_config(payload: ImaConfigInput) -> dict:
+    existing = ima_channel_config()
+    supplied_api_key = payload.api_key.strip()
+    if payload.clear_credentials:
+        api_key = ""
+    elif supplied_api_key and supplied_api_key != MASKED_SECRET:
+        api_key = supplied_api_key
+    else:
+        api_key = str(existing.get("api_key") or "")
+    config = normalize_ima_config(
+        {
+            "adapter": "ima_openapi",
+            "client_id": payload.client_id.strip(),
+            "api_key": api_key,
+            "skill_download_url": payload.skill_download_url.strip() or DEFAULT_IMA_SKILL_DOWNLOAD_URL,
+            "base_url": "https://ima.qq.com",
+            "timeout_seconds": existing.get("timeout_seconds", 30),
+            "result_limit": existing.get("result_limit", 10),
+        },
+        include_fallback=False,
+    )
+    save_channel_request_config("ima-knowledge", config)
+    with db() as conn:
+        conn.execute(
+            "UPDATE channels SET url=?,status='pending',updated_at=? WHERE id='ima-knowledge'",
+            (config["base_url"], now()),
+        )
+    log_event(
+        logger,
+        "INFO",
+        "channel.ima.config.saved",
+        channel_id="ima-knowledge",
+        client_id_configured=bool(config["client_id"]),
+        api_key_configured=bool(config["api_key"]),
+        skill_download_url=config["skill_download_url"],
+    )
+    return {"status": "saved", "config": ima_channel_config_public()}
 
 
 @app.get("/api/channels/wechat-mp-rss/component-status")
@@ -2347,7 +2411,7 @@ def check_channel(channel_id: str) -> dict:
         log_event(logger, "INFO" if result["status"] == "online" else "WARNING", "channel.check.completed", channel_id=channel_id, status=result["status"], message=result["message"])
         return result
     if channel_id == "ima-knowledge" and channel:
-        result = ima_status()
+        result = ima_status(ima_channel_config())
         with db() as conn:
             conn.execute(
                 "UPDATE channels SET status=?,last_check=?,updated_at=? WHERE id=?",

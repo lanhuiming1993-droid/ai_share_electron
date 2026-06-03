@@ -88,22 +88,19 @@ docker compose --env-file .env -f compose.yaml -f compose.admin.yaml up -d
 
 AlphaDesk 可通过腾讯 IMA OpenAPI 将个人或共享知识库作为本地信源参与采集、报告和个股研究前置证据。
 
-在 `.env` 中配置：
+在页面中打开“信源渠道 -> IMA 知识库 -> 配置”，填写：
 
-```env
-IMA_OPENAPI_CLIENTID=your_client_id
-IMA_OPENAPI_APIKEY=your_api_key
-# 可选：逗号分隔指定知识库 ID；留空时搜索全部可访问知识库。
-IMA_KNOWLEDGE_BASE_IDS=
-```
+- `ClientID`
+- `API Key`
+- `IMA Skill 下载地址`
 
-凭证只注入 `api` 容器，不会写入 SQLite 或日志。配置后重启服务，并在“信源渠道 -> IMA 知识库”点击“检查状态”。
+凭证会写入本地加密配置表，不需要修改源码、Compose 或 `.env`；页面接口只回传掩码，不返回 API Key 明文。保存后点击“检查状态”验证当前 IMA 用户可访问的知识库。
 
 ## 数据与备份
 
 - `data/alphadesk/`：AlphaDesk SQLite、`local.key`、日志和浏览器 profile。
 - `data/werss/`：WeRSS 数据库、公众号授权、订阅和文章库存。
-- `.env`：部署级 WeRSS 管理凭据和可选 IMA OpenAPI 凭据。
+- `.env`：部署级 WeRSS 管理凭据。
 - `backups/`：备份脚本生成的压缩包。
 
 恢复时必须同时恢复 `data/` 和 `.env`。`workbench.db` 与 `local.key` 必须成对保留，否则已加密配置无法解密。

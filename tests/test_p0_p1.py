@@ -366,6 +366,42 @@ class MainBehaviorTests(unittest.TestCase):
         self.assertIn("卓胜微", items[0]["content"])
         self.assertEqual(items[0]["metadata"]["platform"], "ima_knowledge_base")
 
+    def test_ima_config_is_encrypted_masked_and_preserved(self) -> None:
+        saved = self.main.update_ima_config(
+            self.main.ImaConfigInput(
+                client_id="client-a",
+                api_key="secret-a",
+                skill_download_url="https://example.com/ima-skills.zip",
+            )
+        )
+        self.assertEqual(saved["config"]["api_key"], self.main.MASKED_SECRET)
+        self.assertTrue(saved["config"]["api_key_configured"])
+        self.assertEqual(saved["config"]["client_id"], "client-a")
+        with self.main.db() as conn:
+            encrypted = conn.execute(
+                "SELECT encrypted_config FROM channel_request_configs WHERE channel_id='ima-knowledge'"
+            ).fetchone()["encrypted_config"]
+        self.assertNotIn("secret-a", encrypted)
+        self.assertEqual(self.main.channel_request_config("ima-knowledge")["api_key"], "secret-a")
+
+        self.main.update_ima_config(
+            self.main.ImaConfigInput(
+                client_id="client-b",
+                api_key=self.main.MASKED_SECRET,
+                skill_download_url="https://example.com/ima-skills-2.zip",
+            )
+        )
+        preserved = self.main.channel_request_config("ima-knowledge")
+        self.assertEqual(preserved["client_id"], "client-b")
+        self.assertEqual(preserved["api_key"], "secret-a")
+        self.assertEqual(preserved["skill_download_url"], "https://example.com/ima-skills-2.zip")
+
+        cleared = self.main.update_ima_config(
+            self.main.ImaConfigInput(client_id="client-b", api_key="", clear_credentials=True)
+        )
+        self.assertFalse(cleared["config"]["api_key_configured"])
+        self.assertEqual(self.main.channel_request_config("ima-knowledge")["api_key"], "")
+
     def test_mx_har_import_wraps_validation_errors_as_json_http_conflict(self) -> None:
         with patch("backend.import_mx_har.import_har_text", side_effect=ValueError("upstream failed")):
             with self.assertRaises(self.main.HTTPException) as raised:

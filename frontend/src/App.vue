@@ -27,6 +27,7 @@ const editingChannel = ref(null);
 const editingProviderId = ref("");
 const channelForm = reactive({ name: "", type: "", url: "", collection_mode: "playwright", status: "pending", notes: "", validation_url: "", success_url_contains: "", success_selector: "", group_ids: [], parsing_strategy: "hybrid", normalization_quality_threshold: 60, max_scrolls: 8, research_enabled: false });
 const marketDataForm = reactive({ enable_akshare: true, enable_baostock: true, enable_tushare: true, tushare_token: "", tushare_token_configured: false, clear_tushare_token: false, component_timeout_seconds: 35 });
+const imaForm = reactive({ client_id: "", api_key: "", api_key_configured: false, skill_download_url: "https://app-dl.ima.qq.com/skills/ima-skills-1.1.7.zip", clear_credentials: false });
 const wechatRssForm = reactive({ base_url: "http://127.0.0.1:8001", feed_ids_text: "all", access_key: "", secret_key: "", credentials_configured: false, admin_username: "admin", admin_password: "", admin_password_configured: false, clear_credentials: false, timeout_seconds: 20, max_items_per_feed: 100 });
 const wechatRssComponent = reactive({ status: "pending", message: "尚未检查", ready: false, service_online: false, rss_online: false, subscription_count: 0, subscriptions: [], subscription_error: "", docker_available: false, docker_engine_available: false, managed_setup_available: false, management_url: "", onboarding_steps: [] });
 const wechatRssComponentLoading = ref(false);
@@ -96,7 +97,7 @@ function channelStatusDescription(channel) {
   }
   if (channel.status === "offline") {
     if (channel.id === "wechat-mp-rss") return "微信公众号组件不可用，请重新登录或检查高级配置";
-    if (channel.id === "ima-knowledge") return "IMA 凭证或知识库不可用，请检查 .env";
+    if (channel.id === "ima-knowledge") return "IMA 凭证或知识库不可用，请检查渠道配置";
     if (channel.collection_mode === "playwright") return "登录态失效，请重新登录";
     if (channel.id === "web-rumors") return "授权会话失效，请重新导入 HAR";
     return "公开采集暂不可用";
@@ -617,6 +618,8 @@ function openChannelModal(channel = null) {
   Object.assign(channelForm, channel ? { ...channel, research_enabled: Boolean(channel.research_enabled), group_ids: [...(channel.group_ids || [])] } : { name: "", type: "", url: "", collection_mode: "playwright", status: "pending", notes: "", validation_url: "", success_url_contains: "", success_selector: "", group_ids: [], parsing_strategy: "hybrid", normalization_quality_threshold: 60, max_scrolls: 8, research_enabled: false });
   Object.assign(marketDataForm, channel?.market_data_config || { enable_akshare: true, enable_baostock: true, enable_tushare: true, tushare_token: "", tushare_token_configured: false, clear_tushare_token: false, component_timeout_seconds: 35 });
   marketDataForm.clear_tushare_token = false;
+  Object.assign(imaForm, channel?.ima_config || { client_id: "", api_key: "", api_key_configured: false, skill_download_url: "https://app-dl.ima.qq.com/skills/ima-skills-1.1.7.zip" });
+  imaForm.clear_credentials = false;
   const wechatRssConfig = channel?.wechat_rss_config || { base_url: "http://127.0.0.1:8001", feed_ids: ["all"], access_key: "", secret_key: "", credentials_configured: false, admin_username: "admin", admin_password: "", admin_password_configured: false, timeout_seconds: 20, max_items_per_feed: 100 };
   Object.assign(wechatRssForm, { ...wechatRssConfig, feed_ids_text: (wechatRssConfig.feed_ids || ["all"]).join("\n"), clear_credentials: false });
   channelModal.value = true;
@@ -638,6 +641,13 @@ async function saveWechatRssConfiguration() {
   });
 }
 
+async function saveImaConfiguration() {
+  return request("/api/channels/ima-knowledge/config", {
+    method: "PUT",
+    body: JSON.stringify(imaForm),
+  });
+}
+
 async function saveChannel(openLoginAfterSave = false, loginWindow = null) {
   if (!channelForm.name.trim() || !channelForm.type.trim()) {
     notice.value = "请填写渠道名称和渠道类型";
@@ -652,6 +662,9 @@ async function saveChannel(openLoginAfterSave = false, loginWindow = null) {
     }
     if (saved.id === "wechat-mp-rss") {
       await saveWechatRssConfiguration();
+    }
+    if (saved.id === "ima-knowledge") {
+      await saveImaConfiguration();
     }
     notice.value = editingChannel.value ? "渠道配置已更新" : "新渠道已添加";
     closeChannelModal();
@@ -1360,7 +1373,7 @@ onUnmounted(() => {
                 <small v-if="channel.group_ids?.length">星球 ID：{{ channel.group_ids.join('、') }}</small>
                 <small v-if="channel.id==='akshare'">组件：AkShare · BaoStock · TuShare{{ channel.market_data_config?.tushare_token_configured ? '（token 已加密保存）' : '（等待 token）' }}</small>
                 <small v-if="channel.id==='wechat-mp-rss'">微信扫码登录后搜索并加入公众号；采集按严格时间窗读取文章快照</small>
-                <small v-if="channel.id==='ima-knowledge'">默认搜索全部可访问 IMA 知识库；可用环境变量限定知识库范围</small>
+                <small v-if="channel.id==='ima-knowledge'">在配置中维护 ClientID、API Key 和 IMA Skill 下载地址；API Key 仅本地加密保存</small>
                 <small>整理策略：{{ channel.parsing_strategy }} · 质量阈值 {{ channel.normalization_quality_threshold }} · 最大滚动 {{ channel.max_scrolls }}</small>
                 <small>个股补证：{{ channel.research_enabled ? '允许' : '关闭' }}</small>
                 <small v-if="channel.last_check">上次检查：{{ channel.last_check }}</small>
@@ -1895,6 +1908,28 @@ onUnmounted(() => {
                 </label>
               </div>
             </details>
+          </div>
+          <div v-if="editingChannel?.id==='ima-knowledge'" class="col-span-2 rounded-2xl border border-teal-400/20 bg-teal-400/[.04] p-4">
+            <span class="form-label">IMA 知识库 OpenAPI</span>
+            <p class="mt-1 text-xs leading-5 text-slate-500">在这里维护 IMA 用户鉴权和 Skill 下载地址，不需要修改源码或 .env。API Key 仅在本地加密保存，接口只回传掩码。</p>
+            <div class="mt-3 grid grid-cols-2 gap-3">
+              <label>
+                <span class="form-label">ClientID</span>
+                <input v-model="imaForm.client_id" autocomplete="off" placeholder="IMA OpenAPI ClientID" class="field mt-2 w-full" />
+              </label>
+              <label>
+                <span class="form-label">API Key</span>
+                <input v-model="imaForm.api_key" type="password" autocomplete="new-password" :placeholder="imaForm.api_key_configured ? '已加密保存；不填则保留原密钥' : 'IMA OpenAPI API Key'" class="field mt-2 w-full" />
+              </label>
+            </div>
+            <label class="mt-3 block">
+              <span class="form-label">IMA Skill 下载地址</span>
+              <input v-model="imaForm.skill_download_url" autocomplete="off" placeholder="https://app-dl.ima.qq.com/skills/ima-skills-1.1.7.zip" class="field mt-2 w-full" />
+            </label>
+            <div class="mt-3 flex flex-wrap items-center gap-4">
+              <label class="text-xs text-slate-400"><input v-model="imaForm.clear_credentials" type="checkbox" class="mr-2" />清除已保存 API Key</label>
+              <small class="text-xs leading-5 text-slate-600">保存后点击“检查状态”即可验证当前 IMA 用户可访问的知识库。</small>
+            </div>
           </div>
           <label class="flex items-center gap-3 rounded-2xl border border-white/[.07] bg-black/10 px-4 py-3">
             <input v-model="channelForm.research_enabled" type="checkbox" />
