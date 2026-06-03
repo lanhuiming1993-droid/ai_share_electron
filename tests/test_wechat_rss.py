@@ -384,12 +384,12 @@ class WechatRssTests(unittest.TestCase):
             session=session,
         )
         self.assertTrue(result["cleared"])
-        clear_call = next(call for call in session.calls if call["method"] == "POST" and call["url"].endswith("/api/v1/task-queue/clear"))
-        history_call = next(call for call in session.calls if call["method"] == "POST" and call["url"].endswith("/api/v1/task-queue/history/clear"))
-        status_call = next(call for call in session.calls if call["method"] == "GET" and call["url"].endswith("/api/v1/task-queue/status"))
+        clear_call = next(call for call in session.calls if call["method"] == "POST" and call["url"].endswith("/api/v1/wx/task-queue/clear"))
+        history_call = next(call for call in session.calls if call["method"] == "POST" and call["url"].endswith("/api/v1/wx/task-queue/history/clear"))
+        status_call = next(call for call in session.calls if call["method"] == "GET" and call["url"].endswith("/api/v1/wx/task-queue/status"))
         self.assertEqual(clear_call["params"], {"queue_type": "content"})
         self.assertEqual(history_call["params"], {"queue_type": "content"})
-        self.assertEqual(status_call["url"], "http://127.0.0.1:8128/api/v1/task-queue/status")
+        self.assertEqual(status_call["url"], "http://127.0.0.1:8128/api/v1/wx/task-queue/status")
 
     def test_managed_start_explains_missing_docker(self) -> None:
         with patch("backend.wechat_rss.shutil.which", return_value=None):

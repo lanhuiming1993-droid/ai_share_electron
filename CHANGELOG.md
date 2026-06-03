@@ -18,6 +18,12 @@ The project follows [Semantic Versioning](https://semver.org/).
 - WeRSS upstream startup logs exposing deployment environment variables.
 - MX HAR and other API failures returning HTML or plain text that the browser client attempted to parse as JSON.
 
+## [0.2.4] - 2026-06-04
+
+### Fixed
+
+- WeRSS queue maintenance now matches the upstream native console path under `/api/v1/wx/task-queue`.
+
 ## [0.2.3] - 2026-06-04
 
 ### Added
@@ -27,7 +33,7 @@ The project follows [Semantic Versioning](https://semver.org/).
 ### Fixed
 
 - WeRSS manual backfill now accepts up to 100 pages and reports FastAPI validation errors as readable text instead of `[object Object]`.
-- WeRSS queue clearing now targets the upstream `/api/v1/task-queue` routes instead of the wx-only API prefix.
+- WeRSS queue clearing is exposed in AlphaDesk alongside manual backfill controls.
 
 ## [0.2.0] - 2026-06-02
 
@@ -51,6 +57,7 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 - Electron application source, npm dependency, and startup workflow.
 
-[Unreleased]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.2...v0.2.3
 [0.2.0]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/bdd21bb...v0.2.0

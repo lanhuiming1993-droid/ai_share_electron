@@ -40,8 +40,7 @@ WERSS_FEED_PAGE_SIZE = 10
 ROOT = Path(__file__).resolve().parents[1]
 WERSS_INTEGRATION_DIR = ROOT / "integrations" / "werss"
 WERSS_COMPOSE_PATH = WERSS_INTEGRATION_DIR / "compose.yaml"
-WERSS_API_BASE_PREFIX = "/api/v1"
-WERSS_API_PREFIX = f"{WERSS_API_BASE_PREFIX}/wx"
+WERSS_API_PREFIX = "/api/v1/wx"
 WERSS_TOKEN_TTL_SECONDS = 25 * 60
 WERSS_WECHAT_AUTH_TRUE_TTL_SECONDS = 5 * 60
 WERSS_WECHAT_AUTH_FALSE_TTL_SECONDS = 10
@@ -372,7 +371,6 @@ def clear_werss_task_queue(
         normalized,
         "task-queue/clear",
         params={"queue_type": normalized_type},
-        api_prefix=WERSS_API_BASE_PREFIX,
         session=session,
     )
     history_result = None
@@ -381,13 +379,11 @@ def clear_werss_task_queue(
             normalized,
             "task-queue/history/clear",
             params={"queue_type": normalized_type},
-            api_prefix=WERSS_API_BASE_PREFIX,
             session=session,
         )
     status = werss_admin_get(
         normalized,
         "task-queue/status",
-        api_prefix=WERSS_API_BASE_PREFIX,
         session=session,
     )
     queue_label = "文章采集队列" if normalized_type == "main" else "内容补抓队列"

@@ -1,6 +1,6 @@
 {
   "name": "a-share-agent-workbench",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "private": true,
   "scripts": {
     "dev": "concurrently -k \"npm:dev:web\" \"npm:dev:api\"",
