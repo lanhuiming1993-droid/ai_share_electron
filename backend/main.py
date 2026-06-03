@@ -53,6 +53,7 @@ from backend.source_registry import CANONICAL_CHANNEL_NAMES, source_catalog, too
 from backend.subprocess_utils import hidden_window_creationflags
 from backend.wechat_rss import (
     add_werss_subscription,
+    clear_werss_task_queue,
     delete_werss_subscription,
     fetch_werss_qr_image,
     managed_werss_status,
@@ -286,8 +287,13 @@ class WechatRssSubscriptionInput(BaseModel):
 
 class WechatRssBackfillInput(BaseModel):
     subscription_ids: list[str] = Field(default_factory=list, max_length=100)
-    start_page: int = Field(default=0, ge=0, le=20)
-    end_page: int = Field(default=1, ge=1, le=20)
+    start_page: int = Field(default=0, ge=0, le=100)
+    end_page: int = Field(default=1, ge=1, le=100)
+
+
+class WechatRssTaskQueueClearInput(BaseModel):
+    queue_type: Literal["main", "content"] = "main"
+    clear_history: bool = False
 
 
 class ReportPdfInput(BaseModel):
@@ -2354,6 +2360,44 @@ def backfill_wechat_rss_subscriptions(payload: WechatRssBackfillInput) -> dict:
         "subscriptions": status["subscriptions"],
         "subscription_count": status["subscription_count"],
         "message": status["message"],
+        "wechat_authorized": status.get("wechat_authorized", False),
+        "wechat_login_state": status.get("wechat_login_state", "unknown"),
+        "wechat_message": status.get("wechat_message", ""),
+    }
+
+
+@app.post("/api/channels/wechat-mp-rss/task-queue/clear")
+def clear_wechat_rss_task_queue(payload: WechatRssTaskQueueClearInput) -> dict:
+    try:
+        result = clear_werss_task_queue(
+            wechat_rss_config(),
+            queue_type=payload.queue_type,
+            clear_history=payload.clear_history,
+        )
+        status = persist_wechat_rss_status(managed_werss_status(wechat_rss_config()))
+    except Exception as exc:
+        log_exception(
+            logger,
+            "channel.wechat_rss.task_queue.clear_failed",
+            exc,
+            channel_id="wechat-mp-rss",
+            queue_type=payload.queue_type,
+            clear_history=payload.clear_history,
+        )
+        raise HTTPException(409, str(exc)) from exc
+    log_event(
+        logger,
+        "WARNING",
+        "channel.wechat_rss.task_queue.cleared",
+        channel_id="wechat-mp-rss",
+        queue_type=payload.queue_type,
+        clear_history=payload.clear_history,
+    )
+    return {
+        **result,
+        "ready": status["ready"],
+        "subscriptions": status["subscriptions"],
+        "subscription_count": status["subscription_count"],
         "wechat_authorized": status.get("wechat_authorized", False),
         "wechat_login_state": status.get("wechat_login_state", "unknown"),
         "wechat_message": status.get("wechat_message", ""),

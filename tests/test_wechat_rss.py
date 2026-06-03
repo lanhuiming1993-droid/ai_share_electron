@@ -8,6 +8,7 @@ from unittest.mock import patch
 from backend.wechat_rss import (
     add_werss_subscription,
     check_werss,
+    clear_werss_task_queue,
     collect_werss,
     delete_werss_subscription,
     fetch_werss_qr_image,
@@ -373,6 +374,22 @@ class WechatRssTests(unittest.TestCase):
         self.assertEqual(result["status"], "submitted")
         update_call = next(call for call in session.calls if call["method"] == "GET" and "/mps/update/MP_WXS_1" in call["url"])
         self.assertEqual(update_call["params"], {"start_page": 1, "end_page": 3})
+
+    def test_clear_task_queue_uses_werss_task_queue_endpoint(self) -> None:
+        session = WerssApiSession(persistent_authorization=True)
+        result = clear_werss_task_queue(
+            {"base_url": "http://127.0.0.1:8128"},
+            queue_type="content",
+            clear_history=True,
+            session=session,
+        )
+        self.assertTrue(result["cleared"])
+        clear_call = next(call for call in session.calls if call["method"] == "POST" and call["url"].endswith("/api/v1/task-queue/clear"))
+        history_call = next(call for call in session.calls if call["method"] == "POST" and call["url"].endswith("/api/v1/task-queue/history/clear"))
+        status_call = next(call for call in session.calls if call["method"] == "GET" and call["url"].endswith("/api/v1/task-queue/status"))
+        self.assertEqual(clear_call["params"], {"queue_type": "content"})
+        self.assertEqual(history_call["params"], {"queue_type": "content"})
+        self.assertEqual(status_call["url"], "http://127.0.0.1:8128/api/v1/task-queue/status")
 
     def test_managed_start_explains_missing_docker(self) -> None:
         with patch("backend.wechat_rss.shutil.which", return_value=None):

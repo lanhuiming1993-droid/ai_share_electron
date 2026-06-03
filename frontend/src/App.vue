@@ -38,6 +38,7 @@ const wechatRssLoginModal = ref(false);
 const wechatRssLoginLoading = ref(false);
 const wechatRssLogin = reactive({ login_state: "idle", message: "点击登录后获取微信二维码", qr_image_url: "", qr_base_url: "", qr_loaded: false, authorized: false });
 const wechatRssSearch = reactive({ query: "", items: [], loading: false, adding_id: "", removing_id: "", backfilling_id: "", backfilling_all: false, adding_panel_open: false, backfill_start_page: 0, backfill_end_page: 1 });
+const wechatRssQueueClearing = ref("");
 const mxHarFile = ref(null);
 const mxHarImporting = ref(false);
 const inventoryCleanupSubmitting = ref(false);
@@ -225,6 +226,27 @@ async function flushFrontendLogs() {
   }
 }
 
+function formatApiErrorDetail(detail) {
+  if (Array.isArray(detail)) {
+    return detail.map((item) => {
+      if (!item || typeof item !== "object") return String(item);
+      const location = Array.isArray(item.loc) ? item.loc.join(".") : "";
+      const message = item.msg || item.message || JSON.stringify(item);
+      return location ? `${location}: ${message}` : message;
+    }).join("；");
+  }
+  if (detail && typeof detail === "object") {
+    const nested = detail.detail ?? detail.message ?? detail.error;
+    if (nested && nested !== detail) return formatApiErrorDetail(nested);
+    try {
+      return JSON.stringify(detail);
+    } catch {
+      return String(detail);
+    }
+  }
+  return String(detail || "请求失败");
+}
+
 async function request(path, options = {}) {
   const requestId = clientRequestId();
   const method = options.method || "GET";
@@ -246,8 +268,9 @@ async function request(path, options = {}) {
     }
     const correlatedId = response.headers.get("X-Request-ID") || requestId;
     if (!response.ok) {
-      frontendLog("error", "api.request.failed", body.detail || "请求失败", { method, path, status_code: response.status, request_id: correlatedId, latency_ms: Math.round(performance.now() - startedAt) });
-      throw new Error(`${body.detail || "请求失败"} · 请求 ID ${correlatedId}`);
+      const detail = formatApiErrorDetail(body.detail ?? body.message ?? body.error);
+      frontendLog("error", "api.request.failed", detail, { method, path, status_code: response.status, request_id: correlatedId, latency_ms: Math.round(performance.now() - startedAt) });
+      throw new Error(`${detail} · 请求 ID ${correlatedId}`);
     }
     if (method !== "GET" && path !== "/api/diagnostics/frontend-logs") {
       frontendLog("info", "api.request.completed", "", { method, path, status_code: response.status, request_id: correlatedId, latency_ms: Math.round(performance.now() - startedAt) });
@@ -946,13 +969,17 @@ async function backfillWechatRssSubscriptions(item = null) {
   if (!ids.length) return notice.value = "当前没有可补采的公众号订阅";
   if (item?.id) wechatRssSearch.backfilling_id = item.id;
   else wechatRssSearch.backfilling_all = true;
+  const startPage = Math.min(Math.max(Number(wechatRssSearch.backfill_start_page || 0), 0), 100);
+  const endPage = Math.min(Math.max(Number(wechatRssSearch.backfill_end_page || 1), 1), 100);
+  wechatRssSearch.backfill_start_page = startPage;
+  wechatRssSearch.backfill_end_page = endPage;
   try {
     const result = await request("/api/channels/wechat-mp-rss/subscriptions/backfill", {
       method: "POST",
       body: JSON.stringify({
         subscription_ids: ids,
-        start_page: Number(wechatRssSearch.backfill_start_page || 0),
-        end_page: Number(wechatRssSearch.backfill_end_page || 1),
+        start_page: startPage,
+        end_page: endPage,
       }),
     });
     Object.assign(wechatRssComponent, {
@@ -971,6 +998,33 @@ async function backfillWechatRssSubscriptions(item = null) {
   } finally {
     wechatRssSearch.backfilling_id = "";
     wechatRssSearch.backfilling_all = false;
+  }
+}
+
+async function clearWechatRssTaskQueue(queueType = "main", clearHistory = false) {
+  const queueLabel = queueType === "content" ? "内容补抓队列" : "文章采集队列";
+  const targetLabel = clearHistory ? `${queueLabel}历史记录` : `${queueLabel}待执行任务`;
+  if (!window.confirm(`确认清空 WeRSS ${targetLabel}吗？正在执行中的公众号任务不会被中断。`)) return;
+  const clearingKey = `${queueType}:${clearHistory ? "history" : "queue"}`;
+  wechatRssQueueClearing.value = clearingKey;
+  try {
+    const result = await request("/api/channels/wechat-mp-rss/task-queue/clear", {
+      method: "POST",
+      body: JSON.stringify({ queue_type: queueType, clear_history: clearHistory }),
+    });
+    Object.assign(wechatRssComponent, {
+      ready: Boolean(result.ready),
+      subscriptions: result.subscriptions || wechatRssComponent.subscriptions,
+      subscription_count: result.subscription_count ?? wechatRssComponent.subscription_count,
+      wechat_authorized: Boolean(result.wechat_authorized ?? wechatRssComponent.wechat_authorized),
+      wechat_login_state: result.wechat_login_state || wechatRssComponent.wechat_login_state,
+      wechat_message: result.wechat_message || wechatRssComponent.wechat_message,
+    });
+    notice.value = clearHistory ? `${result.message}，历史记录也已清空` : result.message;
+  } catch (error) {
+    notice.value = `WeRSS 队列清理失败：${error.message}`;
+  } finally {
+    wechatRssQueueClearing.value = "";
   }
 }
 
@@ -2122,13 +2176,20 @@ onUnmounted(() => {
                   </div>
                   <div class="flex flex-wrap items-center gap-2 text-xs text-slate-400">
                     <label class="flex items-center gap-2">起始页
-                      <input v-model.number="wechatRssSearch.backfill_start_page" type="number" min="0" max="20" class="field w-20" />
+                      <input v-model.number="wechatRssSearch.backfill_start_page" type="number" min="0" max="100" class="field w-20" />
                     </label>
                     <label class="flex items-center gap-2">页数
-                      <input v-model.number="wechatRssSearch.backfill_end_page" type="number" min="1" max="20" class="field w-20" />
+                      <input v-model.number="wechatRssSearch.backfill_end_page" type="number" min="1" max="100" class="field w-20" />
                     </label>
                     <button type="button" @click="backfillWechatRssSubscriptions()" :disabled="wechatRssSearch.backfilling_all || !(wechatRssComponent.subscriptions || []).length" class="primary disabled:cursor-wait disabled:opacity-60">{{ wechatRssSearch.backfilling_all ? '提交中...' : '补采全部订阅' }}</button>
                   </div>
+                </div>
+                <div class="mt-3 flex flex-wrap items-center gap-2 border-t border-white/[.06] pt-3 text-xs text-slate-500">
+                  <span>队列维护：清队列只移除待执行任务，不会中断当前正在抓取的公众号。</span>
+                  <button type="button" @click="clearWechatRssTaskQueue('main', false)" :disabled="Boolean(wechatRssQueueClearing)" class="secondary disabled:cursor-wait disabled:opacity-60">{{ wechatRssQueueClearing==='main:queue' ? '清理中...' : '清文章队列' }}</button>
+                  <button type="button" @click="clearWechatRssTaskQueue('main', true)" :disabled="Boolean(wechatRssQueueClearing)" class="secondary disabled:cursor-wait disabled:opacity-60">{{ wechatRssQueueClearing==='main:history' ? '清理中...' : '清文章历史' }}</button>
+                  <button type="button" @click="clearWechatRssTaskQueue('content', false)" :disabled="Boolean(wechatRssQueueClearing)" class="secondary disabled:cursor-wait disabled:opacity-60">{{ wechatRssQueueClearing==='content:queue' ? '清理中...' : '清内容队列' }}</button>
+                  <button type="button" @click="clearWechatRssTaskQueue('content', true)" :disabled="Boolean(wechatRssQueueClearing)" class="secondary disabled:cursor-wait disabled:opacity-60">{{ wechatRssQueueClearing==='content:history' ? '清理中...' : '清内容历史' }}</button>
                 </div>
               </div>
 

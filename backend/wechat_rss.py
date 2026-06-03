@@ -40,7 +40,8 @@ WERSS_FEED_PAGE_SIZE = 10
 ROOT = Path(__file__).resolve().parents[1]
 WERSS_INTEGRATION_DIR = ROOT / "integrations" / "werss"
 WERSS_COMPOSE_PATH = WERSS_INTEGRATION_DIR / "compose.yaml"
-WERSS_API_PREFIX = "/api/v1/wx"
+WERSS_API_BASE_PREFIX = "/api/v1"
+WERSS_API_PREFIX = f"{WERSS_API_BASE_PREFIX}/wx"
 WERSS_TOKEN_TTL_SECONDS = 25 * 60
 WERSS_WECHAT_AUTH_TRUE_TTL_SECONDS = 5 * 60
 WERSS_WECHAT_AUTH_FALSE_TTL_SECONDS = 10
@@ -119,8 +120,8 @@ def public_werss_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
     }
 
 
-def werss_api_url(config: dict[str, Any], path: str) -> str:
-    return f"{config['base_url']}{WERSS_API_PREFIX}/{path.lstrip('/')}"
+def werss_api_url(config: dict[str, Any], path: str, *, api_prefix: str = WERSS_API_PREFIX) -> str:
+    return f"{config['base_url']}{api_prefix.rstrip('/')}/{path.lstrip('/')}"
 
 
 def werss_response_data(response) -> Any:
@@ -159,12 +160,19 @@ def werss_admin_token(config: dict[str, Any], session=None, force_refresh: bool 
     return token
 
 
-def werss_admin_get(config: dict[str, Any], path: str, *, params: dict[str, Any] | None = None, session=None) -> Any:
+def werss_admin_get(
+    config: dict[str, Any],
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    api_prefix: str = WERSS_API_PREFIX,
+    session=None,
+) -> Any:
     normalized = normalize_werss_config(config)
     session = session or browser_http_session()
     token = werss_admin_token(normalized, session=session)
     response = session.get(
-        werss_api_url(normalized, path),
+        werss_api_url(normalized, path, api_prefix=api_prefix),
         params=params,
         headers={"Authorization": f"Bearer {token}"},
         timeout=normalized["timeout_seconds"],
@@ -172,7 +180,7 @@ def werss_admin_get(config: dict[str, Any], path: str, *, params: dict[str, Any]
     if response.status_code == 401:
         token = werss_admin_token(normalized, session=session, force_refresh=True)
         response = session.get(
-            werss_api_url(normalized, path),
+            werss_api_url(normalized, path, api_prefix=api_prefix),
             params=params,
             headers={"Authorization": f"Bearer {token}"},
             timeout=normalized["timeout_seconds"],
@@ -180,21 +188,31 @@ def werss_admin_get(config: dict[str, Any], path: str, *, params: dict[str, Any]
     return werss_response_data(response)
 
 
-def werss_admin_post(config: dict[str, Any], path: str, *, json_body: dict[str, Any], session=None) -> Any:
+def werss_admin_post(
+    config: dict[str, Any],
+    path: str,
+    *,
+    json_body: dict[str, Any] | None = None,
+    params: dict[str, Any] | None = None,
+    api_prefix: str = WERSS_API_PREFIX,
+    session=None,
+) -> Any:
     normalized = normalize_werss_config(config)
     session = session or browser_http_session()
     token = werss_admin_token(normalized, session=session)
     response = session.post(
-        werss_api_url(normalized, path),
-        json=json_body,
+        werss_api_url(normalized, path, api_prefix=api_prefix),
+        params=params,
+        json=json_body or {},
         headers={"Authorization": f"Bearer {token}"},
         timeout=normalized["timeout_seconds"],
     )
     if response.status_code == 401:
         token = werss_admin_token(normalized, session=session, force_refresh=True)
         response = session.post(
-            werss_api_url(normalized, path),
-            json=json_body,
+            werss_api_url(normalized, path, api_prefix=api_prefix),
+            params=params,
+            json=json_body or {},
             headers={"Authorization": f"Bearer {token}"},
             timeout=normalized["timeout_seconds"],
         )
@@ -311,8 +329,8 @@ def refresh_werss_subscription_articles(
     normalized_id = str(subscription_id or "").strip()
     if not normalized_id:
         raise ValueError("WeRSS subscription ID cannot be empty")
-    start_page = min(max(int(start_page), 0), 20)
-    end_page = min(max(int(end_page), 1), 20)
+    start_page = min(max(int(start_page), 0), 100)
+    end_page = min(max(int(end_page), 1), 100)
     data = werss_admin_get(
         normalized,
         f"mps/update/{quote(normalized_id, safe='')}",
@@ -333,7 +351,56 @@ def refresh_werss_subscription_articles(
             result["returned_count"] = data.get("total")
         elif isinstance(data.get("list"), list):
             result["returned_count"] = len(data["list"])
+        nested_mps = data.get("mps")
+        if isinstance(nested_mps, dict):
+            result["name"] = str(nested_mps.get("mp_name") or "")
     return result
+
+
+def clear_werss_task_queue(
+    config: dict[str, Any] | None,
+    *,
+    queue_type: str = "main",
+    clear_history: bool = False,
+    session=None,
+) -> dict[str, Any]:
+    normalized = normalize_werss_config(config)
+    normalized_type = str(queue_type or "main").strip().casefold()
+    if normalized_type not in {"main", "content"}:
+        raise ValueError("WeRSS 队列类型只能是 main 或 content")
+    queue_result = werss_admin_post(
+        normalized,
+        "task-queue/clear",
+        params={"queue_type": normalized_type},
+        api_prefix=WERSS_API_BASE_PREFIX,
+        session=session,
+    )
+    history_result = None
+    if clear_history:
+        history_result = werss_admin_post(
+            normalized,
+            "task-queue/history/clear",
+            params={"queue_type": normalized_type},
+            api_prefix=WERSS_API_BASE_PREFIX,
+            session=session,
+        )
+    status = werss_admin_get(
+        normalized,
+        "task-queue/status",
+        api_prefix=WERSS_API_BASE_PREFIX,
+        session=session,
+    )
+    queue_label = "文章采集队列" if normalized_type == "main" else "内容补抓队列"
+    return {
+        "queue_type": normalized_type,
+        "queue_label": queue_label,
+        "cleared": True,
+        "history_cleared": bool(clear_history),
+        "queue_result": queue_result,
+        "history_result": history_result,
+        "queue_status": status if isinstance(status, dict) else {},
+        "message": f"已清空 WeRSS {queue_label}的待执行任务；正在执行的任务不会被中断",
+    }
 
 
 def remember_werss_wechat_authorization(config: dict[str, Any], authorized: bool) -> bool:
