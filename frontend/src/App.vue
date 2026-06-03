@@ -75,6 +75,7 @@ const canonicalChannelNames = {
   akshare: "AkShare 市场数据",
   "industry-news": "产业趋势公开资讯",
   "wechat-mp-rss": "微信公众号（WeRSS）",
+  "ima-knowledge": "IMA 知识库",
   zsxq: "知识星球",
   "web-rumors": "MX 小作文频道",
   "146aa28e21": "TG 小作文频道",
@@ -88,12 +89,14 @@ function channelDisplayName(channelOrId) {
 function channelStatusDescription(channel) {
   if (channel.status === "online") {
     if (channel.id === "wechat-mp-rss") return "微信公众号快照采集可用";
+    if (channel.id === "ima-knowledge") return "IMA 知识库检索可用";
     if (channel.collection_mode === "playwright") return "登录态可用";
     if (channel.id === "web-rumors") return "授权会话可用";
     return "公开采集可用";
   }
   if (channel.status === "offline") {
     if (channel.id === "wechat-mp-rss") return "微信公众号组件不可用，请重新登录或检查高级配置";
+    if (channel.id === "ima-knowledge") return "IMA 凭证或知识库不可用，请检查 .env";
     if (channel.collection_mode === "playwright") return "登录态失效，请重新登录";
     if (channel.id === "web-rumors") return "授权会话失效，请重新导入 HAR";
     return "公开采集暂不可用";
@@ -1357,6 +1360,7 @@ onUnmounted(() => {
                 <small v-if="channel.group_ids?.length">星球 ID：{{ channel.group_ids.join('、') }}</small>
                 <small v-if="channel.id==='akshare'">组件：AkShare · BaoStock · TuShare{{ channel.market_data_config?.tushare_token_configured ? '（token 已加密保存）' : '（等待 token）' }}</small>
                 <small v-if="channel.id==='wechat-mp-rss'">微信扫码登录后搜索并加入公众号；采集按严格时间窗读取文章快照</small>
+                <small v-if="channel.id==='ima-knowledge'">默认搜索全部可访问 IMA 知识库；可用环境变量限定知识库范围</small>
                 <small>整理策略：{{ channel.parsing_strategy }} · 质量阈值 {{ channel.normalization_quality_threshold }} · 最大滚动 {{ channel.max_scrolls }}</small>
                 <small>个股补证：{{ channel.research_enabled ? '允许' : '关闭' }}</small>
                 <small v-if="channel.last_check">上次检查：{{ channel.last_check }}</small>
@@ -1364,7 +1368,7 @@ onUnmounted(() => {
               <div class="flex items-center gap-3">
                 <span :class="channel.status==='online'?'status-good':'status-warn'">{{ channel.status }}</span>
                 <button @click="normalizeExistingChannel(channel)" class="secondary">整理已有快照</button>
-                <button v-if="channel.collection_mode==='playwright' || ['web-rumors','akshare','industry-news','wechat-mp-rss'].includes(channel.id)" @click="checkChannel(channel)" class="secondary">检查状态</button>
+                <button v-if="channel.collection_mode==='playwright' || ['web-rumors','akshare','industry-news','wechat-mp-rss','ima-knowledge'].includes(channel.id)" @click="checkChannel(channel)" class="secondary">检查状态</button>
                 <button @click="openChannelModal(channel)" class="secondary">配置</button>
               </div>
             </div>
@@ -1775,6 +1779,7 @@ onUnmounted(() => {
               <option value="akshare">AkShare 模块</option>
               <option value="industry_news">产业趋势公开资讯</option>
               <option value="wechat_rss">微信公众号 WeRSS RSS</option>
+              <option value="ima_knowledge_base">IMA 知识库 OpenAPI</option>
               <option value="requests">HTTP requests</option>
               <option value="playwright">Playwright 持久化浏览器</option>
               <option value="manual">人工补充</option>

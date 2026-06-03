@@ -339,6 +339,33 @@ class MainBehaviorTests(unittest.TestCase):
         self.assertEqual(tg_items[0]["content"], "world")
         self.assertGreaterEqual(tg_items[0]["quality_score"], 80)
 
+    def test_fixed_normalizer_splits_ima_knowledge_results(self) -> None:
+        snapshot = {
+            "channel_id": "ima-knowledge",
+            "occurred_at": timestamp(),
+            "collected_at": timestamp(),
+            "source_url": "ima://knowledge/hashed",
+            "content": json.dumps(
+                {
+                    "platform": "ima_knowledge_base",
+                    "adapter": "ima_openapi",
+                    "query": "卓胜微",
+                    "knowledge_base": {"name": "每日复盘更新", "description": "每日AI自动抓取复盘"},
+                    "results": [
+                        {"title": "卓胜微纪要", "snippet": "卓胜微 射频前端 复盘", "folder": "复盘"},
+                        {"title": "半导体更新", "snippet": "CIS 与射频链条"},
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        }
+        items, note = self.main.fixed_normalized_items(snapshot)
+        self.assertEqual(note, "")
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0]["author"], "每日复盘更新")
+        self.assertIn("卓胜微", items[0]["content"])
+        self.assertEqual(items[0]["metadata"]["platform"], "ima_knowledge_base")
+
     def test_mx_har_import_wraps_validation_errors_as_json_http_conflict(self) -> None:
         with patch("backend.import_mx_har.import_har_text", side_effect=ValueError("upstream failed")):
             with self.assertRaises(self.main.HTTPException) as raised:

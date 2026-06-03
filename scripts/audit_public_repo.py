@@ -27,6 +27,7 @@ SECRET_PATTERNS = {
     "OpenAI API key": re.compile(r"\bsk-(?!test-)[A-Za-z0-9_-]{16,}\b"),
     "GitHub token": re.compile(r"\b(?:ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b"),
     "AWS access key": re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    "IMA API key": re.compile(r"\b(?:IMA_OPENAPI_APIKEY\s*=|APIKEY\s*:)\s*[A-Za-z0-9+/=]{32,}\b"),
     "private key": re.compile(r"BEGIN (?:RSA |OPENSSH |EC |DSA )?PRIVATE KEY"),
 }
 

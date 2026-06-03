@@ -27,6 +27,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from backend.agent_runtime import AgentDecision, build_agent_step_prompt
 from backend.db_migrations import LATEST_SCHEMA_REVISION, ensure_migration_ledger, migration_status
+from backend.ima_openapi import ima_status
 from backend.logging_config import (
     diagnostics_config,
     export_log_bundle,
@@ -189,7 +190,7 @@ class ChannelInput(BaseModel):
     name: str
     type: str
     url: str = ""
-    collection_mode: Literal["akshare", "industry_news", "wechat_rss", "requests", "playwright", "manual"] = "playwright"
+    collection_mode: Literal["akshare", "industry_news", "wechat_rss", "ima_knowledge_base", "requests", "playwright", "manual"] = "playwright"
     status: Literal["online", "pending", "offline"] = "pending"
     notes: str = ""
     validation_url: str = ""
@@ -778,6 +779,40 @@ def init_db() -> None:
             WHERE id='wechat-mp-rss'
             """
         )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO channels(
+              id,name,type,url,collection_mode,status,notes,parsing_strategy,
+              normalization_quality_threshold,max_scrolls,research_enabled,builtin,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "ima-knowledge",
+                "IMA 知识库",
+                "私有知识库检索",
+                "https://ima.qq.com",
+                "ima_knowledge_base",
+                "pending",
+                "通过 IMA OpenAPI 读取可访问知识库；默认搜索全部可访问知识库，也可用环境变量限定范围",
+                "fixed",
+                82,
+                1,
+                1,
+                1,
+                now(),
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE channels
+            SET name='IMA 知识库',type='私有知识库检索',url='https://ima.qq.com',
+                collection_mode='ima_knowledge_base',
+                notes='通过 IMA OpenAPI 读取可访问知识库；默认搜索全部可访问知识库，也可用环境变量限定范围',
+                parsing_strategy='fixed',normalization_quality_threshold=82,max_scrolls=1,
+                research_enabled=1,builtin=1
+            WHERE id='ima-knowledge'
+            """
+        )
         provider_count = conn.execute("SELECT COUNT(*) AS count FROM model_providers").fetchone()["count"]
         legacy_provider = conn.execute("SELECT value FROM settings WHERE key='provider'").fetchone()
         if not provider_count and legacy_provider:
@@ -1294,6 +1329,42 @@ def fixed_normalized_items(snapshot: sqlite3.Row, mode: str = "fixed") -> tuple[
                 "normalization_mode": mode,
             }
         ], ""
+    if isinstance(payload, dict) and payload.get("platform") == "ima_knowledge_base":
+        kb = payload.get("knowledge_base") if isinstance(payload.get("knowledge_base"), dict) else {}
+        results = payload.get("results") if isinstance(payload.get("results"), list) else []
+        items = []
+        for result in results[:100]:
+            if not isinstance(result, dict):
+                continue
+            title = str(result.get("title") or "").strip()
+            snippet = str(result.get("snippet") or "").strip()
+            if not title and not snippet:
+                continue
+            item_content = "\n".join(part for part in (title, snippet) if part).strip()
+            items.append(
+                {
+                    "item_key": stable_item_key(snapshot["channel_id"], source_url, occurred_at, title, item_content),
+                    "occurred_at": occurred_at,
+                    "author": str(kb.get("name") or "IMA 知识库")[:255],
+                    "title": title[:500],
+                    "content": item_content,
+                    "source_url": source_url,
+                    "attachments": [],
+                    "metadata": {
+                        "platform": payload["platform"],
+                        "adapter": payload.get("adapter", ""),
+                        "query": payload.get("query", ""),
+                        "knowledge_base": kb,
+                        "folder": result.get("folder", ""),
+                        "media_type": result.get("media_type", ""),
+                    },
+                    "quality_score": 82 if snippet else 65,
+                    "normalization_mode": mode,
+                }
+            )
+        if items:
+            return items, ""
+        return [], "IMA knowledge base returned no displayable results"
     if isinstance(payload, dict) and payload.get("adapter") == "market_data_aggregate":
         return [
             {
@@ -2275,6 +2346,15 @@ def check_channel(channel_id: str) -> dict:
         result = persist_wechat_rss_status(managed_werss_status(wechat_rss_config()))
         log_event(logger, "INFO" if result["status"] == "online" else "WARNING", "channel.check.completed", channel_id=channel_id, status=result["status"], message=result["message"])
         return result
+    if channel_id == "ima-knowledge" and channel:
+        result = ima_status()
+        with db() as conn:
+            conn.execute(
+                "UPDATE channels SET status=?,last_check=?,updated_at=? WHERE id=?",
+                (result["status"], result["checked_at"], result["checked_at"], channel_id),
+            )
+        log_event(logger, "INFO" if result["status"] == "online" else "WARNING", "channel.check.completed", channel_id=channel_id, status=result["status"], message=result["message"])
+        return result
     if channel:
         request_config = channel_request_config(channel_id)
         if request_config.get("adapter") == "mx_authorized_request_replay":
@@ -2328,11 +2408,11 @@ def refresh_browser_channel_states() -> None:
         channels = [
             dict(row)
             for row in conn.execute(
-                "SELECT id FROM channels WHERE collection_mode='playwright' OR id IN ('web-rumors','akshare','industry-news','wechat-mp-rss')"
+                "SELECT id FROM channels WHERE collection_mode='playwright' OR id IN ('web-rumors','akshare','industry-news','wechat-mp-rss','ima-knowledge')"
             )
         ]
     for channel in channels:
-        if channel["id"] in ("web-rumors", "akshare", "industry-news", "wechat-mp-rss") or browser_profile(channel["id"]).exists():
+        if channel["id"] in ("web-rumors", "akshare", "industry-news", "wechat-mp-rss", "ima-knowledge") or browser_profile(channel["id"]).exists():
             try:
                 check_channel(channel["id"])
             except Exception as exc:
@@ -3221,7 +3301,7 @@ def save_agent_state(task_id: str, state: dict, status: str | None = None, error
 def channel_ids_for_layer(layer: str) -> list[str]:
     modes = {
         "akshare": ("akshare",),
-        "http_requests": ("requests", "industry_news"),
+        "http_requests": ("requests", "industry_news", "ima_knowledge_base"),
         "playwright": ("playwright",),
     }.get(layer)
     if not modes:
