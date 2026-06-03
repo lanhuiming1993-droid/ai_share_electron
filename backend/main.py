@@ -15,7 +15,7 @@ from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from uuid import uuid4
 
 import requests
@@ -59,6 +59,7 @@ from backend.wechat_rss import (
     managed_werss_start_available,
     normalize_werss_config,
     public_werss_config,
+    refresh_werss_subscription_articles,
     search_werss_public_accounts,
     start_managed_werss,
     start_werss_wechat_login,
@@ -86,6 +87,7 @@ CHANNEL_LOGIN_PROCESSES: dict[str, subprocess.Popen] = {}
 CHANNEL_LOGIN_PROCESSES_LOCK = threading.Lock()
 MAX_MX_HAR_BYTES = 32 * 1024 * 1024
 MAX_MX_HAR_UPLOAD_BYTES = 60 * 1024 * 1024
+MAX_REPORT_PDF_HTML_BYTES = 5 * 1024 * 1024
 SNAPSHOT_LIST_PREVIEW_CHARS = 6_000
 SNAPSHOT_DETAIL_PREVIEW_CHARS = 120_000
 SNAPSHOT_DETAIL_PREVIEW_MAX_CHARS = 200_000
@@ -280,6 +282,17 @@ class WechatRssSubscriptionInput(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     avatar: str = Field(default="", max_length=1_000)
     intro: str = Field(default="", max_length=1_000)
+
+
+class WechatRssBackfillInput(BaseModel):
+    subscription_ids: list[str] = Field(default_factory=list, max_length=100)
+    start_page: int = Field(default=0, ge=0, le=20)
+    end_page: int = Field(default=1, ge=1, le=20)
+
+
+class ReportPdfInput(BaseModel):
+    title: str = Field(default="AlphaDesk 报告", max_length=255)
+    html: str = Field(min_length=1, max_length=MAX_REPORT_PDF_HTML_BYTES)
 
 
 class FrontendLogInput(BaseModel):
@@ -1681,6 +1694,88 @@ def export_diagnostics_logs():
     )
 
 
+REPORT_PDF_PRINT_STYLE = """
+<style id="alphadesk-pdf-print-style">
+@page { size: A4; margin: 14mm 12mm; }
+html, body { background: #ffffff !important; }
+body {
+  -webkit-print-color-adjust: exact;
+  print-color-adjust: exact;
+  word-break: break-word;
+}
+main, article, section, table, pre, blockquote, img {
+  break-inside: avoid-page;
+}
+h1, h2, h3, h4 {
+  break-after: avoid-page;
+}
+img, svg, canvas {
+  max-width: 100% !important;
+  height: auto !important;
+}
+pre, code {
+  white-space: pre-wrap;
+}
+</style>
+""".strip()
+
+
+def inject_report_pdf_print_style(html: str) -> str:
+    text = html.strip()
+    if not re.search(r"<html(?:\s|>)", text, re.I):
+        return (
+            "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
+            f"{REPORT_PDF_PRINT_STYLE}</head><body>{text}</body></html>"
+        )
+    if re.search(r"</head>", text, re.I):
+        return re.sub(r"</head>", f"{REPORT_PDF_PRINT_STYLE}</head>", text, count=1, flags=re.I)
+    return re.sub(r"<html([^>]*)>", f"<html\\1><head>{REPORT_PDF_PRINT_STYLE}</head>", text, count=1, flags=re.I)
+
+
+def report_download_filename(title: str, extension: str) -> str:
+    stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", title or "AlphaDesk 报告").strip()[:100] or "AlphaDesk 报告"
+    return f"{stem}.{extension.lstrip('.') or 'pdf'}"
+
+
+@app.post("/api/reports/export/pdf")
+def export_report_pdf(payload: ReportPdfInput) -> Response:
+    html_bytes = payload.html.encode("utf-8")
+    if len(html_bytes) > MAX_REPORT_PDF_HTML_BYTES:
+        raise HTTPException(413, "报告 HTML 过大，暂不支持直接导出 PDF")
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        raise HTTPException(500, f"后端缺少 Playwright PDF 渲染环境：{exc}") from exc
+
+    try:
+        with sync_playwright() as playwright:
+            browser = playwright.chromium.launch(headless=True)
+            try:
+                page = browser.new_page(
+                    viewport={"width": 794, "height": 1123},
+                    device_scale_factor=1,
+                )
+                page.set_content(inject_report_pdf_print_style(payload.html), wait_until="networkidle", timeout=30_000)
+                pdf = page.pdf(
+                    format="A4",
+                    print_background=True,
+                    prefer_css_page_size=True,
+                    margin={"top": "0", "right": "0", "bottom": "0", "left": "0"},
+                )
+            finally:
+                browser.close()
+    except Exception as exc:
+        log_exception(logger, "report.pdf_export.failed", exc)
+        raise HTTPException(500, f"PDF 导出失败：{exc}") from exc
+
+    filename = report_download_filename(payload.title, "pdf")
+    return Response(
+        content=pdf,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="report.pdf"; filename*=UTF-8\'\'{quote(filename)}'},
+    )
+
+
 def channel_names_for_ids(channel_ids: list[str], names: dict[str, str] | None = None) -> list[str]:
     if names is None:
         with db() as conn:
@@ -2110,6 +2205,9 @@ def wechat_rss_login_status() -> dict:
                 "ready": status["ready"],
                 "subscriptions": status["subscriptions"],
                 "subscription_count": status["subscription_count"],
+                "wechat_authorized": status.get("wechat_authorized", False),
+                "wechat_login_state": status.get("wechat_login_state", "unknown"),
+                "wechat_message": status.get("wechat_message", ""),
             }
         )
         log_event(
@@ -2136,6 +2234,11 @@ def wechat_rss_subscriptions() -> dict:
         "subscriptions": status["subscriptions"],
         "subscription_count": status["subscription_count"],
         "message": status["message"],
+        "wechat_authorized": status.get("wechat_authorized", False),
+        "wechat_login_state": status.get("wechat_login_state", "unknown"),
+        "wechat_message": status.get("wechat_message", ""),
+        "admin_authorized": status.get("admin_authorized", False),
+        "qr_available": status.get("qr_available", False),
     }
 
 
@@ -2164,6 +2267,10 @@ def add_wechat_rss_subscription(payload: WechatRssSubscriptionInput) -> dict:
         "ready": status["ready"],
         "subscriptions": status["subscriptions"],
         "subscription_count": status["subscription_count"],
+        "message": status["message"],
+        "wechat_authorized": status.get("wechat_authorized", False),
+        "wechat_login_state": status.get("wechat_login_state", "unknown"),
+        "wechat_message": status.get("wechat_message", ""),
     }
 
 
@@ -2181,6 +2288,75 @@ def remove_wechat_rss_subscription(subscription_id: str) -> dict:
         "ready": status["ready"],
         "subscriptions": status["subscriptions"],
         "subscription_count": status["subscription_count"],
+        "message": status["message"],
+        "wechat_authorized": status.get("wechat_authorized", False),
+        "wechat_login_state": status.get("wechat_login_state", "unknown"),
+        "wechat_message": status.get("wechat_message", ""),
+    }
+
+
+@app.post("/api/channels/wechat-mp-rss/subscriptions/backfill")
+def backfill_wechat_rss_subscriptions(payload: WechatRssBackfillInput) -> dict:
+    config = wechat_rss_config()
+    status = persist_wechat_rss_status(managed_werss_status(config))
+    requested_ids = [item.strip() for item in payload.subscription_ids if item.strip()]
+    if requested_ids:
+        subscription_ids = list(dict.fromkeys(requested_ids))
+    else:
+        subscription_ids = [
+            str(item.get("id") or "").strip()
+            for item in status.get("subscriptions", [])
+            if str(item.get("id") or "").strip() and item.get("enabled", True)
+        ]
+    if not subscription_ids:
+        raise HTTPException(409, "No WeRSS subscriptions are available for backfill")
+    results = []
+    for subscription_id in subscription_ids:
+        try:
+            results.append(
+                refresh_werss_subscription_articles(
+                    config,
+                    subscription_id,
+                    start_page=payload.start_page,
+                    end_page=payload.end_page,
+                )
+            )
+        except Exception as exc:
+            log_exception(
+                logger,
+                "channel.wechat_rss.subscription.backfill_failed",
+                exc,
+                channel_id="wechat-mp-rss",
+                subscription_id=subscription_id,
+            )
+            results.append({"id": subscription_id, "status": "failed", "message": str(exc)})
+    submitted_count = sum(1 for item in results if item.get("status") == "submitted")
+    failed_count = len(results) - submitted_count
+    response_status = "submitted" if submitted_count and not failed_count else ("partial" if submitted_count else "failed")
+    log_event(
+        logger,
+        "INFO" if submitted_count else "WARNING",
+        "channel.wechat_rss.subscription.backfill_requested",
+        channel_id="wechat-mp-rss",
+        requested_count=len(subscription_ids),
+        submitted_count=submitted_count,
+        failed_count=failed_count,
+        start_page=payload.start_page,
+        end_page=payload.end_page,
+    )
+    return {
+        "status": response_status,
+        "count": len(results),
+        "submitted_count": submitted_count,
+        "failed_count": failed_count,
+        "results": results,
+        "ready": status["ready"],
+        "subscriptions": status["subscriptions"],
+        "subscription_count": status["subscription_count"],
+        "message": status["message"],
+        "wechat_authorized": status.get("wechat_authorized", False),
+        "wechat_login_state": status.get("wechat_login_state", "unknown"),
+        "wechat_message": status.get("wechat_message", ""),
     }
 
 

@@ -15,6 +15,7 @@ from backend.wechat_rss import (
     managed_werss_status,
     parse_werss_feed,
     public_werss_config,
+    refresh_werss_subscription_articles,
     search_werss_public_accounts,
     start_managed_werss,
     start_werss_wechat_login,
@@ -79,12 +80,27 @@ class FakeResponse:
 
 
 class FakeSession:
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, admin_authorized: bool = False) -> None:
         self.text = text
         self.calls: list[dict] = []
+        self.admin_authorized = admin_authorized
+
+    def post(self, url: str, **kwargs):
+        if not self.admin_authorized:
+            raise AttributeError("post")
+        self.calls.append({"method": "POST", "url": url, **kwargs})
+        if url.endswith("/auth/login"):
+            return FakeResponse("", url, {"code": 0, "data": {"access_token": "admin-token"}})
+        return FakeResponse("", url, {"code": 0, "data": {}})
 
     def get(self, url: str, **kwargs):
         self.calls.append({"url": url, **kwargs})
+        if not self.admin_authorized and (url.endswith("/auth/verify") or url.endswith("/auth/qr/status")):
+            raise RuntimeError("admin disabled")
+        if url.endswith("/auth/verify"):
+            return FakeResponse("", url, {"code": 0, "data": {"is_valid": True, "username": "admin"}})
+        if url.endswith("/auth/qr/status"):
+            return FakeResponse("", url, {"code": 0, "data": {"login_status": True, "qr_code": False}})
         return FakeResponse(self.text, url)
 
 
@@ -147,11 +163,15 @@ class WerssApiSession:
 
     def get(self, url: str, **kwargs):
         self.calls.append({"method": "GET", "url": url, **kwargs})
-        if url.endswith("/auth/qr/code"):
+        if url.endswith("/auth/verify"):
+            payload = {"code": 0, "data": {"is_valid": True, "username": "admin"}}
+        elif url.endswith("/auth/qr/code"):
             self.qr_generated = True
             payload = {"code": 0, "data": {"code": "/static/wx_qrcode.png?t=1", "is_exists": True}}
         elif url.endswith("/auth/qr/status"):
             payload = {"code": 0, "data": {"login_status": self.persistent_authorization or (self.qr_login_status and self.qr_generated), "qr_code": self.qr_generated}}
+        elif "/mps/update/" in url:
+            payload = {"code": 0, "data": {"time_span": 3600, "list": [], "total": 0}}
         elif "/mps/search/" in url:
             payload = {
                 "code": 0,
@@ -274,7 +294,7 @@ class WechatRssTests(unittest.TestCase):
         self.assertIn("抽样读取 0 条文章", result["message"])
 
     def test_component_status_exposes_qr_login_console_without_requiring_docker(self) -> None:
-        session = FakeSession("<rss version=\"2.0\"><channel></channel></rss>")
+        session = FakeSession("<rss version=\"2.0\"><channel></channel></rss>", admin_authorized=True)
         with patch("backend.wechat_rss.browser_http_session", return_value=session), patch("backend.wechat_rss.fetch_werss_subscriptions", return_value=[{"id": "MP_WXS_1", "name": "产业研究"}]), patch("backend.wechat_rss.shutil.which", return_value=None):
             result = managed_werss_status()
         self.assertTrue(result["service_online"])
@@ -340,6 +360,19 @@ class WechatRssTests(unittest.TestCase):
         self.assertEqual(add_call["json"]["mp_id"], "ZmFrZS1pZA==")
         delete_call = next(call for call in session.calls if call["method"] == "DELETE")
         self.assertTrue(delete_call["url"].endswith("/mps/MP_WXS_1"))
+
+    def test_refresh_subscription_articles_uses_werss_update_endpoint(self) -> None:
+        session = WerssApiSession(persistent_authorization=True)
+        result = refresh_werss_subscription_articles(
+            {"base_url": "http://127.0.0.1:8127"},
+            "MP_WXS_1",
+            start_page=1,
+            end_page=3,
+            session=session,
+        )
+        self.assertEqual(result["status"], "submitted")
+        update_call = next(call for call in session.calls if call["method"] == "GET" and "/mps/update/MP_WXS_1" in call["url"])
+        self.assertEqual(update_call["params"], {"start_page": 1, "end_page": 3})
 
     def test_managed_start_explains_missing_docker(self) -> None:
         with patch("backend.wechat_rss.shutil.which", return_value=None):

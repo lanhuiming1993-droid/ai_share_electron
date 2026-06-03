@@ -12,6 +12,7 @@ const notice = ref("");
 const selectedReport = ref("");
 const selectedReportTitle = ref("");
 const reportModal = ref(false);
+const reportPdfExporting = ref(false);
 const sourceJobSubmitting = ref(false);
 const sourceJobFeedback = ref("");
 const sourceJobFeedbackType = ref("info");
@@ -30,12 +31,13 @@ const marketDataForm = reactive({ enable_akshare: true, enable_baostock: true, e
 const imaForm = reactive({ client_id: "", api_key: "", api_key_configured: false, skill_download_url: "https://app-dl.ima.qq.com/skills/ima-skills-1.1.7.zip", clear_credentials: false });
 const wechatRssForm = reactive({ base_url: "http://127.0.0.1:8001", feed_ids_text: "all", access_key: "", secret_key: "", credentials_configured: false, admin_username: "admin", admin_password: "", admin_password_configured: false, clear_credentials: false, timeout_seconds: 20, max_items_per_feed: 100 });
 const wechatRssComponent = reactive({ status: "pending", message: "尚未检查", ready: false, service_online: false, rss_online: false, subscription_count: 0, subscriptions: [], subscription_error: "", docker_available: false, docker_engine_available: false, managed_setup_available: false, management_url: "", onboarding_steps: [] });
+Object.assign(wechatRssComponent, { wechat_authorized: false, wechat_login_state: "unknown", wechat_message: "", admin_authorized: false, qr_available: false });
 const wechatRssComponentLoading = ref(false);
 const wechatRssStarting = ref(false);
 const wechatRssLoginModal = ref(false);
 const wechatRssLoginLoading = ref(false);
 const wechatRssLogin = reactive({ login_state: "idle", message: "点击登录后获取微信二维码", qr_image_url: "", qr_base_url: "", qr_loaded: false, authorized: false });
-const wechatRssSearch = reactive({ query: "", items: [], loading: false, adding_id: "", removing_id: "" });
+const wechatRssSearch = reactive({ query: "", items: [], loading: false, adding_id: "", removing_id: "", backfilling_id: "", backfilling_all: false, adding_panel_open: false, backfill_start_page: 0, backfill_end_page: 1 });
 const mxHarFile = ref(null);
 const mxHarImporting = ref(false);
 const inventoryCleanupSubmitting = ref(false);
@@ -72,6 +74,7 @@ const readyTools = computed(() => data.tools.filter((x) => x.status === "ready")
 const pendingChannels = computed(() => data.channels.filter((x) => x.status === "pending").length);
 const pageTitle = computed(() => pageMeta[activePage.value][0]);
 const pageSubtitle = computed(() => pageMeta[activePage.value][1]);
+const wechatRssAuthorized = computed(() => Boolean(wechatRssComponent.wechat_authorized || wechatRssLogin.authorized || wechatRssComponent.ready));
 const canonicalChannelNames = {
   akshare: "AkShare 市场数据",
   "industry-news": "产业趋势公开资讯",
@@ -142,6 +145,44 @@ watch(activePage, (page, previousPage) => {
 
 function clientRequestId() {
   return globalThis.crypto?.randomUUID?.().replaceAll("-", "").slice(0, 12) || `${Date.now()}${Math.random()}`.replace(".", "").slice(-12);
+}
+
+const beijingTimeFormatter = new Intl.DateTimeFormat("zh-CN", {
+  timeZone: "Asia/Shanghai",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hourCycle: "h23",
+  hour12: false,
+});
+
+function formatBeijingTime(value) {
+  if (!value) return "";
+  if (value instanceof Date) {
+    if (Number.isNaN(value.getTime())) return "";
+    const parts = Object.fromEntries(beijingTimeFormatter.formatToParts(value).map((part) => [part.type, part.value]));
+    return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
+  }
+  const text = String(value).trim();
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:/.test(text) ? text.replace(" ", "T") : text;
+  const date = new Date(normalized);
+  if (Number.isNaN(date.getTime())) return text;
+  const parts = Object.fromEntries(beijingTimeFormatter.formatToParts(date).map((part) => [part.type, part.value]));
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
+}
+
+function localizeReportTimestamps(report) {
+  return String(report || "").replace(
+    /\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:?\d{2})?\b/g,
+    (match) => {
+      const date = new Date(match.replace(" ", "T"));
+      if (Number.isNaN(date.getTime())) return match;
+      return `${formatBeijingTime(date)} 北京时间`;
+    },
+  );
 }
 
 function sanitizeClientContext(value, key = "") {
@@ -406,6 +447,13 @@ async function exportJobReport(job) {
   try {
     const result = await request(`/api/source-jobs/${job.id}/report`);
     downloadReportHtml(result.report, result.report_title || job.report_title);
+  } catch (error) { notice.value = error.message; }
+}
+
+async function exportJobReportPdf(job) {
+  try {
+    const result = await request(`/api/source-jobs/${job.id}/report`);
+    await downloadReportPdf(result.report, result.report_title || job.report_title);
   } catch (error) { notice.value = error.message; }
 }
 
@@ -746,7 +794,7 @@ async function refreshWechatRssComponentStatus() {
   try {
     Object.assign(wechatRssComponent, await request("/api/channels/wechat-mp-rss/component-status"));
   } catch (error) {
-    Object.assign(wechatRssComponent, { status: "offline", message: error.message, service_online: false, rss_online: false });
+    Object.assign(wechatRssComponent, { status: "offline", message: error.message, service_online: false, rss_online: false, wechat_authorized: false, wechat_login_state: "failed", wechat_message: error.message });
   } finally {
     wechatRssComponentLoading.value = false;
   }
@@ -815,6 +863,8 @@ async function syncWechatRssSubscriptions({ quiet = false } = {}) {
 }
 
 async function searchWechatRssAccounts() {
+  if (!wechatRssAuthorized.value) return notice.value = "微信授权无效，请先扫码登录微信公众号";
+  wechatRssSearch.adding_panel_open = true;
   const query = wechatRssSearch.query.trim();
   if (!query) return notice.value = "请输入公众号名称或关键词";
   wechatRssSearch.loading = true;
@@ -829,6 +879,14 @@ async function searchWechatRssAccounts() {
   }
 }
 
+function openWechatRssSubscriptionPanel() {
+  if (!wechatRssAuthorized.value) {
+    notice.value = "微信授权无效，请先扫码登录微信公众号";
+    return;
+  }
+  wechatRssSearch.adding_panel_open = true;
+}
+
 async function addWechatRssSubscription(item) {
   wechatRssSearch.adding_id = item.id;
   try {
@@ -840,8 +898,15 @@ async function addWechatRssSubscription(item) {
       ready: Boolean(result.ready),
       subscriptions: result.subscriptions || [],
       subscription_count: result.subscription_count || 0,
+      wechat_authorized: Boolean(result.wechat_authorized ?? wechatRssComponent.wechat_authorized),
+      wechat_login_state: result.wechat_login_state || wechatRssComponent.wechat_login_state,
+      wechat_message: result.wechat_message || wechatRssComponent.wechat_message,
     });
     wechatRssSearch.items = wechatRssSearch.items.filter((candidate) => candidate.id !== item.id);
+    if (!wechatRssSearch.items.length) {
+      wechatRssSearch.query = "";
+      wechatRssSearch.adding_panel_open = false;
+    }
     notice.value = `已加入公众号订阅：${item.name}`;
     await refresh();
   } catch (error) {
@@ -860,6 +925,9 @@ async function removeWechatRssSubscription(item) {
       ready: Boolean(result.ready),
       subscriptions: result.subscriptions || [],
       subscription_count: result.subscription_count || 0,
+      wechat_authorized: Boolean(result.wechat_authorized ?? wechatRssComponent.wechat_authorized),
+      wechat_login_state: result.wechat_login_state || wechatRssComponent.wechat_login_state,
+      wechat_message: result.wechat_message || wechatRssComponent.wechat_message,
     });
     notice.value = `已移除公众号订阅：${item.name}`;
     await refresh();
@@ -867,6 +935,42 @@ async function removeWechatRssSubscription(item) {
     notice.value = `移除公众号失败：${error.message}`;
   } finally {
     wechatRssSearch.removing_id = "";
+  }
+}
+
+async function backfillWechatRssSubscriptions(item = null) {
+  if (!wechatRssAuthorized.value) return notice.value = "微信授权无效，请先扫码登录微信公众号";
+  const ids = item?.id
+    ? [item.id]
+    : (wechatRssComponent.subscriptions || []).filter((entry) => entry.enabled !== false).map((entry) => entry.id).filter(Boolean);
+  if (!ids.length) return notice.value = "当前没有可补采的公众号订阅";
+  if (item?.id) wechatRssSearch.backfilling_id = item.id;
+  else wechatRssSearch.backfilling_all = true;
+  try {
+    const result = await request("/api/channels/wechat-mp-rss/subscriptions/backfill", {
+      method: "POST",
+      body: JSON.stringify({
+        subscription_ids: ids,
+        start_page: Number(wechatRssSearch.backfill_start_page || 0),
+        end_page: Number(wechatRssSearch.backfill_end_page || 1),
+      }),
+    });
+    Object.assign(wechatRssComponent, {
+      ready: Boolean(result.ready),
+      subscriptions: result.subscriptions || wechatRssComponent.subscriptions,
+      subscription_count: result.subscription_count ?? wechatRssComponent.subscription_count,
+      wechat_authorized: Boolean(result.wechat_authorized ?? wechatRssComponent.wechat_authorized),
+      wechat_login_state: result.wechat_login_state || wechatRssComponent.wechat_login_state,
+      wechat_message: result.wechat_message || wechatRssComponent.wechat_message,
+    });
+    notice.value = result.failed_count
+      ? `已提交 ${result.submitted_count} 个公众号补采，${result.failed_count} 个失败；可稍后同步或查看 WeRSS 任务队列`
+      : `已提交 ${result.submitted_count} 个公众号补采；可稍后同步公众号快照`;
+  } catch (error) {
+    notice.value = `公众号补采失败：${error.message}`;
+  } finally {
+    wechatRssSearch.backfilling_id = "";
+    wechatRssSearch.backfilling_all = false;
   }
 }
 
@@ -881,7 +985,11 @@ async function pollWechatRssLoginStatus() {
         ready: Boolean(result.ready),
         subscriptions: result.subscriptions || [],
         subscription_count: result.subscription_count || 0,
+        wechat_authorized: Boolean(result.wechat_authorized ?? result.authorized),
+        wechat_login_state: result.wechat_login_state || result.login_state,
+        wechat_message: result.wechat_message || result.message,
       });
+      wechatRssLoginModal.value = false;
       notice.value = result.ready
         ? `微信扫码成功，已同步 ${result.subscription_count} 个公众号，信源可用`
         : "微信扫码成功。请在当前弹窗中搜索并加入需要采集的公众号。";
@@ -899,17 +1007,39 @@ async function pollWechatRssLoginStatus() {
 }
 
 async function beginWechatRssLogin() {
-  wechatRssLoginModal.value = true;
+  wechatRssLoginModal.value = false;
   wechatRssLoginLoading.value = true;
   stopWechatRssLoginPolling();
   stopWechatRssQrRefresh();
   Object.assign(wechatRssLogin, { login_state: "starting", message: "正在准备微信扫码二维码...", qr_image_url: "", qr_base_url: "", qr_loaded: false, authorized: false });
   try {
     await saveWechatRssConfiguration();
+    try {
+      const current = await request("/api/channels/wechat-mp-rss/wechat-login/status");
+      Object.assign(wechatRssLogin, current, { authorized: Boolean(current.authorized) });
+      if (current.authorized) {
+        Object.assign(wechatRssComponent, {
+          ready: Boolean(current.ready),
+          subscriptions: current.subscriptions || wechatRssComponent.subscriptions,
+          subscription_count: current.subscription_count ?? wechatRssComponent.subscription_count,
+          wechat_authorized: true,
+          wechat_login_state: current.wechat_login_state || current.login_state,
+          wechat_message: current.wechat_message || current.message,
+        });
+        await syncWechatRssSubscriptions({ quiet: true });
+        notice.value = "微信授权仍然有效，可直接管理公众号订阅";
+        return;
+      }
+    } catch {
+      // If status probing fails, fall through and request a fresh QR code.
+    }
+    wechatRssLoginModal.value = true;
     const result = await request("/api/channels/wechat-mp-rss/wechat-login", { method: "POST" });
     Object.assign(wechatRssLogin, result, { qr_base_url: result.qr_image_url || "", qr_loaded: false, authorized: Boolean(result.authorized) });
     if (result.authorized) {
+      wechatRssLoginModal.value = false;
       await syncWechatRssSubscriptions({ quiet: true });
+      notice.value = "微信授权仍然有效，可直接管理公众号订阅";
       return;
     }
     refreshWechatRssQrImage();
@@ -917,6 +1047,7 @@ async function beginWechatRssLogin() {
     wechatRssLoginPollTimer = window.setInterval(() => void pollWechatRssLoginStatus(), 3000);
   } catch (error) {
     Object.assign(wechatRssLogin, { login_state: "failed", message: error.message, qr_image_url: "", qr_base_url: "", qr_loaded: false, authorized: false });
+    if (!wechatRssLoginModal.value) notice.value = error.message;
   } finally {
     wechatRssLoginLoading.value = false;
   }
@@ -989,7 +1120,7 @@ function escapeHtml(value) {
 }
 
 function buildReportPreviewDocument(report) {
-  const text = (report || "").trim();
+  const text = localizeReportTimestamps(report || "").trim();
   const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:; base-uri 'none'; form-action 'none';">`;
   if (/<html(?:\s|>)/i.test(text) && /<body(?:\s|>)/i.test(text)) {
     return /<head(?:\s|>)/i.test(text)
@@ -1000,22 +1131,23 @@ function buildReportPreviewDocument(report) {
 }
 
 function buildReportExportDocument(report) {
-  const text = (report || "").trim();
+  const text = localizeReportTimestamps(report || "").trim();
   return /<html(?:\s|>)/i.test(text) && /<body(?:\s|>)/i.test(text)
     ? text
     : buildReportPreviewDocument(text);
 }
 
-function reportExportFilename(title = selectedReportTitle.value) {
+function reportExportFilename(title = selectedReportTitle.value, extension = "html") {
   const stem = (title || "AlphaDesk 报告")
     .replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_")
     .trim()
     .slice(0, 100) || "AlphaDesk 报告";
-  return `${stem}.html`;
+  const suffix = String(extension || "html").replace(/^\.+/, "") || "html";
+  return `${stem}.${suffix}`;
 }
 
 function downloadReportHtml(report, title = "AlphaDesk 报告") {
-  const filename = reportExportFilename(title);
+  const filename = reportExportFilename(title, "html");
   const html = buildReportExportDocument(report);
   try {
     frontendLog("info", "report.export.clicked", "", { filename, report_chars: html.length });
@@ -1033,12 +1165,67 @@ function downloadReportHtml(report, title = "AlphaDesk 报告") {
   }
 }
 
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function apiErrorMessageFromText(text, fallback = "请求失败") {
+  try {
+    const parsed = JSON.parse(text);
+    return parsed.detail || parsed.message || fallback;
+  } catch {
+    return text?.trim()?.slice(0, 500) || fallback;
+  }
+}
+
+async function downloadReportPdf(report, title = "AlphaDesk 报告") {
+  if (!report?.trim()) {
+    notice.value = "没有可导出的报告";
+    return;
+  }
+  const filename = reportExportFilename(title, "pdf");
+  const html = buildReportExportDocument(report);
+  reportPdfExporting.value = true;
+  try {
+    frontendLog("info", "report.pdf_export.clicked", "", { filename, report_chars: html.length });
+    const response = await fetch(`${API}/api/reports/export/pdf`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Request-ID": clientRequestId() },
+      body: JSON.stringify({ title, html }),
+    });
+    if (!response.ok) {
+      throw new Error(apiErrorMessageFromText(await response.text(), `PDF 导出失败：HTTP ${response.status}`));
+    }
+    downloadBlob(await response.blob(), filename);
+    notice.value = `PDF 报告已下载：${filename}`;
+  } catch (error) {
+    notice.value = `PDF 报告导出失败：${error.message}`;
+  } finally {
+    reportPdfExporting.value = false;
+  }
+}
+
 function exportReportHtml() {
   downloadReportHtml(selectedReport.value, selectedReportTitle.value);
 }
 
+async function exportReportPdf() {
+  await downloadReportPdf(selectedReport.value, selectedReportTitle.value);
+}
+
 function exportTaskReport(item) {
   downloadReportHtml(item.report, `${item.target} - ${item.title}`);
+}
+
+async function exportTaskReportPdf(item) {
+  await downloadReportPdf(item.report, `${item.target} - ${item.title}`);
 }
 
 function closeTopmostModal(event) {
@@ -1178,11 +1365,17 @@ onUnmounted(() => {
                 <div v-for="item in data.tasks.slice(0,4)" :key="item.id" class="list-row">
                   <div>
                     <p class="text-sm font-medium text-white">{{ item.target }} · {{ item.title }}</p>
-                    <p class="mt-1 text-xs text-slate-600">{{ item.created_at }} · {{ item.status }}</p>
+                    <p class="mt-1 text-xs text-slate-600">{{ formatBeijingTime(item.created_at) }} · {{ item.status }}</p>
                   </div>
                   <div v-if="item.report" class="flex shrink-0 gap-2">
                     <button @click="openReport(item.report, `${item.target} - ${item.title}`)" class="report-action">查看报告</button>
-                    <button @click="exportTaskReport(item)" class="report-action">导出报告</button>
+                    <div class="group relative inline-flex shrink-0">
+                      <button type="button" class="report-action">导出报告</button>
+                      <div class="pointer-events-none absolute right-0 top-full z-30 mt-2 min-w-32 rounded-xl border border-white/[.12] bg-[#101a2a] p-1 opacity-0 shadow-xl shadow-black/30 transition group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100">
+                        <button type="button" @click="exportTaskReport(item)" class="block w-full rounded-lg px-3 py-2 text-left text-xs font-semibold text-slate-200 hover:bg-white/[.07]">导出 HTML</button>
+                        <button type="button" @click="exportTaskReportPdf(item)" :disabled="reportPdfExporting" class="block w-full rounded-lg px-3 py-2 text-left text-xs font-semibold text-slate-200 hover:bg-white/[.07] disabled:cursor-wait disabled:opacity-60">{{ reportPdfExporting ? 'PDF 生成中' : '导出 PDF' }}</button>
+                      </div>
+                    </div>
                   </div>
                   <button v-else-if="canRunTask(item)" @click="runTask(item.id)" class="secondary">{{ taskActionLabel(item) }}</button>
                   <span v-else class="status-warn">{{ taskActionLabel(item) }}</span>
@@ -1242,13 +1435,19 @@ onUnmounted(() => {
             <div v-for="item in data.tasks" :key="item.id" class="list-row">
               <div>
                 <p class="font-medium text-white">{{ item.target }} · {{ item.title }}</p>
-                <p class="mt-1 text-xs text-slate-600">{{ item.created_at }} · {{ item.status }}</p>
+                <p class="mt-1 text-xs text-slate-600">{{ formatBeijingTime(item.created_at) }} · {{ item.status }}</p>
                 <p class="mt-2 text-xs text-slate-500">{{ item.objective }}</p>
                 <p v-if="item.agent_error" class="mt-2 text-xs text-rose-300">{{ item.agent_error }}</p>
               </div>
               <div class="flex shrink-0 items-center gap-2">
                 <button v-if="item.report" @click="openReport(item.report, `${item.target} - ${item.title}`)" class="report-action">查看报告</button>
-                <button v-if="item.report" @click="exportTaskReport(item)" class="report-action">导出报告</button>
+                <div v-if="item.report" class="group relative inline-flex shrink-0">
+                  <button type="button" class="report-action">导出报告</button>
+                  <div class="pointer-events-none absolute right-0 top-full z-30 mt-2 min-w-32 rounded-xl border border-white/[.12] bg-[#101a2a] p-1 opacity-0 shadow-xl shadow-black/30 transition group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100">
+                    <button type="button" @click="exportTaskReport(item)" class="block w-full rounded-lg px-3 py-2 text-left text-xs font-semibold text-slate-200 hover:bg-white/[.07]">导出 HTML</button>
+                    <button type="button" @click="exportTaskReportPdf(item)" :disabled="reportPdfExporting" class="block w-full rounded-lg px-3 py-2 text-left text-xs font-semibold text-slate-200 hover:bg-white/[.07] disabled:cursor-wait disabled:opacity-60">{{ reportPdfExporting ? 'PDF 生成中' : '导出 PDF' }}</button>
+                  </div>
+                </div>
                 <button v-if="canRunTask(item)" @click="runTask(item.id)" class="secondary">{{ taskActionLabel(item) }}</button>
                 <span v-else-if="!item.report" class="status-warn">{{ taskActionLabel(item) }}</span>
                 <button @click="resetTask(item)" class="secondary">重置</button>
@@ -1304,16 +1503,22 @@ onUnmounted(() => {
             <div v-for="job in data.source_jobs" :key="job.id" class="list-row items-start">
               <div class="min-w-0">
                 <p class="text-sm font-medium text-white">{{ job.report_title }}</p>
-                <p class="mt-1 text-xs text-slate-600">{{ job.created_at }} · {{ sourceJobActionLabel(job.action) }} · {{ sourceJobStatusLabel(job) }} · {{ sourceJobSnapshotLabel(job) }}</p>
+                <p class="mt-1 text-xs text-slate-600">{{ formatBeijingTime(job.created_at) }} · {{ sourceJobActionLabel(job.action) }} · {{ sourceJobStatusLabel(job) }} · {{ sourceJobSnapshotLabel(job) }}</p>
                 <p class="mt-1 text-xs text-slate-600">信源：{{ jobChannelNames(job).join('、') }} · 窗口：{{ job.lookback_days }} 天</p>
                 <p v-if="job.runs?.length" class="mt-1 text-xs text-slate-600">逐信源：{{ sourceRunSummary(job) }}</p>
-                <p v-if="job.report_anchor" class="mt-1 text-xs text-slate-600">报告数据锚点：{{ job.report_anchor }}</p>
+                <p v-if="job.report_anchor" class="mt-1 text-xs text-slate-600">报告数据锚点：{{ formatBeijingTime(job.report_anchor) }}</p>
                 <p v-if="job.error" class="mt-2 max-w-4xl break-all text-xs leading-5 text-rose-300">{{ job.error }}</p>
               </div>
               <div class="flex shrink-0 gap-2">
                 <button v-if="job.snapshot_count" @click="openSnapshots(job)" class="snapshot-action">查看快照</button>
                 <button v-if="job.has_report || job.report" @click="openJobReport(job)" class="report-action">查看报告</button>
-                <button v-if="job.has_report || job.report" @click="exportJobReport(job)" class="report-action">导出报告</button>
+                <div v-if="job.has_report || job.report" class="group relative inline-flex shrink-0">
+                  <button type="button" class="report-action">导出报告</button>
+                  <div class="pointer-events-none absolute right-0 top-full z-30 mt-2 min-w-32 rounded-xl border border-white/[.12] bg-[#101a2a] p-1 opacity-0 shadow-xl shadow-black/30 transition group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100">
+                    <button type="button" @click="exportJobReport(job)" class="block w-full rounded-lg px-3 py-2 text-left text-xs font-semibold text-slate-200 hover:bg-white/[.07]">导出 HTML</button>
+                    <button type="button" @click="exportJobReportPdf(job)" :disabled="reportPdfExporting" class="block w-full rounded-lg px-3 py-2 text-left text-xs font-semibold text-slate-200 hover:bg-white/[.07] disabled:cursor-wait disabled:opacity-60">{{ reportPdfExporting ? 'PDF 生成中' : '导出 PDF' }}</button>
+                  </div>
+                </div>
                 <span v-if="job.status==='generating_report'" class="status-warn">报告生成中</span>
                 <button v-if="canRetrySourceJob(job)" @click="retrySourceJob(job)" class="secondary">{{ retrySourceJobLabel(job) }}</button>
               </div>
@@ -1376,7 +1581,7 @@ onUnmounted(() => {
                 <small v-if="channel.id==='ima-knowledge'">在配置中维护 ClientID、API Key 和 IMA Skill 下载地址；API Key 仅本地加密保存</small>
                 <small>整理策略：{{ channel.parsing_strategy }} · 质量阈值 {{ channel.normalization_quality_threshold }} · 最大滚动 {{ channel.max_scrolls }}</small>
                 <small>个股补证：{{ channel.research_enabled ? '允许' : '关闭' }}</small>
-                <small v-if="channel.last_check">上次检查：{{ channel.last_check }}</small>
+                <small v-if="channel.last_check">上次检查：{{ formatBeijingTime(channel.last_check) }}</small>
               </span>
               <div class="flex items-center gap-3">
                 <span :class="channel.status==='online'?'status-good':'status-warn'">{{ channel.status }}</span>
@@ -1429,7 +1634,7 @@ onUnmounted(() => {
                   <p class="text-sm font-medium text-white">{{ channelDisplayName(item) }}</p>
                   <p v-if="item.scope_key" class="mt-1 text-xs text-slate-600">范围：{{ item.scope_key }}</p>
                 </div>
-                <p class="text-xs text-slate-400">{{ item.last_success_at }}</p>
+                <p class="text-xs text-slate-400">{{ formatBeijingTime(item.last_success_at) }}</p>
               </div>
             </div>
             <div class="panel p-5">
@@ -1438,7 +1643,7 @@ onUnmounted(() => {
               <div v-for="item in data.audit.snapshots" :key="item.channel_id" class="list-row">
                 <div>
                   <p class="text-sm font-medium text-white">{{ channelDisplayName(item) }}</p>
-                  <p class="mt-1 text-xs text-slate-600">最近聚合：{{ item.last_collected_at }}</p>
+                  <p class="mt-1 text-xs text-slate-600">最近聚合：{{ formatBeijingTime(item.last_collected_at) }}</p>
                 </div>
                 <span class="status-good">{{ item.snapshot_count }} 条</span>
               </div>
@@ -1449,7 +1654,7 @@ onUnmounted(() => {
               <div v-for="item in data.audit.normalized" :key="item.channel_id" class="list-row">
                 <div>
                   <p class="text-sm font-medium text-white">{{ channelDisplayName(item) }}</p>
-                  <p class="mt-1 text-xs text-slate-600">平均质量：{{ item.average_quality ?? '-' }} · {{ item.last_normalized_at }}</p>
+                  <p class="mt-1 text-xs text-slate-600">平均质量：{{ item.average_quality ?? '-' }} · {{ formatBeijingTime(item.last_normalized_at) }}</p>
                 </div>
                 <button @click="openNormalizedItems({ channelId: item.channel_id, title: `${channelDisplayName(item)} · 结构化条目` })" class="secondary">{{ item.item_count }} 条</button>
               </div>
@@ -1461,7 +1666,7 @@ onUnmounted(() => {
             <div v-for="job in data.audit.jobs" :key="job.id" class="list-row items-start">
               <div class="min-w-0">
                 <p class="text-sm font-medium text-white">{{ job.report_title }}</p>
-                <p class="mt-1 text-xs text-slate-600">{{ job.created_at }} · {{ job.action }} · {{ sourceJobStatusLabel(job) }} · {{ job.snapshot_count }} 条快照</p>
+                <p class="mt-1 text-xs text-slate-600">{{ formatBeijingTime(job.created_at) }} · {{ job.action }} · {{ sourceJobStatusLabel(job) }} · {{ job.snapshot_count }} 条快照</p>
                 <p class="mt-1 text-xs text-slate-600">信源：{{ jobChannelNames(job).join('、') }}<span v-if="job.evidence_layer"> · Agent 层：{{ job.evidence_layer }}</span></p>
                 <p v-if="job.runs?.length" class="mt-1 text-xs text-slate-600">逐信源：{{ sourceRunSummary(job) }}</p>
                 <p v-if="job.error" class="mt-2 text-xs text-rose-300">{{ job.error }}</p>
@@ -1469,7 +1674,13 @@ onUnmounted(() => {
               <div class="flex shrink-0 gap-2">
                 <button v-if="job.snapshot_count" @click="openSnapshots(job)" class="snapshot-action">查看快照</button>
                 <button v-if="job.has_report || job.report" @click="openJobReport(job)" class="report-action">查看报告</button>
-                <button v-if="job.has_report || job.report" @click="exportJobReport(job)" class="report-action">导出报告</button>
+                <div v-if="job.has_report || job.report" class="group relative inline-flex shrink-0">
+                  <button type="button" class="report-action">导出报告</button>
+                  <div class="pointer-events-none absolute right-0 top-full z-30 mt-2 min-w-32 rounded-xl border border-white/[.12] bg-[#101a2a] p-1 opacity-0 shadow-xl shadow-black/30 transition group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100">
+                    <button type="button" @click="exportJobReport(job)" class="block w-full rounded-lg px-3 py-2 text-left text-xs font-semibold text-slate-200 hover:bg-white/[.07]">导出 HTML</button>
+                    <button type="button" @click="exportJobReportPdf(job)" :disabled="reportPdfExporting" class="block w-full rounded-lg px-3 py-2 text-left text-xs font-semibold text-slate-200 hover:bg-white/[.07] disabled:cursor-wait disabled:opacity-60">{{ reportPdfExporting ? 'PDF 生成中' : '导出 PDF' }}</button>
+                  </div>
+                </div>
                 <span v-if="job.status==='generating_report'" class="status-warn">报告生成中</span>
                 <button v-if="canRetrySourceJob(job)" @click="retrySourceJob(job)" class="secondary">{{ retrySourceJobLabel(job) }}</button>
               </div>
@@ -1483,7 +1694,7 @@ onUnmounted(() => {
                 <p class="text-sm font-medium text-white">{{ event.event_type }} · {{ event.task_id }}</p>
                 <p class="mt-1 max-w-5xl break-all text-xs leading-5 text-slate-600">{{ event.detail }}</p>
               </div>
-              <p class="whitespace-nowrap text-xs text-slate-500">{{ event.created_at }}</p>
+              <p class="whitespace-nowrap text-xs text-slate-500">{{ formatBeijingTime(event.created_at) }}</p>
             </div>
           </section>
           <section class="panel mt-5 p-5">
@@ -1517,7 +1728,7 @@ onUnmounted(() => {
                   <strong class="text-slate-200">{{ entry.event }}</strong>
                   <span class="text-slate-500">{{ entry.component }}</span>
                   <span v-if="entry.request_id" class="font-mono text-blue-300">{{ entry.request_id }}</span>
-                  <span class="ml-auto text-slate-600">{{ entry.timestamp }}</span>
+                  <span class="ml-auto text-slate-600">{{ formatBeijingTime(entry.timestamp) }}</span>
                 </div>
                 <pre v-if="Object.keys(entry.fields || {}).length" class="mt-2 max-h-48 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-black/20 p-3 text-[11px] leading-5 text-slate-500">{{ formatDiagnosticFields(entry.fields) }}</pre>
               </article>
@@ -1600,7 +1811,13 @@ onUnmounted(() => {
             <p class="mt-1 text-xs text-slate-500">隔离预览 · 禁止脚本执行 · 新生成报告严禁 Markdown</p>
           </div>
           <div class="flex items-center gap-2">
-            <button @click="exportReportHtml" class="report-action">导出 HTML</button>
+            <div class="group relative inline-flex shrink-0">
+              <button type="button" class="report-action">导出报告</button>
+              <div class="pointer-events-none absolute right-0 top-full z-30 mt-2 min-w-32 rounded-xl border border-white/[.12] bg-[#101a2a] p-1 opacity-0 shadow-xl shadow-black/30 transition group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100">
+                <button type="button" @click="exportReportHtml" class="block w-full rounded-lg px-3 py-2 text-left text-xs font-semibold text-slate-200 hover:bg-white/[.07]">导出 HTML</button>
+                <button type="button" @click="exportReportPdf" :disabled="reportPdfExporting" class="block w-full rounded-lg px-3 py-2 text-left text-xs font-semibold text-slate-200 hover:bg-white/[.07] disabled:cursor-wait disabled:opacity-60">{{ reportPdfExporting ? 'PDF 生成中' : '导出 PDF' }}</button>
+              </div>
+            </div>
             <button @click="closeReport" class="flex h-8 w-8 items-center justify-center rounded-full text-lg text-slate-500 transition hover:bg-white/[.06] hover:text-white">×</button>
           </div>
         </header>
@@ -1625,7 +1842,7 @@ onUnmounted(() => {
             <div class="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <p class="text-sm font-semibold text-teal-200">{{ channelDisplayName({ id: item.channel_id, name: item.channel_name }) }}</p>
-                <p class="mt-1 text-xs text-slate-500">发生时间：{{ item.occurred_at }} · 聚合时间：{{ item.collected_at }}</p>
+                <p class="mt-1 text-xs text-slate-500">发生时间：{{ formatBeijingTime(item.occurred_at) }} · 聚合时间：{{ formatBeijingTime(item.collected_at) }}</p>
                 <p class="mt-1 text-xs text-slate-500">整理状态：{{ item.normalization_status }} · {{ item.normalized_item_count }} 条结构化内容</p>
               </div>
               <a :href="item.source_url" target="_blank" class="max-w-xl break-all text-right text-xs text-teal-300 hover:text-teal-200">{{ item.source_url }}</a>
@@ -1659,7 +1876,7 @@ onUnmounted(() => {
             <div class="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <p class="text-sm font-semibold text-teal-200">{{ item.title || channelDisplayName({ id: item.channel_id, name: item.channel_name }) }}</p>
-                <p class="mt-1 text-xs text-slate-500">{{ item.occurred_at }} · {{ item.author || '未标注作者' }} · {{ item.normalization_mode }}</p>
+                <p class="mt-1 text-xs text-slate-500">{{ formatBeijingTime(item.occurred_at) }} · {{ item.author || '未标注作者' }} · {{ item.normalization_mode }}</p>
               </div>
               <span class="status-good">质量 {{ item.quality_score }}</span>
             </div>
@@ -1691,7 +1908,7 @@ onUnmounted(() => {
             </div>
           </div>
           <p class="mt-4 text-center text-sm" :class="wechatRssLogin.authorized ? 'text-emerald-300' : wechatRssLogin.login_state==='failed' || wechatRssLogin.login_state==='expired' ? 'text-amber-300' : 'text-slate-300'">{{ wechatRssLogin.message }}</p>
-          <div v-if="wechatRssLogin.authorized" class="mt-4 rounded-xl border border-teal-400/20 bg-teal-400/[.04] p-3">
+          <div v-if="false && wechatRssLogin.authorized" class="mt-4 rounded-xl border border-teal-400/20 bg-teal-400/[.04] p-3">
             <p class="text-xs leading-5 text-slate-400">WeRSS 无法枚举个人微信的全部关注列表。请搜索需要采集的公众号并加入订阅；已加入项会自动进入后续快照采集。</p>
             <div class="mt-3 flex gap-2">
               <input v-model="wechatRssSearch.query" @keyup.enter="searchWechatRssAccounts" placeholder="搜索公众号，例如 半导体、证券时报" class="field min-w-0 flex-1" />
@@ -1707,7 +1924,7 @@ onUnmounted(() => {
               </div>
             </div>
           </div>
-          <div v-if="wechatRssComponent.subscriptions?.length" class="mt-4 max-h-36 space-y-2 overflow-y-auto rounded-xl border border-white/[.07] bg-black/10 p-3">
+          <div v-if="false && wechatRssComponent.subscriptions?.length" class="mt-4 max-h-36 space-y-2 overflow-y-auto rounded-xl border border-white/[.07] bg-black/10 p-3">
             <div v-for="item in wechatRssComponent.subscriptions" :key="item.id" class="flex items-center justify-between gap-3 text-xs">
               <span class="truncate text-slate-200">{{ item.name }}</span>
               <div class="flex shrink-0 items-center gap-2">
@@ -1845,24 +2062,93 @@ onUnmounted(() => {
                 <span class="form-label">微信公众号</span>
                 <p class="mt-1 text-xs leading-5 text-slate-500">微信扫码一次，在 AlphaDesk 内搜索并加入需要采集的公众号。后续任务会按严格时间窗保存文章快照。</p>
               </div>
-              <span :class="wechatRssComponent.ready ? 'status-good' : 'status-warn'">{{ wechatRssComponentLoading ? '正在检查' : (wechatRssComponent.ready ? '信源可用' : '等待登录') }}</span>
+              <span :class="wechatRssAuthorized ? 'status-good' : 'status-warn'">{{ wechatRssComponentLoading ? '正在检查' : (wechatRssAuthorized ? '授权有效' : '等待登录') }}</span>
             </div>
             <div class="mt-4 grid grid-cols-4 gap-2">
               <div class="rounded-xl border border-white/[.07] bg-black/10 p-3"><p class="text-[11px] text-slate-500">组件</p><p class="mt-1 text-xs font-semibold" :class="wechatRssComponent.service_online?'text-emerald-300':'text-amber-300'">{{ wechatRssComponent.service_online ? '已连接' : '待启动' }}</p></div>
-              <div class="rounded-xl border border-white/[.07] bg-black/10 p-3"><p class="text-[11px] text-slate-500">微信登录</p><p class="mt-1 text-xs font-semibold" :class="wechatRssLogin.authorized || wechatRssComponent.ready ? 'text-emerald-300' : 'text-slate-300'">{{ wechatRssLogin.authorized || wechatRssComponent.ready ? '已授权' : '等待扫码' }}</p></div>
+              <div class="rounded-xl border border-white/[.07] bg-black/10 p-3"><p class="text-[11px] text-slate-500">微信登录</p><p class="mt-1 text-xs font-semibold" :class="wechatRssAuthorized ? 'text-emerald-300' : 'text-slate-300'">{{ wechatRssAuthorized ? '已授权' : '等待扫码' }}</p></div>
               <div class="rounded-xl border border-white/[.07] bg-black/10 p-3"><p class="text-[11px] text-slate-500">已订阅公众号</p><p class="mt-1 text-xs font-semibold text-slate-200">{{ wechatRssComponent.subscription_count || 0 }} 个</p></div>
               <div class="rounded-xl border border-white/[.07] bg-black/10 p-3"><p class="text-[11px] text-slate-500">采集状态</p><p class="mt-1 text-xs font-semibold" :class="wechatRssComponent.ready?'text-emerald-300':'text-amber-300'">{{ wechatRssComponent.ready ? '可用' : '待配置' }}</p></div>
             </div>
             <div class="mt-3 flex flex-wrap gap-2">
-              <button type="button" @click="beginWechatRssLogin" :disabled="wechatRssLoginLoading" class="primary disabled:cursor-wait disabled:opacity-60">{{ wechatRssLoginLoading ? '正在准备...' : '登录微信公众号' }}</button>
+              <button v-if="!wechatRssAuthorized" type="button" @click="beginWechatRssLogin" :disabled="wechatRssLoginLoading" class="primary disabled:cursor-wait disabled:opacity-60">{{ wechatRssLoginLoading ? '正在准备...' : '扫码登录微信公众号' }}</button>
+              <button v-else type="button" @click="beginWechatRssLogin" :disabled="wechatRssLoginLoading" class="secondary disabled:cursor-wait disabled:opacity-60">{{ wechatRssLoginLoading ? '正在检查...' : '重新扫码授权' }}</button>
+              <button v-if="wechatRssAuthorized" type="button" @click="openWechatRssSubscriptionPanel" class="primary">添加订阅</button>
               <button type="button" @click="syncWechatRssSubscriptions()" :disabled="wechatRssComponentLoading" class="secondary">{{ wechatRssComponentLoading ? '正在同步...' : '同步已订阅公众号' }}</button>
             </div>
-            <p class="mt-3 text-xs leading-5" :class="wechatRssComponent.ready ? 'text-emerald-300' : 'text-slate-500'">{{ wechatRssComponent.ready ? `信源可用，WeRSS 已加入 ${wechatRssComponent.subscription_count} 个公众号` : '首次使用请点击“登录微信公众号”，扫码后搜索并加入需要采集的公众号。' }}</p>
-            <div v-if="wechatRssComponent.subscriptions?.length" class="mt-3 flex max-h-28 flex-wrap gap-2 overflow-y-auto">
+            <p class="mt-3 text-xs leading-5" :class="wechatRssAuthorized ? 'text-emerald-300' : 'text-slate-500'">{{ wechatRssAuthorized ? `微信授权有效，WeRSS 已加入 ${wechatRssComponent.subscription_count || 0} 个公众号` : '微信授权无效或尚未登录，请扫码后再搜索并加入需要采集的公众号。' }}</p>
+            <div v-if="false && wechatRssComponent.subscriptions?.length" class="mt-3 flex max-h-28 flex-wrap gap-2 overflow-y-auto">
               <span v-for="item in wechatRssComponent.subscriptions" :key="item.id" class="inline-flex items-center gap-1 rounded-full border border-teal-400/20 bg-teal-400/[.06] py-1 pl-3 pr-1 text-xs text-teal-100">
                 {{ item.name }}
                 <button type="button" @click="removeWechatRssSubscription(item)" :disabled="wechatRssSearch.removing_id===item.id" :title="`移除公众号订阅：${item.name}`" class="flex h-5 w-5 items-center justify-center rounded-full text-sm text-rose-300 transition hover:bg-rose-400/15 disabled:cursor-wait disabled:opacity-60">×</button>
               </span>
+            </div>
+            <div v-if="wechatRssAuthorized" class="mt-4 space-y-4 rounded-xl border border-teal-400/20 bg-teal-400/[.04] p-4">
+              <div>
+                <div class="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <p class="text-sm font-semibold text-teal-100">公众号订阅管理</p>
+                    <p class="mt-1 text-xs leading-5 text-slate-500">授权有效时可直接搜索、加入订阅、移除订阅或触发文章补采，无需重新扫码。</p>
+                  </div>
+                  <div class="flex flex-wrap gap-2">
+                    <button type="button" @click="openWechatRssSubscriptionPanel" class="primary">添加订阅</button>
+                    <button type="button" @click="syncWechatRssSubscriptions()" :disabled="wechatRssComponentLoading" class="secondary disabled:cursor-wait disabled:opacity-60">{{ wechatRssComponentLoading ? '同步中...' : '刷新订阅状态' }}</button>
+                  </div>
+                </div>
+                <div v-if="wechatRssSearch.adding_panel_open || wechatRssSearch.items.length" class="mt-3 rounded-xl border border-white/[.07] bg-black/10 p-3">
+                  <div class="flex gap-2">
+                    <input v-model="wechatRssSearch.query" @keyup.enter="searchWechatRssAccounts" placeholder="搜索公众号，例如 半导体、证券时报" class="field min-w-0 flex-1" />
+                    <button type="button" @click="searchWechatRssAccounts" :disabled="wechatRssSearch.loading" class="primary disabled:cursor-wait disabled:opacity-60">{{ wechatRssSearch.loading ? '搜索中...' : '搜索' }}</button>
+                    <button type="button" @click="wechatRssSearch.adding_panel_open=false; wechatRssSearch.items=[]; wechatRssSearch.query=''" class="secondary">收起</button>
+                  </div>
+                  <p class="mt-2 text-xs leading-5 text-slate-500">输入公众号名称或关键词，搜索后点击“加入订阅”。授权有效时不需要重新扫码。</p>
+                  <div v-if="wechatRssSearch.items.length" class="mt-3 max-h-48 space-y-2 overflow-y-auto">
+                    <div v-for="item in wechatRssSearch.items" :key="item.id" class="flex items-center justify-between gap-3 rounded-lg border border-white/[.07] bg-black/10 px-3 py-2">
+                      <div class="min-w-0">
+                        <p class="truncate text-xs font-semibold text-slate-200">{{ item.name }}</p>
+                        <p class="truncate text-[11px] text-slate-500">{{ item.alias || item.intro || '未提供简介' }}</p>
+                      </div>
+                      <button type="button" @click="addWechatRssSubscription(item)" :disabled="wechatRssSearch.adding_id===item.id" class="secondary shrink-0 disabled:cursor-wait disabled:opacity-60">{{ wechatRssSearch.adding_id===item.id ? '加入中...' : '加入订阅' }}</button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="rounded-xl border border-white/[.07] bg-black/10 p-3">
+                <div class="flex flex-wrap items-end justify-between gap-3">
+                  <div>
+                    <p class="text-sm font-semibold text-slate-200">公众号文章补采</p>
+                    <p class="mt-1 text-xs leading-5 text-slate-500">调用 WeRSS 原生更新接口，适合发现某个公众号漏抓或需要补齐最近文章时手动重试。</p>
+                  </div>
+                  <div class="flex flex-wrap items-center gap-2 text-xs text-slate-400">
+                    <label class="flex items-center gap-2">起始页
+                      <input v-model.number="wechatRssSearch.backfill_start_page" type="number" min="0" max="20" class="field w-20" />
+                    </label>
+                    <label class="flex items-center gap-2">页数
+                      <input v-model.number="wechatRssSearch.backfill_end_page" type="number" min="1" max="20" class="field w-20" />
+                    </label>
+                    <button type="button" @click="backfillWechatRssSubscriptions()" :disabled="wechatRssSearch.backfilling_all || !(wechatRssComponent.subscriptions || []).length" class="primary disabled:cursor-wait disabled:opacity-60">{{ wechatRssSearch.backfilling_all ? '提交中...' : '补采全部订阅' }}</button>
+                  </div>
+                </div>
+              </div>
+
+              <div v-if="wechatRssComponent.subscriptions?.length" class="max-h-72 space-y-2 overflow-y-auto">
+                <div v-for="item in wechatRssComponent.subscriptions" :key="item.id" class="flex items-center justify-between gap-3 rounded-xl border border-white/[.07] bg-black/10 px-3 py-2">
+                  <div class="min-w-0">
+                    <p class="truncate text-sm font-semibold text-slate-200">{{ item.name }}</p>
+                    <p class="truncate text-[11px] text-slate-500">{{ item.id }}</p>
+                  </div>
+                  <div class="flex shrink-0 items-center gap-2">
+                    <span :class="item.enabled ? 'status-good' : 'status-warn'">{{ item.enabled ? '已启用' : '已停用' }}</span>
+                    <button type="button" @click="backfillWechatRssSubscriptions(item)" :disabled="wechatRssSearch.backfilling_id===item.id || wechatRssSearch.backfilling_all" class="secondary disabled:cursor-wait disabled:opacity-60">{{ wechatRssSearch.backfilling_id===item.id ? '提交中...' : '补采' }}</button>
+                    <button type="button" @click="removeWechatRssSubscription(item)" :disabled="wechatRssSearch.removing_id===item.id" class="rounded-lg px-2 py-1 font-semibold text-rose-300 transition hover:bg-rose-400/10 disabled:cursor-wait disabled:opacity-60">{{ wechatRssSearch.removing_id===item.id ? '移除中...' : '移除' }}</button>
+                  </div>
+                </div>
+              </div>
+              <p v-else class="rounded-xl border border-dashed border-white/[.08] p-4 text-center text-xs text-slate-500">还没有已订阅公众号，可先搜索并加入订阅。</p>
+            </div>
+            <div v-else class="mt-4 rounded-xl border border-amber-400/20 bg-amber-400/[.05] p-4 text-xs leading-5 text-amber-100">
+              微信授权无效或尚未完成扫码。只有在授权无效时才需要点击“扫码登录微信公众号”，授权有效后可直接在这里搜索、加入订阅和补采文章。
             </div>
             <details class="mt-3 rounded-xl border border-white/[.07] bg-black/10 p-3">
               <summary class="cursor-pointer text-xs font-semibold text-slate-300">高级配置与维护</summary>

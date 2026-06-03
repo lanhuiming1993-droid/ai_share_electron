@@ -299,6 +299,43 @@ def delete_werss_subscription(config: dict[str, Any] | None, subscription_id: st
     return {"id": normalized_id}
 
 
+def refresh_werss_subscription_articles(
+    config: dict[str, Any] | None,
+    subscription_id: str,
+    *,
+    start_page: int = 0,
+    end_page: int = 1,
+    session=None,
+) -> dict[str, Any]:
+    normalized = normalize_werss_config(config)
+    normalized_id = str(subscription_id or "").strip()
+    if not normalized_id:
+        raise ValueError("WeRSS subscription ID cannot be empty")
+    start_page = min(max(int(start_page), 0), 20)
+    end_page = min(max(int(end_page), 1), 20)
+    data = werss_admin_get(
+        normalized,
+        f"mps/update/{quote(normalized_id, safe='')}",
+        params={"start_page": start_page, "end_page": end_page},
+        session=session,
+    )
+    result: dict[str, Any] = {
+        "id": normalized_id,
+        "status": "submitted",
+        "message": "已提交 WeRSS 公众号补采任务",
+        "start_page": start_page,
+        "end_page": end_page,
+    }
+    if isinstance(data, dict):
+        if "time_span" in data:
+            result["time_span"] = data.get("time_span")
+        if "total" in data:
+            result["returned_count"] = data.get("total")
+        elif isinstance(data.get("list"), list):
+            result["returned_count"] = len(data["list"])
+    return result
+
+
 def remember_werss_wechat_authorization(config: dict[str, Any], authorized: bool) -> bool:
     normalized = normalize_werss_config(config)
     ttl = WERSS_WECHAT_AUTH_TRUE_TTL_SECONDS if authorized else WERSS_WECHAT_AUTH_FALSE_TTL_SECONDS
@@ -306,21 +343,68 @@ def remember_werss_wechat_authorization(config: dict[str, Any], authorized: bool
     return authorized
 
 
-def probe_werss_wechat_authorization(config: dict[str, Any] | None = None, session=None, force_refresh: bool = False) -> bool:
+def verify_werss_wechat_authorization(config: dict[str, Any] | None = None, session=None, force_refresh: bool = False) -> dict[str, Any]:
     normalized = normalize_werss_config(config)
     cached = _WERSS_WECHAT_AUTH.get(normalized["base_url"])
     if not force_refresh and cached and cached[1] > time.time():
-        return cached[0]
+        authorized = cached[0]
+        return {
+            "authorized": authorized,
+            "admin_authorized": True,
+            "login_state": "authorized" if authorized else "expired",
+            "message": "微信授权有效" if authorized else "微信授权已失效",
+            "qr_available": False,
+        }
     try:
+        verify_data = werss_admin_get(normalized, "auth/verify", session=session)
+        admin_authorized = bool(verify_data.get("is_valid", True)) if isinstance(verify_data, dict) else True
+        if not admin_authorized:
+            remember_werss_wechat_authorization(normalized, False)
+            return {
+                "authorized": False,
+                "admin_authorized": False,
+                "login_state": "invalid_admin",
+                "message": "WeRSS 管理会话无效",
+                "qr_available": False,
+            }
         data = werss_admin_get(normalized, "auth/qr/status", session=session)
-    except Exception:
-        return remember_werss_wechat_authorization(normalized, False)
-    return remember_werss_wechat_authorization(normalized, bool(data.get("login_status")) if isinstance(data, dict) else False)
+    except Exception as exc:
+        remember_werss_wechat_authorization(normalized, False)
+        return {
+            "authorized": False,
+            "admin_authorized": False,
+            "login_state": "failed",
+            "message": f"WeRSS 授权检查失败：{type(exc).__name__}",
+            "qr_available": False,
+        }
+    login_status = bool(data.get("login_status")) if isinstance(data, dict) else False
+    qr_exists = bool(data.get("qr_code")) if isinstance(data, dict) else False
+    remember_werss_wechat_authorization(normalized, login_status)
+    if login_status:
+        return {
+            "authorized": True,
+            "admin_authorized": True,
+            "login_state": "authorized",
+            "message": "微信授权有效",
+            "qr_available": qr_exists,
+        }
+    return {
+        "authorized": False,
+        "admin_authorized": True,
+        "login_state": "waiting_scan" if qr_exists else "expired",
+        "message": "等待微信扫码授权" if qr_exists else "微信授权已失效",
+        "qr_available": qr_exists,
+    }
+
+
+def probe_werss_wechat_authorization(config: dict[str, Any] | None = None, session=None, force_refresh: bool = False) -> bool:
+    return bool(verify_werss_wechat_authorization(config, session=session, force_refresh=force_refresh).get("authorized"))
 
 
 def start_werss_wechat_login(config: dict[str, Any] | None = None, session=None) -> dict[str, Any]:
     normalized = normalize_werss_config(config)
-    if probe_werss_wechat_authorization(normalized, session=session):
+    authorization = verify_werss_wechat_authorization(normalized, session=session, force_refresh=True)
+    if authorization["authorized"]:
         return {
             "login_state": "authorized",
             "message": "微信授权仍然有效，无需重复扫码",
@@ -369,16 +453,13 @@ def fetch_werss_qr_image(config: dict[str, Any] | None = None, session=None) -> 
 
 def werss_wechat_login_status(config: dict[str, Any] | None = None, session=None) -> dict[str, Any]:
     normalized = normalize_werss_config(config)
-    data = werss_admin_get(normalized, "auth/qr/status", session=session)
-    login_status = bool(data.get("login_status")) if isinstance(data, dict) else False
-    qr_exists = bool(data.get("qr_code")) if isinstance(data, dict) else False
-    if login_status:
-        remember_werss_wechat_authorization(normalized, True)
-        return {"login_state": "authorized", "message": "微信扫码授权成功", "authorized": True}
-    if probe_werss_wechat_authorization(normalized, session=session):
+    authorization = verify_werss_wechat_authorization(normalized, session=session, force_refresh=True)
+    if authorization["authorized"]:
         return {"login_state": "authorized", "message": "微信授权有效", "authorized": True}
-    if qr_exists:
+    if authorization["login_state"] == "waiting_scan":
         return {"login_state": "waiting_scan", "message": "等待微信扫码授权", "authorized": False}
+    if authorization["login_state"] == "failed":
+        return {"login_state": "failed", "message": authorization["message"], "authorized": False}
     return {"login_state": "expired", "message": "二维码已失效，请重新获取", "authorized": False}
 
 
@@ -616,6 +697,13 @@ def managed_werss_status(config: dict[str, Any] | None = None) -> dict[str, Any]
     service_online = False
     subscriptions: list[dict[str, Any]] = []
     subscription_error = ""
+    authorization = {
+        "authorized": False,
+        "admin_authorized": False,
+        "login_state": "unknown",
+        "message": "WeRSS 服务不可用",
+        "qr_available": False,
+    }
     try:
         response = session.get(f"{normalized['base_url']}/", timeout=min(normalized["timeout_seconds"], 5))
         service_online = response.status_code < 500
@@ -626,17 +714,31 @@ def managed_werss_status(config: dict[str, Any] | None = None) -> dict[str, Any]
             subscriptions = fetch_werss_subscriptions(normalized, session=session)
         except Exception as exc:
             subscription_error = f"{type(exc).__name__}: {exc}"
+        authorization = verify_werss_wechat_authorization(normalized, session=session)
     rss_status = check_werss(normalized)
     docker_available = managed_werss_start_available() and shutil.which("docker") is not None
     public_base_url = public_werss_base_url(normalized)
-    ready = service_online and rss_status["status"] == "online" and bool(subscriptions)
+    ready = service_online and rss_status["status"] == "online" and bool(subscriptions) and bool(authorization["authorized"])
+    if ready:
+        status_message = "WeRSS 公众号信源可用"
+    elif service_online and not authorization["authorized"]:
+        status_message = str(authorization["message"])
+    elif subscription_error:
+        status_message = subscription_error
+    else:
+        status_message = rss_status["message"]
     return {
         "status": "online" if ready else ("pending" if service_online else "offline"),
-        "message": "微信公众号信源可用" if ready else rss_status["message"],
+        "message": status_message,
         "checked_at": rss_status["checked_at"],
         "ready": ready,
         "service_online": service_online,
         "rss_online": rss_status["status"] == "online",
+        "wechat_authorized": bool(authorization["authorized"]),
+        "wechat_login_state": authorization["login_state"],
+        "wechat_message": authorization["message"],
+        "admin_authorized": bool(authorization["admin_authorized"]),
+        "qr_available": bool(authorization["qr_available"]),
         "subscription_count": len(subscriptions),
         "subscriptions": subscriptions,
         "subscription_error": subscription_error,
