@@ -1371,7 +1371,7 @@ onUnmounted(() => {
                     <button @click="openReport(item.report, `${item.target} - ${item.title}`)" class="report-action">查看报告</button>
                     <div class="group relative inline-flex shrink-0">
                       <button type="button" class="report-action">导出报告</button>
-                      <div class="pointer-events-none absolute right-0 top-full z-30 mt-2 min-w-32 rounded-xl border border-white/[.12] bg-[#101a2a] p-1 opacity-0 shadow-xl shadow-black/30 transition group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100">
+                      <div class="invisible absolute right-0 top-[calc(100%-1px)] z-30 min-w-32 rounded-xl border border-white/[.12] bg-[#101a2a] p-1 opacity-0 shadow-xl shadow-black/30 transition group-hover:visible group-hover:opacity-100 group-focus-within:visible group-focus-within:opacity-100">
                         <button type="button" @click="exportTaskReport(item)" class="block w-full rounded-lg px-3 py-2 text-left text-xs font-semibold text-slate-200 hover:bg-white/[.07]">导出 HTML</button>
                         <button type="button" @click="exportTaskReportPdf(item)" :disabled="reportPdfExporting" class="block w-full rounded-lg px-3 py-2 text-left text-xs font-semibold text-slate-200 hover:bg-white/[.07] disabled:cursor-wait disabled:opacity-60">{{ reportPdfExporting ? 'PDF 生成中' : '导出 PDF' }}</button>
                       </div>
@@ -1443,7 +1443,7 @@ onUnmounted(() => {
                 <button v-if="item.report" @click="openReport(item.report, `${item.target} - ${item.title}`)" class="report-action">查看报告</button>
                 <div v-if="item.report" class="group relative inline-flex shrink-0">
                   <button type="button" class="report-action">导出报告</button>
-                  <div class="pointer-events-none absolute right-0 top-full z-30 mt-2 min-w-32 rounded-xl border border-white/[.12] bg-[#101a2a] p-1 opacity-0 shadow-xl shadow-black/30 transition group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100">
+                  <div class="invisible absolute right-0 top-[calc(100%-1px)] z-30 min-w-32 rounded-xl border border-white/[.12] bg-[#101a2a] p-1 opacity-0 shadow-xl shadow-black/30 transition group-hover:visible group-hover:opacity-100 group-focus-within:visible group-focus-within:opacity-100">
                     <button type="button" @click="exportTaskReport(item)" class="block w-full rounded-lg px-3 py-2 text-left text-xs font-semibold text-slate-200 hover:bg-white/[.07]">导出 HTML</button>
                     <button type="button" @click="exportTaskReportPdf(item)" :disabled="reportPdfExporting" class="block w-full rounded-lg px-3 py-2 text-left text-xs font-semibold text-slate-200 hover:bg-white/[.07] disabled:cursor-wait disabled:opacity-60">{{ reportPdfExporting ? 'PDF 生成中' : '导出 PDF' }}</button>
                   </div>
@@ -1514,7 +1514,7 @@ onUnmounted(() => {
                 <button v-if="job.has_report || job.report" @click="openJobReport(job)" class="report-action">查看报告</button>
                 <div v-if="job.has_report || job.report" class="group relative inline-flex shrink-0">
                   <button type="button" class="report-action">导出报告</button>
-                  <div class="pointer-events-none absolute right-0 top-full z-30 mt-2 min-w-32 rounded-xl border border-white/[.12] bg-[#101a2a] p-1 opacity-0 shadow-xl shadow-black/30 transition group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100">
+                  <div class="invisible absolute right-0 top-[calc(100%-1px)] z-30 min-w-32 rounded-xl border border-white/[.12] bg-[#101a2a] p-1 opacity-0 shadow-xl shadow-black/30 transition group-hover:visible group-hover:opacity-100 group-focus-within:visible group-focus-within:opacity-100">
                     <button type="button" @click="exportJobReport(job)" class="block w-full rounded-lg px-3 py-2 text-left text-xs font-semibold text-slate-200 hover:bg-white/[.07]">导出 HTML</button>
                     <button type="button" @click="exportJobReportPdf(job)" :disabled="reportPdfExporting" class="block w-full rounded-lg px-3 py-2 text-left text-xs font-semibold text-slate-200 hover:bg-white/[.07] disabled:cursor-wait disabled:opacity-60">{{ reportPdfExporting ? 'PDF 生成中' : '导出 PDF' }}</button>
                   </div>
@@ -1676,7 +1676,7 @@ onUnmounted(() => {
                 <button v-if="job.has_report || job.report" @click="openJobReport(job)" class="report-action">查看报告</button>
                 <div v-if="job.has_report || job.report" class="group relative inline-flex shrink-0">
                   <button type="button" class="report-action">导出报告</button>
-                  <div class="pointer-events-none absolute right-0 top-full z-30 mt-2 min-w-32 rounded-xl border border-white/[.12] bg-[#101a2a] p-1 opacity-0 shadow-xl shadow-black/30 transition group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100">
+                  <div class="invisible absolute right-0 top-[calc(100%-1px)] z-30 min-w-32 rounded-xl border border-white/[.12] bg-[#101a2a] p-1 opacity-0 shadow-xl shadow-black/30 transition group-hover:visible group-hover:opacity-100 group-focus-within:visible group-focus-within:opacity-100">
                     <button type="button" @click="exportJobReport(job)" class="block w-full rounded-lg px-3 py-2 text-left text-xs font-semibold text-slate-200 hover:bg-white/[.07]">导出 HTML</button>
                     <button type="button" @click="exportJobReportPdf(job)" :disabled="reportPdfExporting" class="block w-full rounded-lg px-3 py-2 text-left text-xs font-semibold text-slate-200 hover:bg-white/[.07] disabled:cursor-wait disabled:opacity-60">{{ reportPdfExporting ? 'PDF 生成中' : '导出 PDF' }}</button>
                   </div>
@@ -1813,7 +1813,7 @@ onUnmounted(() => {
           <div class="flex items-center gap-2">
             <div class="group relative inline-flex shrink-0">
               <button type="button" class="report-action">导出报告</button>
-              <div class="pointer-events-none absolute right-0 top-full z-30 mt-2 min-w-32 rounded-xl border border-white/[.12] bg-[#101a2a] p-1 opacity-0 shadow-xl shadow-black/30 transition group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100">
+              <div class="invisible absolute right-0 top-[calc(100%-1px)] z-30 min-w-32 rounded-xl border border-white/[.12] bg-[#101a2a] p-1 opacity-0 shadow-xl shadow-black/30 transition group-hover:visible group-hover:opacity-100 group-focus-within:visible group-focus-within:opacity-100">
                 <button type="button" @click="exportReportHtml" class="block w-full rounded-lg px-3 py-2 text-left text-xs font-semibold text-slate-200 hover:bg-white/[.07]">导出 HTML</button>
                 <button type="button" @click="exportReportPdf" :disabled="reportPdfExporting" class="block w-full rounded-lg px-3 py-2 text-left text-xs font-semibold text-slate-200 hover:bg-white/[.07] disabled:cursor-wait disabled:opacity-60">{{ reportPdfExporting ? 'PDF 生成中' : '导出 PDF' }}</button>
               </div>
