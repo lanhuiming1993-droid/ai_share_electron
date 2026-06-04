@@ -28,6 +28,12 @@ from pydantic import BaseModel, Field, ValidationError
 from backend.agent_runtime import AgentDecision, build_agent_step_prompt
 from backend.db_migrations import LATEST_SCHEMA_REVISION, ensure_migration_ledger, migration_status
 from backend.ima_openapi import DEFAULT_IMA_SKILL_DOWNLOAD_URL, ima_status, normalize_ima_config
+from backend.itick_source import (
+    DEFAULT_ITICK_API_BASE,
+    itick_status,
+    normalize_itick_config,
+    public_itick_config,
+)
 from backend.logging_config import (
     diagnostics_config,
     export_log_bundle,
@@ -193,7 +199,7 @@ class ChannelInput(BaseModel):
     name: str
     type: str
     url: str = ""
-    collection_mode: Literal["akshare", "industry_news", "wechat_rss", "ima_knowledge_base", "requests", "playwright", "manual"] = "playwright"
+    collection_mode: Literal["akshare", "industry_news", "wechat_rss", "ima_knowledge_base", "itick_market_data", "requests", "playwright", "manual"] = "playwright"
     status: Literal["online", "pending", "offline"] = "pending"
     notes: str = ""
     validation_url: str = ""
@@ -275,6 +281,16 @@ class ImaConfigInput(BaseModel):
     client_id: str = Field(default="", max_length=255)
     api_key: str = Field(default="", repr=False)
     skill_download_url: str = Field(default=DEFAULT_IMA_SKILL_DOWNLOAD_URL, max_length=1_000)
+    clear_credentials: bool = False
+
+
+class ItickConfigInput(BaseModel):
+    api_base: str = Field(default=DEFAULT_ITICK_API_BASE, max_length=1_000)
+    api_key: str = Field(default="", repr=False)
+    default_symbols: list[str] = Field(default_factory=list, max_length=100)
+    kline_type: int = Field(default=2, ge=1, le=10)
+    kline_limit: int = Field(default=60, ge=1, le=300)
+    timeout_seconds: int = Field(default=20, ge=3, le=60)
     clear_credentials: bool = False
 
 
@@ -486,6 +502,14 @@ def ima_channel_config_public() -> dict:
         "api_key_configured": configured,
         "skill_download_url": config.get("skill_download_url") or DEFAULT_IMA_SKILL_DOWNLOAD_URL,
     }
+
+
+def itick_channel_config() -> dict:
+    return normalize_itick_config(channel_request_config("itick"))
+
+
+def itick_channel_config_public() -> dict:
+    return public_itick_config(itick_channel_config())
 
 
 def init_db() -> None:
@@ -853,6 +877,41 @@ def init_db() -> None:
                 research_enabled=1,builtin=1
             WHERE id='ima-knowledge'
             """
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO channels(
+              id,name,type,url,collection_mode,status,notes,parsing_strategy,
+              normalization_quality_threshold,max_scrolls,research_enabled,builtin,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "itick",
+                "iTick 行情 API",
+                "股票/外汇/指数/加密货币行情",
+                DEFAULT_ITICK_API_BASE,
+                "itick_market_data",
+                "pending",
+                "通过 iTick REST API 获取股票实时行情与 K 线；API Key 仅在本机加密保存。",
+                "fixed",
+                86,
+                1,
+                1,
+                1,
+                now(),
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE channels
+            SET name='iTick 行情 API',type='股票/外汇/指数/加密货币行情',url=?,
+                collection_mode='itick_market_data',
+                notes='通过 iTick REST API 获取股票实时行情与 K 线；API Key 仅在本机加密保存。',
+                parsing_strategy='fixed',normalization_quality_threshold=86,max_scrolls=1,
+                research_enabled=1,builtin=1
+            WHERE id='itick'
+            """,
+            (DEFAULT_ITICK_API_BASE,),
         )
         provider_count = conn.execute("SELECT COUNT(*) AS count FROM model_providers").fetchone()["count"]
         legacy_provider = conn.execute("SELECT value FROM settings WHERE key='provider'").fetchone()
@@ -1413,6 +1472,71 @@ def fixed_normalized_items(snapshot: sqlite3.Row, mode: str = "fixed") -> tuple[
         if items:
             return items, ""
         return [], "IMA knowledge base returned no displayable results"
+    if isinstance(payload, dict) and payload.get("platform") == "itick_market_data":
+        symbol = payload.get("symbol") if isinstance(payload.get("symbol"), dict) else {}
+        region = str(symbol.get("region") or "").strip()
+        code = str(symbol.get("code") or "").strip()
+        symbol_label = f"{region}:{code}".strip(":") or "unknown"
+        if payload.get("category") == "collector_diagnostics":
+            failures = payload.get("failures") if isinstance(payload.get("failures"), dict) else {}
+            title = f"iTick collector diagnostics {symbol_label}"
+            item_content = json.dumps(failures, ensure_ascii=False, default=str, indent=2)
+            return [
+                {
+                    "item_key": stable_item_key(snapshot["channel_id"], source_url, occurred_at, title, item_content),
+                    "occurred_at": occurred_at,
+                    "author": "iTick",
+                    "title": title[:500],
+                    "content": item_content,
+                    "source_url": source_url,
+                    "attachments": [],
+                    "metadata": {
+                        "platform": payload["platform"],
+                        "adapter": payload.get("adapter", ""),
+                        "category": payload.get("category", ""),
+                        "query": payload.get("query", ""),
+                        "api_base_host": payload.get("api_base_host", ""),
+                    },
+                    "quality_score": 58,
+                    "normalization_mode": mode,
+                }
+            ], ""
+        quote = payload.get("quote")
+        kline = payload.get("kline")
+        diagnostics = payload.get("diagnostics") if isinstance(payload.get("diagnostics"), dict) else {}
+        item_content = json.dumps(
+            {
+                "symbol": symbol,
+                "quote": quote,
+                "kline": kline,
+                "diagnostics": diagnostics,
+            },
+            ensure_ascii=False,
+            default=str,
+            indent=2,
+        )
+        title = f"iTick 行情快照 {symbol_label}"
+        return [
+            {
+                "item_key": stable_item_key(snapshot["channel_id"], source_url, occurred_at, title, item_content),
+                "occurred_at": occurred_at,
+                "author": "iTick",
+                "title": title[:500],
+                "content": item_content,
+                "source_url": source_url,
+                "attachments": [],
+                "metadata": {
+                    "platform": payload["platform"],
+                    "adapter": payload.get("adapter", ""),
+                    "symbol": symbol,
+                    "query": payload.get("query", ""),
+                    "collection_window": payload.get("collection_window", {}),
+                    "api_base_host": payload.get("api_base_host", ""),
+                },
+                "quality_score": 88 if diagnostics.get("quote_available") else 76,
+                "normalization_mode": mode,
+            }
+        ], ""
     if isinstance(payload, dict) and payload.get("adapter") == "market_data_aggregate":
         return [
             {
@@ -1815,6 +1939,8 @@ def dashboard() -> dict:
             channel["wechat_rss_config"] = wechat_rss_config_public()
         if channel["id"] == "ima-knowledge":
             channel["ima_config"] = ima_channel_config_public()
+        if channel["id"] == "itick":
+            channel["itick_config"] = itick_channel_config_public()
     skills = [
         {"name": item.name, "path": str(item.relative_to(ROOT)), "status": "loaded"}
         for item in SKILLS_DIR.iterdir()
@@ -2143,6 +2269,45 @@ def update_ima_config(payload: ImaConfigInput) -> dict:
     return {"status": "saved", "config": ima_channel_config_public()}
 
 
+@app.put("/api/channels/itick/config")
+def update_itick_config(payload: ItickConfigInput) -> dict:
+    existing = itick_channel_config()
+    supplied_api_key = payload.api_key.strip()
+    if payload.clear_credentials:
+        api_key = ""
+    elif supplied_api_key and supplied_api_key != MASKED_SECRET:
+        api_key = supplied_api_key
+    else:
+        api_key = str(existing.get("api_key") or "")
+    config = normalize_itick_config(
+        {
+            "adapter": "itick_market_data",
+            "api_base": payload.api_base.strip() or DEFAULT_ITICK_API_BASE,
+            "api_key": api_key,
+            "default_symbols": payload.default_symbols or existing.get("default_symbols") or [],
+            "kline_type": payload.kline_type,
+            "kline_limit": payload.kline_limit,
+            "timeout_seconds": payload.timeout_seconds,
+        }
+    )
+    save_channel_request_config("itick", config)
+    with db() as conn:
+        conn.execute(
+            "UPDATE channels SET url=?,status='pending',updated_at=? WHERE id='itick'",
+            (config["api_base"], now()),
+        )
+    log_event(
+        logger,
+        "INFO",
+        "channel.itick.config.saved",
+        channel_id="itick",
+        api_base_host=urlsplit(config["api_base"]).netloc,
+        api_key_configured=bool(config["api_key"]),
+        default_symbol_count=len(config["default_symbols"]),
+    )
+    return {"status": "saved", "config": itick_channel_config_public()}
+
+
 @app.get("/api/channels/wechat-mp-rss/component-status")
 def wechat_rss_component_status() -> dict:
     return persist_wechat_rss_status(managed_werss_status(wechat_rss_config()))
@@ -2432,23 +2597,7 @@ def start_wechat_rss_sidecar() -> dict:
 
 @app.post("/api/channels")
 def create_channel(payload: ChannelInput) -> dict:
-    channel = {"id": uuid4().hex[:10], **payload.model_dump(), "builtin": 0, "last_check": "", "updated_at": now()}
-    channel["group_ids"] = json.dumps(channel["group_ids"], ensure_ascii=False)
-    with db() as conn:
-        conn.execute(
-            """
-            INSERT INTO channels(
-              id,name,type,url,collection_mode,status,notes,validation_url,success_url_contains,success_selector,
-              group_ids,parsing_strategy,normalization_quality_threshold,max_scrolls,research_enabled,builtin,last_check,updated_at
-            )
-            VALUES(
-              :id,:name,:type,:url,:collection_mode,:status,:notes,:validation_url,:success_url_contains,:success_selector,
-              :group_ids,:parsing_strategy,:normalization_quality_threshold,:max_scrolls,:research_enabled,:builtin,:last_check,:updated_at
-            )
-            """,
-            channel,
-        )
-    return {**channel, "group_ids": json.loads(channel["group_ids"])}
+    raise HTTPException(410, "通用添加信源入口已关闭；信源请通过后端内置适配后发布。")
 
 
 @app.put("/api/channels/{channel_id}")
@@ -2646,6 +2795,15 @@ def check_channel(channel_id: str) -> dict:
             )
         log_event(logger, "INFO" if result["status"] == "online" else "WARNING", "channel.check.completed", channel_id=channel_id, status=result["status"], message=result["message"])
         return result
+    if channel_id == "itick" and channel:
+        result = itick_status(itick_channel_config())
+        with db() as conn:
+            conn.execute(
+                "UPDATE channels SET status=?,last_check=?,updated_at=? WHERE id=?",
+                (result["status"], result["checked_at"], result["checked_at"], channel_id),
+            )
+        log_event(logger, "INFO" if result["status"] == "online" else "WARNING", "channel.check.completed", channel_id=channel_id, status=result["status"], message=result["message"])
+        return result
     if channel:
         request_config = channel_request_config(channel_id)
         if request_config.get("adapter") == "mx_authorized_request_replay":
@@ -2699,11 +2857,11 @@ def refresh_browser_channel_states() -> None:
         channels = [
             dict(row)
             for row in conn.execute(
-                "SELECT id FROM channels WHERE collection_mode='playwright' OR id IN ('web-rumors','akshare','industry-news','wechat-mp-rss','ima-knowledge')"
+                "SELECT id FROM channels WHERE collection_mode='playwright' OR id IN ('web-rumors','akshare','industry-news','wechat-mp-rss','ima-knowledge','itick')"
             )
         ]
     for channel in channels:
-        if channel["id"] in ("web-rumors", "akshare", "industry-news", "wechat-mp-rss", "ima-knowledge") or browser_profile(channel["id"]).exists():
+        if channel["id"] in ("web-rumors", "akshare", "industry-news", "wechat-mp-rss", "ima-knowledge", "itick") or browser_profile(channel["id"]).exists():
             try:
                 check_channel(channel["id"])
             except Exception as exc:

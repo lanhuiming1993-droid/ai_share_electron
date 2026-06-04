@@ -6,10 +6,18 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.8] - 2026-06-04
+
 ### Added
 
+- iTick 行情 API 内置信源，支持本机加密配置 API Key、默认代码、quote 与 K 线快照采集。
+- Codex 本机 iTick MCP 配置，使用官方 `uvx itick-mcp` stdio 启动方式。
 - Loopback-only noVNC workspace for interactive Playwright channel login.
 - WeRSS startup synchronization for deployment-level administrator credentials.
+
+### Changed
+
+- 信源新增入口改为后端内置适配发布路线，浏览器客户端不再提供通用添加渠道按钮。
 
 ### Fixed
 
@@ -82,7 +90,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 - Electron application source, npm dependency, and startup workflow.
 
-[Unreleased]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.7...HEAD
+[Unreleased]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.8...HEAD
+[0.2.8]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.7...v0.2.8
 [0.2.7]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.4...v0.2.5

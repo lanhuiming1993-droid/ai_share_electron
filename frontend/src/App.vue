@@ -29,6 +29,7 @@ const editingProviderId = ref("");
 const channelForm = reactive({ name: "", type: "", url: "", collection_mode: "playwright", status: "pending", notes: "", validation_url: "", success_url_contains: "", success_selector: "", group_ids: [], parsing_strategy: "hybrid", normalization_quality_threshold: 60, max_scrolls: 8, research_enabled: false });
 const marketDataForm = reactive({ enable_akshare: true, enable_baostock: true, enable_tushare: true, tushare_token: "", tushare_token_configured: false, clear_tushare_token: false, component_timeout_seconds: 35 });
 const imaForm = reactive({ client_id: "", api_key: "", api_key_configured: false, skill_download_url: "https://app-dl.ima.qq.com/skills/ima-skills-1.1.7.zip", clear_credentials: false });
+const itickForm = reactive({ api_base: "https://api0.itick.org", api_key: "", api_key_configured: false, default_symbols_text: "HK:700\nUS:AAPL\nSH:600519", kline_type: 2, kline_limit: 60, timeout_seconds: 20, clear_credentials: false });
 const wechatRssForm = reactive({ base_url: "http://127.0.0.1:8001", feed_ids_text: "all", access_key: "", secret_key: "", credentials_configured: false, admin_username: "admin", admin_password: "", admin_password_configured: false, clear_credentials: false, timeout_seconds: 20, max_items_per_feed: 100 });
 const wechatRssComponent = reactive({ status: "pending", message: "尚未检查", ready: false, service_online: false, rss_online: false, subscription_count: 0, subscriptions: [], subscription_error: "", docker_available: false, docker_engine_available: false, managed_setup_available: false, management_url: "", onboarding_steps: [] });
 Object.assign(wechatRssComponent, { wechat_authorized: false, wechat_login_state: "unknown", wechat_message: "", admin_authorized: false, qr_available: false });
@@ -78,6 +79,7 @@ const pageSubtitle = computed(() => pageMeta[activePage.value][1]);
 const wechatRssAuthorized = computed(() => Boolean(wechatRssComponent.wechat_authorized || wechatRssLogin.authorized || wechatRssComponent.ready));
 const canonicalChannelNames = {
   akshare: "AkShare 市场数据",
+  itick: "iTick 行情 API",
   "industry-news": "产业趋势公开资讯",
   "wechat-mp-rss": "微信公众号（WeRSS）",
   "ima-knowledge": "IMA 知识库",
@@ -95,6 +97,7 @@ function channelStatusDescription(channel) {
   if (channel.status === "online") {
     if (channel.id === "wechat-mp-rss") return "微信公众号快照采集可用";
     if (channel.id === "ima-knowledge") return "IMA 知识库检索可用";
+    if (channel.id === "itick") return "iTick 行情 API 可用";
     if (channel.collection_mode === "playwright") return "登录态可用";
     if (channel.id === "web-rumors") return "授权会话可用";
     return "公开采集可用";
@@ -102,6 +105,7 @@ function channelStatusDescription(channel) {
   if (channel.status === "offline") {
     if (channel.id === "wechat-mp-rss") return "微信公众号组件不可用，请重新登录或检查高级配置";
     if (channel.id === "ima-knowledge") return "IMA 凭证或知识库不可用，请检查渠道配置";
+    if (channel.id === "itick") return "iTick 凭证或 API 不可用，请检查渠道配置";
     if (channel.collection_mode === "playwright") return "登录态失效，请重新登录";
     if (channel.id === "web-rumors") return "授权会话失效，请重新导入 HAR";
     return "公开采集暂不可用";
@@ -693,12 +697,18 @@ async function deleteTask(item) {
 }
 
 function openChannelModal(channel = null) {
+  if (!channel) {
+    notice.value = "新增信源入口已关闭；信源请通过后端内置适配后发布。";
+    return;
+  }
   editingChannel.value = channel;
   Object.assign(channelForm, channel ? { ...channel, research_enabled: Boolean(channel.research_enabled), group_ids: [...(channel.group_ids || [])] } : { name: "", type: "", url: "", collection_mode: "playwright", status: "pending", notes: "", validation_url: "", success_url_contains: "", success_selector: "", group_ids: [], parsing_strategy: "hybrid", normalization_quality_threshold: 60, max_scrolls: 8, research_enabled: false });
   Object.assign(marketDataForm, channel?.market_data_config || { enable_akshare: true, enable_baostock: true, enable_tushare: true, tushare_token: "", tushare_token_configured: false, clear_tushare_token: false, component_timeout_seconds: 35 });
   marketDataForm.clear_tushare_token = false;
   Object.assign(imaForm, channel?.ima_config || { client_id: "", api_key: "", api_key_configured: false, skill_download_url: "https://app-dl.ima.qq.com/skills/ima-skills-1.1.7.zip" });
   imaForm.clear_credentials = false;
+  const itickConfig = channel?.itick_config || { api_base: "https://api0.itick.org", api_key: "", api_key_configured: false, default_symbols: ["HK:700", "US:AAPL", "SH:600519"], kline_type: 2, kline_limit: 60, timeout_seconds: 20 };
+  Object.assign(itickForm, { ...itickConfig, api_key: "", default_symbols_text: (itickConfig.default_symbols || ["HK:700", "US:AAPL", "SH:600519"]).join("\n"), clear_credentials: false });
   const wechatRssConfig = channel?.wechat_rss_config || { base_url: "http://127.0.0.1:8001", feed_ids: ["all"], access_key: "", secret_key: "", credentials_configured: false, admin_username: "admin", admin_password: "", admin_password_configured: false, timeout_seconds: 20, max_items_per_feed: 100 };
   Object.assign(wechatRssForm, { ...wechatRssConfig, feed_ids_text: (wechatRssConfig.feed_ids || ["all"]).join("\n"), clear_credentials: false });
   channelModal.value = true;
@@ -727,7 +737,19 @@ async function saveImaConfiguration() {
   });
 }
 
+async function saveItickConfiguration() {
+  const { default_symbols_text, ...config } = itickForm;
+  return request("/api/channels/itick/config", {
+    method: "PUT",
+    body: JSON.stringify({ ...config, default_symbols: default_symbols_text.split(/\r?\n|,|，|;|；/).map((item) => item.trim()).filter(Boolean) }),
+  });
+}
+
 async function saveChannel(openLoginAfterSave = false, loginWindow = null) {
+  if (!editingChannel.value) {
+    notice.value = "新增信源入口已关闭；信源请通过后端内置适配后发布。";
+    return;
+  }
   if (!channelForm.name.trim() || !channelForm.type.trim()) {
     notice.value = "请填写渠道名称和渠道类型";
     return;
@@ -744,6 +766,9 @@ async function saveChannel(openLoginAfterSave = false, loginWindow = null) {
     }
     if (saved.id === "ima-knowledge") {
       await saveImaConfiguration();
+    }
+    if (saved.id === "itick") {
+      await saveItickConfiguration();
     }
     notice.value = editingChannel.value ? "渠道配置已更新" : "新渠道已添加";
     closeChannelModal();
@@ -1630,7 +1655,6 @@ onUnmounted(() => {
               </div>
               <div class="flex gap-2">
                 <button @click="checkAllChannels" class="secondary">巡检状态</button>
-                <button @click="openChannelModal()" class="primary">添加渠道</button>
               </div>
             </div>
             <div v-for="channel in data.channels" :key="channel.id" class="setting-row px-5 py-4">
@@ -1639,6 +1663,7 @@ onUnmounted(() => {
                 <small>{{ channel.type }} · {{ channelStatusDescription(channel) }}</small>
                 <small v-if="channel.group_ids?.length">星球 ID：{{ channel.group_ids.join('、') }}</small>
                 <small v-if="channel.id==='akshare'">组件：AkShare · BaoStock · TuShare{{ channel.market_data_config?.tushare_token_configured ? '（token 已加密保存）' : '（等待 token）' }}</small>
+                <small v-if="channel.id==='itick'">iTick 行情 API：配置中维护 API Base、API Key 和默认代码；API Key 仅本地加密保存</small>
                 <small v-if="channel.id==='wechat-mp-rss'">微信扫码登录后搜索并加入公众号；采集按严格时间窗读取文章快照</small>
                 <small v-if="channel.id==='ima-knowledge'">在配置中维护 ClientID、API Key 和 IMA Skill 下载地址；API Key 仅本地加密保存</small>
                 <small>整理策略：{{ channel.parsing_strategy }} · 质量阈值 {{ channel.normalization_quality_threshold }} · 最大滚动 {{ channel.max_scrolls }}</small>
@@ -1648,7 +1673,7 @@ onUnmounted(() => {
               <div class="flex items-center gap-3">
                 <span :class="channel.status==='online'?'status-good':'status-warn'">{{ channel.status }}</span>
                 <button @click="normalizeExistingChannel(channel)" class="secondary">整理已有快照</button>
-                <button v-if="channel.collection_mode==='playwright' || ['web-rumors','akshare','industry-news','wechat-mp-rss','ima-knowledge'].includes(channel.id)" @click="checkChannel(channel)" class="secondary">检查状态</button>
+                <button v-if="channel.collection_mode==='playwright' || ['web-rumors','akshare','industry-news','wechat-mp-rss','ima-knowledge','itick'].includes(channel.id)" @click="checkChannel(channel)" class="secondary">检查状态</button>
                 <button @click="openChannelModal(channel)" class="secondary">配置</button>
               </div>
             </div>
@@ -2041,7 +2066,7 @@ onUnmounted(() => {
       <section class="flex max-h-[94vh] w-full max-w-2xl flex-col overflow-hidden rounded-3xl border border-white/[.12] bg-[#101a2a] shadow-2xl shadow-black/40">
         <header class="flex items-center justify-between border-b border-white/[.08] px-6 py-5">
           <div>
-            <h2 class="text-lg font-semibold text-white">{{ editingChannel ? '配置渠道' : '添加渠道' }}</h2>
+            <h2 class="text-lg font-semibold text-white">配置渠道</h2>
             <p class="mt-1 text-xs text-slate-500">保存渠道入口、采集方式和当前可用状态</p>
           </div>
           <button @click="closeChannelModal" class="flex h-8 w-8 items-center justify-center rounded-full text-lg text-slate-500 transition hover:bg-white/[.06] hover:text-white">×</button>
@@ -2069,6 +2094,7 @@ onUnmounted(() => {
             <span class="form-label">采集方式</span>
             <select v-model="channelForm.collection_mode" class="field mt-2 w-full">
               <option value="akshare">AkShare 模块</option>
+              <option value="itick_market_data">iTick 行情 API</option>
               <option value="industry_news">产业趋势公开资讯</option>
               <option value="wechat_rss">微信公众号 WeRSS RSS</option>
               <option value="ima_knowledge_base">IMA 知识库 OpenAPI</option>
@@ -2116,6 +2142,43 @@ onUnmounted(() => {
                 <input v-model.number="marketDataForm.component_timeout_seconds" type="number" min="5" max="120" class="field w-20" />
                 秒
               </label>
+            </div>
+          </div>
+          <div v-if="editingChannel?.id==='itick'" class="col-span-2 rounded-2xl border border-teal-400/20 bg-teal-400/[.04] p-4">
+            <span class="form-label">iTick 行情 API</span>
+            <p class="mt-1 text-xs leading-5 text-slate-500">按官方 REST 语义读取股票实时 quote 与 K 线。API Key 只在本机加密保存，页面接口只回传掩码。</p>
+            <div class="mt-3 grid grid-cols-2 gap-3">
+              <label>
+                <span class="form-label">API Base</span>
+                <input v-model="itickForm.api_base" autocomplete="off" placeholder="https://api0.itick.org" class="field mt-2 w-full" />
+              </label>
+              <label>
+                <span class="form-label">API Key</span>
+                <input v-model="itickForm.api_key" type="password" autocomplete="new-password" :placeholder="itickForm.api_key_configured ? '已加密保存；不填则保留原密钥' : 'iTick API Key'" class="field mt-2 w-full" />
+              </label>
+            </div>
+            <label class="mt-3 block">
+              <span class="form-label">默认代码</span>
+              <textarea v-model="itickForm.default_symbols_text" rows="4" placeholder="HK:700&#10;US:AAPL&#10;SH:600519" class="field mt-2 w-full"></textarea>
+              <small class="mt-1 block text-xs leading-5 text-slate-600">每行一个 <code>REGION:CODE</code>，例如港股 <code>HK:700</code>、美股 <code>US:AAPL</code>、A 股 <code>SH:600519</code>。个股研究时也会从查询词中自动识别 6 位 A 股代码。</small>
+            </label>
+            <div class="mt-3 grid grid-cols-3 gap-3">
+              <label>
+                <span class="form-label">K 线类型</span>
+                <input v-model.number="itickForm.kline_type" type="number" min="1" max="10" class="field mt-2 w-full" />
+              </label>
+              <label>
+                <span class="form-label">K 线条数</span>
+                <input v-model.number="itickForm.kline_limit" type="number" min="1" max="300" class="field mt-2 w-full" />
+              </label>
+              <label>
+                <span class="form-label">请求超时秒数</span>
+                <input v-model.number="itickForm.timeout_seconds" type="number" min="3" max="60" class="field mt-2 w-full" />
+              </label>
+            </div>
+            <div class="mt-3 flex flex-wrap items-center gap-4">
+              <label class="text-xs text-slate-400"><input v-model="itickForm.clear_credentials" type="checkbox" class="mr-2" />清除已保存 API Key</label>
+              <small class="text-xs leading-5 text-slate-600">保存后点击“检查状态”即可用第一条默认代码验证当前 iTick 凭证。</small>
             </div>
           </div>
           <div v-if="editingChannel?.id==='wechat-mp-rss'" class="col-span-2 rounded-2xl border border-teal-400/20 bg-teal-400/[.04] p-4">

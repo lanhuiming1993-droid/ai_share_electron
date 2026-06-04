@@ -18,6 +18,7 @@ from bs4 import BeautifulSoup
 from backend.http_policy import browser_headers, browser_http_session
 from backend.ima_openapi import collect_ima_knowledge_base
 from backend.industry_news_sources import collect_public_industry_news
+from backend.itick_source import collect_itick_market_data
 from backend.subprocess_utils import hidden_window_creationflags
 from backend.wechat_rss import collect_werss
 
@@ -480,6 +481,8 @@ def collect_channel(channel: dict[str, Any], window: dict[str, str], profile: Pa
         return collect_werss(channel, window, query)
     if mode == "ima_knowledge_base":
         return collect_ima_knowledge_base(channel["id"], window, query, channel.get("request_config") or {})
+    if mode == "itick_market_data":
+        return collect_itick_market_data(channel["id"], window, query, channel.get("request_config") or {})
     if mode == "requests":
         if (channel.get("request_config") or {}).get("adapter") == "mx_authorized_request_replay":
             return collect_mx(channel, window, query)
