@@ -18,6 +18,12 @@ The project follows [Semantic Versioning](https://semver.org/).
 - WeRSS upstream startup logs exposing deployment environment variables.
 - MX HAR and other API failures returning HTML or plain text that the browser client attempted to parse as JSON.
 
+## [0.2.7] - 2026-06-04
+
+### Fixed
+
+- Browser client messages now localize embedded ISO timestamps to Beijing 24-hour time in API errors, task failures, audit details, and exported report text.
+
 ## [0.2.6] - 2026-06-04
 
 ### Fixed
@@ -76,7 +82,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 - Electron application source, npm dependency, and startup workflow.
 
-[Unreleased]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.6...HEAD
+[Unreleased]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.7...HEAD
+[0.2.7]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.6...v0.2.7
 [0.2.6]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.3...v0.2.4

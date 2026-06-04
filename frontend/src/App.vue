@@ -175,15 +175,22 @@ function formatBeijingTime(value) {
   return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second}`;
 }
 
+const inlineTimestampPattern = /\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:?\d{2})?\b/g;
+
+function localizeInlineTimestamps(value) {
+  return String(value || "").replace(inlineTimestampPattern, (match) => {
+    const date = new Date(match.replace(" ", "T"));
+    if (Number.isNaN(date.getTime())) return match;
+    return `${formatBeijingTime(date)} 北京时间`;
+  });
+}
+
 function localizeReportTimestamps(report) {
-  return String(report || "").replace(
-    /\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d{1,6})?)?(?:Z|[+-]\d{2}:?\d{2})?\b/g,
-    (match) => {
-      const date = new Date(match.replace(" ", "T"));
-      if (Number.isNaN(date.getTime())) return match;
-      return `${formatBeijingTime(date)} 北京时间`;
-    },
-  );
+  return localizeInlineTimestamps(report);
+}
+
+function displayMessage(value) {
+  return localizeInlineTimestamps(value);
 }
 
 function sanitizeClientContext(value, key = "") {
@@ -228,23 +235,23 @@ async function flushFrontendLogs() {
 
 function formatApiErrorDetail(detail) {
   if (Array.isArray(detail)) {
-    return detail.map((item) => {
+    return localizeInlineTimestamps(detail.map((item) => {
       if (!item || typeof item !== "object") return String(item);
       const location = Array.isArray(item.loc) ? item.loc.join(".") : "";
       const message = item.msg || item.message || JSON.stringify(item);
       return location ? `${location}: ${message}` : message;
-    }).join("；");
+    }).join("；"));
   }
   if (detail && typeof detail === "object") {
     const nested = detail.detail ?? detail.message ?? detail.error;
     if (nested && nested !== detail) return formatApiErrorDetail(nested);
     try {
-      return JSON.stringify(detail);
+      return localizeInlineTimestamps(JSON.stringify(detail));
     } catch {
-      return String(detail);
+      return localizeInlineTimestamps(String(detail));
     }
   }
-  return String(detail || "请求失败");
+  return localizeInlineTimestamps(String(detail || "请求失败"));
 }
 
 async function request(path, options = {}) {
@@ -278,8 +285,9 @@ async function request(path, options = {}) {
     return body;
   } catch (error) {
     if (!String(error.message).includes("请求 ID")) {
-      frontendLog("error", "api.request.network_failed", error.message, { method, path, request_id: requestId, latency_ms: Math.round(performance.now() - startedAt) });
-      throw new Error(`${error.message} · 请求 ID ${requestId}`);
+      const message = localizeInlineTimestamps(error.message);
+      frontendLog("error", "api.request.network_failed", message, { method, path, request_id: requestId, latency_ms: Math.round(performance.now() - startedAt) });
+      throw new Error(`${message} · 请求 ID ${requestId}`);
     }
     throw error;
   }
@@ -1375,7 +1383,7 @@ onUnmounted(() => {
       </header>
 
       <div class="mx-auto max-w-[1480px] p-8">
-        <div v-if="notice" class="mb-5 rounded-2xl border border-teal-400/20 bg-teal-400/[.08] px-4 py-3 text-sm text-teal-100">{{ notice }}</div>
+        <div v-if="notice" class="mb-5 rounded-2xl border border-teal-400/20 bg-teal-400/[.08] px-4 py-3 text-sm text-teal-100">{{ displayMessage(notice) }}</div>
 
         <template v-if="activePage==='dashboard'">
           <section class="mb-5 grid grid-cols-4 gap-4">
@@ -1491,7 +1499,7 @@ onUnmounted(() => {
                 <p class="font-medium text-white">{{ item.target }} · {{ item.title }}</p>
                 <p class="mt-1 text-xs text-slate-600">{{ formatBeijingTime(item.created_at) }} · {{ item.status }}</p>
                 <p class="mt-2 text-xs text-slate-500">{{ item.objective }}</p>
-                <p v-if="item.agent_error" class="mt-2 text-xs text-rose-300">{{ item.agent_error }}</p>
+                <p v-if="item.agent_error" class="mt-2 text-xs text-rose-300">{{ displayMessage(item.agent_error) }}</p>
               </div>
               <div class="flex shrink-0 items-center gap-2">
                 <button v-if="item.report" @click="openReport(item.report, `${item.target} - ${item.title}`)" class="report-action">查看报告</button>
@@ -1545,7 +1553,7 @@ onUnmounted(() => {
               <p v-if="sourceJobSubmitting" class="text-xs text-teal-200">请求处理中，请勿重复点击</p>
             </div>
             <div v-if="sourceJobFeedback" class="mt-3 rounded-xl border px-3 py-2 text-xs leading-5" :class="sourceJobFeedbackType==='error'?'border-rose-400/25 bg-rose-400/[.08] text-rose-200':sourceJobFeedbackType==='warn'?'border-amber-400/25 bg-amber-400/[.08] text-amber-200':sourceJobFeedbackType==='success'?'border-emerald-400/25 bg-emerald-400/[.08] text-emerald-200':'border-teal-400/20 bg-teal-400/[.08] text-teal-100'">
-              {{ sourceJobFeedback }}
+              {{ displayMessage(sourceJobFeedback) }}
             </div>
           </section>
           <section class="panel mt-5 p-5">
@@ -1561,7 +1569,7 @@ onUnmounted(() => {
                 <p class="mt-1 text-xs text-slate-600">信源：{{ jobChannelNames(job).join('、') }} · 窗口：{{ job.lookback_days }} 天</p>
                 <p v-if="job.runs?.length" class="mt-1 text-xs text-slate-600">逐信源：{{ sourceRunSummary(job) }}</p>
                 <p v-if="job.report_anchor" class="mt-1 text-xs text-slate-600">报告数据锚点：{{ formatBeijingTime(job.report_anchor) }}</p>
-                <p v-if="job.error" class="mt-2 max-w-4xl break-all text-xs leading-5 text-rose-300">{{ job.error }}</p>
+                <p v-if="job.error" class="mt-2 max-w-4xl break-all text-xs leading-5 text-rose-300">{{ displayMessage(job.error) }}</p>
               </div>
               <div class="flex shrink-0 gap-2">
                 <button v-if="job.snapshot_count" @click="openSnapshots(job)" class="snapshot-action">查看快照</button>
@@ -1723,7 +1731,7 @@ onUnmounted(() => {
                 <p class="mt-1 text-xs text-slate-600">{{ formatBeijingTime(job.created_at) }} · {{ job.action }} · {{ sourceJobStatusLabel(job) }} · {{ job.snapshot_count }} 条快照</p>
                 <p class="mt-1 text-xs text-slate-600">信源：{{ jobChannelNames(job).join('、') }}<span v-if="job.evidence_layer"> · Agent 层：{{ job.evidence_layer }}</span></p>
                 <p v-if="job.runs?.length" class="mt-1 text-xs text-slate-600">逐信源：{{ sourceRunSummary(job) }}</p>
-                <p v-if="job.error" class="mt-2 text-xs text-rose-300">{{ job.error }}</p>
+                <p v-if="job.error" class="mt-2 text-xs text-rose-300">{{ displayMessage(job.error) }}</p>
               </div>
               <div class="flex shrink-0 gap-2">
                 <button v-if="job.snapshot_count" @click="openSnapshots(job)" class="snapshot-action">查看快照</button>
@@ -1746,7 +1754,7 @@ onUnmounted(() => {
             <div v-for="event in data.audit.events" :key="event.id" class="list-row">
               <div>
                 <p class="text-sm font-medium text-white">{{ event.event_type }} · {{ event.task_id }}</p>
-                <p class="mt-1 max-w-5xl break-all text-xs leading-5 text-slate-600">{{ event.detail }}</p>
+                <p class="mt-1 max-w-5xl break-all text-xs leading-5 text-slate-600">{{ displayMessage(event.detail) }}</p>
               </div>
               <p class="whitespace-nowrap text-xs text-slate-500">{{ formatBeijingTime(event.created_at) }}</p>
             </div>
@@ -1907,7 +1915,7 @@ onUnmounted(() => {
               <button v-if="item.content_truncated && item.content_preview.length < 200000" @click="loadLongerSnapshotPreview(item)" :disabled="snapshotPreviewLoadingId===item.id" class="secondary disabled:cursor-wait disabled:opacity-60">{{ snapshotPreviewLoadingId===item.id ? '加载中...' : '加载更多预览' }}</button>
               <a :href="snapshotDownloadUrl(item)" class="secondary">下载完整原文</a>
             </div>
-            <p v-if="item.normalization_error" class="mt-3 break-all text-xs leading-5 text-amber-300">{{ item.normalization_error }}</p>
+            <p v-if="item.normalization_error" class="mt-3 break-all text-xs leading-5 text-amber-300">{{ displayMessage(item.normalization_error) }}</p>
             <p v-if="item.content_truncated" class="mt-3 text-xs text-amber-300">当前仅展示 {{ item.content_preview.length }} / {{ item.content_length }} 字符预览。完整内容请下载原文。</p>
             <pre class="mt-4 max-h-[440px] overflow-auto whitespace-pre-wrap break-words rounded-xl bg-black/25 p-4 text-xs leading-6 text-slate-300">{{ formatSnapshotContent(snapshotPreviewText(item)) }}</pre>
           </article>
