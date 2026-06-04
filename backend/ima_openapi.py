@@ -4,9 +4,12 @@ import hashlib
 import json
 import os
 import re
+import zipfile
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Any
+from xml.etree import ElementTree
 
 import requests
 
@@ -18,7 +21,7 @@ DEFAULT_IMA_SKILL_DOWNLOAD_URL = os.environ.get(
 DEFAULT_TIMEOUT_SECONDS = int(os.environ.get("ALPHADESK_IMA_TIMEOUT_SECONDS", "30") or "30")
 DEFAULT_RESULT_LIMIT = int(os.environ.get("ALPHADESK_IMA_RESULT_LIMIT", "10") or "10")
 DEFAULT_CONTENT_FETCH_LIMIT = int(os.environ.get("ALPHADESK_IMA_CONTENT_FETCH_LIMIT", "10") or "10")
-DEFAULT_CONTENT_MAX_BYTES = int(os.environ.get("ALPHADESK_IMA_CONTENT_MAX_BYTES", "1048576") or "1048576")
+DEFAULT_CONTENT_MAX_BYTES = int(os.environ.get("ALPHADESK_IMA_CONTENT_MAX_BYTES", "10485760") or "10485760")
 DEFAULT_CONTENT_MAX_CHARS = int(os.environ.get("ALPHADESK_IMA_CONTENT_MAX_CHARS", "20000") or "20000")
 TEXT_CONTENT_TYPE_MARKERS = (
     "text/",
@@ -31,6 +34,12 @@ TEXT_CONTENT_TYPE_MARKERS = (
     "application/x-ndjson",
 )
 TEXT_FILE_EXTENSIONS = (".txt", ".md", ".markdown", ".json", ".csv", ".tsv", ".html", ".htm", ".xml", ".log")
+WORD_CONTENT_TYPE_MARKERS = (
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+)
+WORD_FILE_EXTENSIONS = (".docx",)
+FOLDER_MEDIA_TYPES = {"99"}
+TEXT_MEDIA_TYPES = {"7", "13"}
 
 
 def read_user_config(name: str) -> str:
@@ -211,7 +220,7 @@ def safe_error(exc: Exception) -> str:
 
 def is_folder_item(item: dict[str, Any]) -> bool:
     item_type = str(item.get("media_type") or item.get("type") or "").strip().lower()
-    if item_type in {"folder", "folder_info"}:
+    if item_type in {"folder", "folder_info"} or item_type in FOLDER_MEDIA_TYPES:
         return True
     return any(key in item for key in ("folder_id", "file_number", "folder_number", "is_top"))
 
@@ -257,7 +266,51 @@ def looks_textual_response(content_type: str, url: str, sample: bytes) -> bool:
     return printable / max(1, len(decoded)) > 0.85
 
 
-def fetch_url_text(url_info: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+def item_filename(item: dict[str, Any] | None) -> str:
+    if not isinstance(item, dict):
+        return ""
+    return str(item.get("title") or item.get("name") or item.get("file_name") or "").strip()
+
+
+def item_media_type(item: dict[str, Any] | None) -> str:
+    if not isinstance(item, dict):
+        return ""
+    return str(item.get("media_type") or item.get("type") or "").strip()
+
+
+def filename_ext(value: str) -> str:
+    return Path(value.split("?", 1)[0]).suffix.lower()
+
+
+def should_treat_as_text(content_type: str, url: str, sample: bytes, item: dict[str, Any] | None = None) -> bool:
+    name = item_filename(item)
+    media_type = item_media_type(item)
+    if media_type in TEXT_MEDIA_TYPES or filename_ext(name) in TEXT_FILE_EXTENSIONS:
+        return True
+    return looks_textual_response(content_type, url, sample)
+
+
+def should_treat_as_docx(content_type: str, item: dict[str, Any] | None = None) -> bool:
+    lowered_type = content_type.lower()
+    name = item_filename(item)
+    return any(marker in lowered_type for marker in WORD_CONTENT_TYPE_MARKERS) or filename_ext(name) in WORD_FILE_EXTENSIONS
+
+
+def docx_to_text(raw: bytes) -> str:
+    paragraphs: list[str] = []
+    with zipfile.ZipFile(BytesIO(raw)) as archive:
+        xml_bytes = archive.read("word/document.xml")
+    root = ElementTree.fromstring(xml_bytes)
+    namespace = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    for paragraph in root.findall(".//w:p", namespace):
+        parts = [node.text or "" for node in paragraph.findall(".//w:t", namespace)]
+        text = "".join(parts).strip()
+        if text:
+            paragraphs.append(text)
+    return "\n".join(paragraphs).strip()
+
+
+def fetch_url_text(url_info: dict[str, Any], config: dict[str, Any], item: dict[str, Any] | None = None) -> dict[str, Any]:
     url = str(url_info.get("url") or "").strip()
     if not url:
         return {"content_status": "unavailable"}
@@ -280,7 +333,28 @@ def fetch_url_text(url_info: dict[str, Any], config: dict[str, Any]) -> dict[str
                 if len(chunk) > remaining:
                     truncated = True
                     break
-            if not looks_textual_response(content_type, url, bytes(raw[:4096])):
+            if should_treat_as_docx(content_type, item):
+                if truncated:
+                    return {
+                        "content_status": "truncated",
+                        "content_error": "document exceeds IMA content download limit",
+                        "content_type": content_type,
+                        "content_bytes": len(raw),
+                        "content_truncated": True,
+                    }
+                try:
+                    text, char_truncated = clip_text(docx_to_text(bytes(raw)), int(config["content_max_chars"]))
+                except Exception as exc:
+                    return {"content_status": "error", "content_error": safe_error(exc), "content_type": content_type}
+                if not text:
+                    return {"content_status": "empty", "content_type": content_type}
+                return {
+                    "content": text,
+                    "content_status": "ok",
+                    "content_type": content_type or "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    "content_truncated": truncated or char_truncated,
+                }
+            if not should_treat_as_text(content_type, url, bytes(raw[:4096]), item):
                 return {
                     "content_status": "binary",
                     "content_type": content_type,
@@ -344,7 +418,7 @@ def fetch_knowledge_item_content(item: dict[str, Any], config: dict[str, Any]) -
 
     url_info = media_info.get("url_info") if isinstance(media_info.get("url_info"), dict) else {}
     if url_info:
-        result = fetch_url_text(url_info, config)
+        result = fetch_url_text(url_info, config, item)
         if result.get("content_status") != "ok":
             result.setdefault("media_type", media_type)
         return result
@@ -384,12 +458,15 @@ def list_kb_items_recursive(kb: dict[str, str], limit: int, config: dict[str, An
             folders: list[dict[str, Any]] = []
             for key in ("folder_info_list", "folders", "folder_list"):
                 folders.extend(item for item in data.get(key) or [] if isinstance(item, dict))
+            for item in data.get("knowledge_list") or []:
+                if isinstance(item, dict) and is_folder_item(item):
+                    folders.append(item)
             for folder in folders:
                 nested_folder_id = extract_folder_id(folder)
                 if nested_folder_id and nested_folder_id not in visited_folders:
                     queue.append(nested_folder_id)
             raw_items: list[dict[str, Any]] = []
-            for key in ("knowledge_info_list", "info_list", "items"):
+            for key in ("knowledge_list", "knowledge_info_list", "info_list", "items"):
                 raw_items.extend(item for item in data.get(key) or [] if isinstance(item, dict))
             result.extend(item for item in raw_items if not is_folder_item(item))
             if data.get("is_end", True):

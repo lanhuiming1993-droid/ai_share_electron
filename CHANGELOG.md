@@ -18,6 +18,14 @@ The project follows [Semantic Versioning](https://semver.org/).
 - WeRSS upstream startup logs exposing deployment environment variables.
 - MX HAR and other API failures returning HTML or plain text that the browser client attempted to parse as JSON.
 
+## [0.2.6] - 2026-06-04
+
+### Fixed
+
+- IMA knowledge-base collection now parses the real `knowledge_list` response field and recurses through `media_type=99` folders.
+- IMA signed document URLs now extract Markdown/plain-text content even when upstream returns a generic content type.
+- IMA `.docx` files are parsed into text when the signed URL is available.
+
 ## [0.2.5] - 2026-06-04
 
 ### Added
@@ -68,7 +76,8 @@ The project follows [Semantic Versioning](https://semver.org/).
 
 - Electron application source, npm dependency, and startup workflow.
 
-[Unreleased]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.5...HEAD
+[Unreleased]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.6...HEAD
+[0.2.6]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.5...v0.2.6
 [0.2.5]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.4...v0.2.5
 [0.2.4]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/lanhuiming1993-droid/ai_share_electron/compare/v0.2.2...v0.2.3

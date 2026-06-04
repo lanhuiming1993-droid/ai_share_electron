@@ -2,12 +2,40 @@ from __future__ import annotations
 
 import json
 import unittest
+import zipfile
+from io import BytesIO
 from unittest.mock import patch
 
 from backend import ima_openapi
 
 
 class ImaOpenApiTests(unittest.TestCase):
+    def test_browse_ima_knowledge_list_recurses_media_type_99_folders(self) -> None:
+        def fake_request(api_path: str, body: dict, timeout: int | None = None, config: dict | None = None) -> dict:
+            self.assertEqual(api_path, "openapi/wiki/v1/get_knowledge_list")
+            if "folder_id" not in body:
+                return {
+                    "knowledge_list": [
+                        {"media_id": "secret-folder-media-id", "title": "Folder from knowledge_list", "media_type": 99},
+                        {"media_id": "secret-root-media-id", "title": "Root document.md", "media_type": 7},
+                    ],
+                    "is_end": True,
+                }
+            self.assertEqual(body["folder_id"], "secret-folder-media-id")
+            return {
+                "knowledge_list": [{"media_id": "secret-nested-media-id", "title": "Nested document.md", "media_type": 7}],
+                "is_end": True,
+            }
+
+        with patch.object(ima_openapi, "ima_openapi_request", side_effect=fake_request):
+            items = ima_openapi.search_or_list_kb_items(
+                {"id": "secret-kb-id", "name": "Daily Research", "description": ""},
+                "",
+                5,
+                {"client_id": "cid", "api_key": "secret", "content_fetch_limit": 0},
+            )
+        self.assertEqual([item["title"] for item in items], ["Root document.md", "Nested document.md"])
+
     def test_browse_ima_knowledge_base_recurses_into_folders(self) -> None:
         def fake_request(api_path: str, body: dict, timeout: int | None = None, config: dict | None = None) -> dict:
             self.assertEqual(api_path, "openapi/wiki/v1/get_knowledge_list")
@@ -33,6 +61,20 @@ class ImaOpenApiTests(unittest.TestCase):
             )
         self.assertEqual(len(items), 1)
         self.assertEqual(items[0]["title"], "Nested document")
+
+    def test_docx_to_text_extracts_paragraphs(self) -> None:
+        document_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+        <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+          <w:body>
+            <w:p><w:r><w:t>First paragraph</w:t></w:r></w:p>
+            <w:p><w:r><w:t>Second</w:t></w:r><w:r><w:t> paragraph</w:t></w:r></w:p>
+          </w:body>
+        </w:document>
+        """
+        buffer = BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr("word/document.xml", document_xml)
+        self.assertEqual(ima_openapi.docx_to_text(buffer.getvalue()), "First paragraph\nSecond paragraph")
 
     def test_collect_ima_knowledge_base_reads_note_content_without_leaking_ids(self) -> None:
         def fake_request(api_path: str, body: dict, timeout: int | None = None, config: dict | None = None) -> dict:
