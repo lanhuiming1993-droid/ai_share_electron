@@ -17,6 +17,20 @@ DEFAULT_IMA_SKILL_DOWNLOAD_URL = os.environ.get(
 ).strip()
 DEFAULT_TIMEOUT_SECONDS = int(os.environ.get("ALPHADESK_IMA_TIMEOUT_SECONDS", "30") or "30")
 DEFAULT_RESULT_LIMIT = int(os.environ.get("ALPHADESK_IMA_RESULT_LIMIT", "10") or "10")
+DEFAULT_CONTENT_FETCH_LIMIT = int(os.environ.get("ALPHADESK_IMA_CONTENT_FETCH_LIMIT", "10") or "10")
+DEFAULT_CONTENT_MAX_BYTES = int(os.environ.get("ALPHADESK_IMA_CONTENT_MAX_BYTES", "1048576") or "1048576")
+DEFAULT_CONTENT_MAX_CHARS = int(os.environ.get("ALPHADESK_IMA_CONTENT_MAX_CHARS", "20000") or "20000")
+TEXT_CONTENT_TYPE_MARKERS = (
+    "text/",
+    "application/json",
+    "application/xml",
+    "application/xhtml+xml",
+    "application/javascript",
+    "application/x-javascript",
+    "application/markdown",
+    "application/x-ndjson",
+)
+TEXT_FILE_EXTENSIONS = (".txt", ".md", ".markdown", ".json", ".csv", ".tsv", ".html", ".htm", ".xml", ".log")
 
 
 def read_user_config(name: str) -> str:
@@ -59,6 +73,9 @@ def normalize_ima_config(config: dict[str, Any] | None = None, include_fallback:
     skill_download_url = str(raw.get("skill_download_url") or DEFAULT_IMA_SKILL_DOWNLOAD_URL).strip()
     timeout_seconds = int(raw.get("timeout_seconds") or DEFAULT_TIMEOUT_SECONDS)
     result_limit = int(raw.get("result_limit") or DEFAULT_RESULT_LIMIT)
+    content_fetch_limit = int(raw.get("content_fetch_limit") or DEFAULT_CONTENT_FETCH_LIMIT)
+    content_max_bytes = int(raw.get("content_max_bytes") or DEFAULT_CONTENT_MAX_BYTES)
+    content_max_chars = int(raw.get("content_max_chars") or DEFAULT_CONTENT_MAX_CHARS)
     knowledge_base_ids = raw.get("knowledge_base_ids", [])
     if isinstance(knowledge_base_ids, str):
         knowledge_base_ids = [item.strip() for item in re.split(r"[,;\s]+", knowledge_base_ids) if item.strip()]
@@ -77,6 +94,9 @@ def normalize_ima_config(config: dict[str, Any] | None = None, include_fallback:
         "knowledge_base_ids": knowledge_base_ids,
         "timeout_seconds": max(3, min(120, timeout_seconds)),
         "result_limit": max(1, min(50, result_limit)),
+        "content_fetch_limit": max(0, min(50, content_fetch_limit)),
+        "content_max_bytes": max(16_384, min(10_485_760, content_max_bytes)),
+        "content_max_chars": max(1_000, min(200_000, content_max_chars)),
     }
 
 
@@ -185,6 +205,152 @@ def clean_highlight(value: object) -> str:
     return re.sub(r"<[^>]+>", "", text).strip()
 
 
+def safe_error(exc: Exception) -> str:
+    return str(exc).replace("\n", " ").strip()[:180] or type(exc).__name__
+
+
+def is_folder_item(item: dict[str, Any]) -> bool:
+    item_type = str(item.get("media_type") or item.get("type") or "").strip().lower()
+    if item_type in {"folder", "folder_info"}:
+        return True
+    return any(key in item for key in ("folder_id", "file_number", "folder_number", "is_top"))
+
+
+def extract_folder_id(item: dict[str, Any]) -> str:
+    return str(item.get("folder_id") or item.get("media_id") or item.get("id") or "").strip()
+
+
+def extract_media_id(item: dict[str, Any]) -> str:
+    if is_folder_item(item):
+        return ""
+    return str(item.get("media_id") or "").strip()
+
+
+def clip_text(text: str, max_chars: int) -> tuple[str, bool]:
+    if len(text) <= max_chars:
+        return text, False
+    return text[:max_chars].rstrip(), True
+
+
+def html_to_text(text: str) -> str:
+    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def looks_textual_response(content_type: str, url: str, sample: bytes) -> bool:
+    lowered_type = content_type.lower()
+    if any(marker in lowered_type for marker in TEXT_CONTENT_TYPE_MARKERS):
+        return True
+    lowered_url = url.lower().split("?", 1)[0]
+    if lowered_url.endswith(TEXT_FILE_EXTENSIONS):
+        return True
+    if "application/pdf" in lowered_type or "application/octet-stream" in lowered_type:
+        return False
+    if not sample or b"\x00" in sample[:2048]:
+        return False
+    try:
+        decoded = sample[:2048].decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    printable = sum(1 for char in decoded if char.isprintable() or char.isspace())
+    return printable / max(1, len(decoded)) > 0.85
+
+
+def fetch_url_text(url_info: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    url = str(url_info.get("url") or "").strip()
+    if not url:
+        return {"content_status": "unavailable"}
+    headers = url_info.get("headers") if isinstance(url_info.get("headers"), dict) else {}
+    max_bytes = int(config["content_max_bytes"])
+    raw = bytearray()
+    truncated = False
+    try:
+        with requests.get(url, headers=headers, timeout=config["timeout_seconds"], stream=True) as response:
+            response.raise_for_status()
+            content_type = response.headers.get("content-type", "")
+            for chunk in response.iter_content(chunk_size=65_536):
+                if not chunk:
+                    continue
+                remaining = max_bytes - len(raw)
+                if remaining <= 0:
+                    truncated = True
+                    break
+                raw.extend(chunk[:remaining])
+                if len(chunk) > remaining:
+                    truncated = True
+                    break
+            if not looks_textual_response(content_type, url, bytes(raw[:4096])):
+                return {
+                    "content_status": "binary",
+                    "content_type": content_type,
+                    "content_bytes": len(raw),
+                    "content_truncated": truncated,
+                }
+            encoding = response.encoding or "utf-8"
+    except Exception as exc:
+        return {"content_status": "error", "content_error": safe_error(exc)}
+
+    text = bytes(raw).decode(encoding, errors="replace").strip()
+    if "html" in content_type.lower():
+        text = html_to_text(text)
+    text, char_truncated = clip_text(text, int(config["content_max_chars"]))
+    if not text:
+        return {"content_status": "empty", "content_type": content_type}
+    return {
+        "content": text,
+        "content_status": "ok",
+        "content_type": content_type,
+        "content_truncated": truncated or char_truncated,
+    }
+
+
+def fetch_note_content(note_id: str, config: dict[str, Any]) -> dict[str, Any]:
+    if not note_id:
+        return {"content_status": "unavailable"}
+    try:
+        data = ima_openapi_request(
+            "openapi/note/v1/get_doc_content",
+            {"note_id": note_id, "target_content_format": 0},
+            config=config,
+        )
+    except Exception as exc:
+        return {"content_status": "error", "content_error": safe_error(exc)}
+    text, truncated = clip_text(str(data.get("content") or "").strip(), int(config["content_max_chars"]))
+    if not text:
+        return {"content_status": "empty", "media_type": 11}
+    return {
+        "content": text,
+        "content_status": "ok",
+        "media_type": 11,
+        "content_type": "text/plain",
+        "content_truncated": truncated,
+    }
+
+
+def fetch_knowledge_item_content(item: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    media_id = extract_media_id(item)
+    if not media_id:
+        return {"content_status": "missing_media_id" if not is_folder_item(item) else "folder"}
+    try:
+        media_info = ima_openapi_request("openapi/wiki/v1/get_media_info", {"media_id": media_id}, config=config)
+    except Exception as exc:
+        return {"content_status": "error", "content_error": safe_error(exc)}
+
+    media_type = media_info.get("media_type") or item.get("media_type") or item.get("type") or ""
+    if str(media_type) == "11":
+        notebook_ext_info = media_info.get("notebook_ext_info") if isinstance(media_info.get("notebook_ext_info"), dict) else {}
+        return fetch_note_content(str(notebook_ext_info.get("notebook_id") or "").strip(), config)
+
+    url_info = media_info.get("url_info") if isinstance(media_info.get("url_info"), dict) else {}
+    if url_info:
+        result = fetch_url_text(url_info, config)
+        if result.get("content_status") != "ok":
+            result.setdefault("media_type", media_type)
+        return result
+    return {"content_status": "unavailable", "media_type": media_type}
+
+
 def normalize_knowledge_item(item: dict[str, Any], kb: dict[str, str]) -> dict[str, Any]:
     title = str(item.get("title") or item.get("name") or "").strip()
     highlight = clean_highlight(item.get("highlight_content") or item.get("summary") or item.get("content") or "")
@@ -199,31 +365,70 @@ def normalize_knowledge_item(item: dict[str, Any], kb: dict[str, str]) -> dict[s
     }
 
 
+def list_kb_items_recursive(kb: dict[str, str], limit: int, config: dict[str, Any]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    queue: list[str | None] = [None]
+    visited_folders: set[str] = set()
+    while queue and len(result) < limit:
+        folder_id = queue.pop(0)
+        if folder_id:
+            if folder_id in visited_folders:
+                continue
+            visited_folders.add(folder_id)
+        cursor = ""
+        while len(result) < limit:
+            body: dict[str, Any] = {"knowledge_base_id": kb["id"], "cursor": cursor, "limit": min(max(limit, 1), 50)}
+            if folder_id:
+                body["folder_id"] = folder_id
+            data = ima_openapi_request("openapi/wiki/v1/get_knowledge_list", body, config=config)
+            folders: list[dict[str, Any]] = []
+            for key in ("folder_info_list", "folders", "folder_list"):
+                folders.extend(item for item in data.get(key) or [] if isinstance(item, dict))
+            for folder in folders:
+                nested_folder_id = extract_folder_id(folder)
+                if nested_folder_id and nested_folder_id not in visited_folders:
+                    queue.append(nested_folder_id)
+            raw_items: list[dict[str, Any]] = []
+            for key in ("knowledge_info_list", "info_list", "items"):
+                raw_items.extend(item for item in data.get(key) or [] if isinstance(item, dict))
+            result.extend(item for item in raw_items if not is_folder_item(item))
+            if data.get("is_end", True):
+                break
+            cursor = str(data.get("next_cursor") or "")
+            if not cursor:
+                break
+    return result[:limit]
+
+
 def search_or_list_kb_items(
     kb: dict[str, str],
     query: str,
     limit: int,
     config: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    normalized = normalize_ima_config(config)
     if query:
         data = ima_openapi_request(
             "openapi/wiki/v1/search_knowledge",
             {"query": query, "knowledge_base_id": kb["id"], "cursor": ""},
-            config=config,
+            config=normalized,
         )
         raw_items = data.get("info_list") or data.get("knowledge_info_list") or data.get("items") or []
     else:
-        data = ima_openapi_request(
-            "openapi/wiki/v1/get_knowledge_list",
-            {"knowledge_base_id": kb["id"], "cursor": "", "limit": min(max(limit, 1), 50)},
-            config=config,
-        )
-        raw_items = []
-        for key in ("folder_info_list", "folders", "folder_list"):
-            raw_items.extend(data.get(key) or [])
-        for key in ("knowledge_info_list", "info_list", "items"):
-            raw_items.extend(data.get(key) or [])
-    return [normalize_knowledge_item(item, kb) for item in raw_items[:limit] if isinstance(item, dict)]
+        raw_items = list_kb_items_recursive(kb, limit, normalized)
+
+    items: list[dict[str, Any]] = []
+    fetched_content = 0
+    content_fetch_limit = int(normalized["content_fetch_limit"])
+    for item in raw_items[:limit]:
+        if not isinstance(item, dict):
+            continue
+        normalized_item = normalize_knowledge_item(item, kb)
+        if content_fetch_limit > 0 and fetched_content < content_fetch_limit and extract_media_id(item):
+            normalized_item.update(fetch_knowledge_item_content(item, normalized))
+            fetched_content += 1
+        items.append(normalized_item)
+    return items
 
 
 def collect_ima_knowledge_base(

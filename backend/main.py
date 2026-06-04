@@ -1379,9 +1379,13 @@ def fixed_normalized_items(snapshot: sqlite3.Row, mode: str = "fixed") -> tuple[
                 continue
             title = str(result.get("title") or "").strip()
             snippet = str(result.get("snippet") or "").strip()
-            if not title and not snippet:
+            body = str(result.get("content") or "").strip()
+            if not title and not snippet and not body:
                 continue
-            item_content = "\n".join(part for part in (title, snippet) if part).strip()
+            content_parts = [part for part in (title, snippet) if part]
+            if body and body not in content_parts:
+                content_parts.append(body)
+            item_content = "\n".join(content_parts).strip()
             items.append(
                 {
                     "item_key": stable_item_key(snapshot["channel_id"], source_url, occurred_at, title, item_content),
@@ -1398,8 +1402,11 @@ def fixed_normalized_items(snapshot: sqlite3.Row, mode: str = "fixed") -> tuple[
                         "knowledge_base": kb,
                         "folder": result.get("folder", ""),
                         "media_type": result.get("media_type", ""),
+                        "content_status": result.get("content_status", ""),
+                        "content_type": result.get("content_type", ""),
+                        "content_truncated": bool(result.get("content_truncated", False)),
                     },
-                    "quality_score": 82 if snippet else 65,
+                    "quality_score": 88 if body else 82 if snippet else 65,
                     "normalization_mode": mode,
                 }
             )
