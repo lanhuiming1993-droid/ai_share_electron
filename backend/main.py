@@ -1920,13 +1920,38 @@ def channel_names_for_ids(channel_ids: list[str], names: dict[str, str] | None =
     return [names.get(channel_id, CANONICAL_CHANNEL_NAMES.get(channel_id, channel_id)) for channel_id in channel_ids]
 
 
+def standalone_source_job_filter(alias: str = "") -> str:
+    prefix = f"{alias}." if alias else ""
+    return f"{prefix}parent_task_id='' AND {prefix}query='' AND {prefix}evidence_layer=''"
+
+
+def source_job_scope(job: sqlite3.Row | dict) -> tuple[str, str]:
+    values = dict(job)
+    query = str(values.get("query") or "")
+    evidence_layer = str(values.get("evidence_layer") or "")
+    parent_task_id = str(values.get("parent_task_id") or "")
+    general_refresh = evidence_layer == "local_source_snapshots" and not canonical_scope_key(query)
+    if general_refresh or not (parent_task_id or query or evidence_layer):
+        return "general", ""
+    return "research", canonical_scope_key(query)
+
+
 @app.get("/api/dashboard")
 def dashboard() -> dict:
     with db() as conn:
         tasks = [dict(row) for row in conn.execute("SELECT * FROM tasks ORDER BY created_at DESC LIMIT 8")]
         source_jobs = source_job_list_response(
             conn,
-            [dict(row) for row in conn.execute("SELECT * FROM source_collection_jobs ORDER BY created_at DESC LIMIT 80")],
+            [
+                dict(row)
+                for row in conn.execute(
+                    f"""
+                    SELECT * FROM source_collection_jobs
+                    WHERE {standalone_source_job_filter()}
+                    ORDER BY created_at DESC LIMIT 80
+                    """
+                )
+            ],
         )
         channels = [dict(row) for row in conn.execute("SELECT * FROM channels ORDER BY builtin DESC, updated_at")]
         schema = migration_status(conn)
@@ -1966,7 +1991,7 @@ def inventory_summary(conn: sqlite3.Connection) -> dict:
         "snapshot_count": conn.execute("SELECT COUNT(*) AS count FROM source_snapshots").fetchone()["count"],
         "normalized_item_count": conn.execute("SELECT COUNT(*) AS count FROM normalized_source_items").fetchone()["count"],
         "source_report_count": conn.execute(
-            "SELECT COUNT(*) AS count FROM source_collection_jobs WHERE report IS NOT NULL"
+            f"SELECT COUNT(*) AS count FROM source_collection_jobs WHERE report IS NOT NULL AND {standalone_source_job_filter()}"
         ).fetchone()["count"],
         "research_report_count": conn.execute("SELECT COUNT(*) AS count FROM tasks WHERE report IS NOT NULL").fetchone()["count"],
     }
@@ -2119,10 +2144,18 @@ def clear_task_list(scope: Literal["research", "source-jobs", "all"]) -> dict:
                 cursor = conn.execute(f"DELETE FROM tasks WHERE id IN ({task_marks})", task_ids)
                 deleted_research_tasks = cursor.rowcount
         if scope in ("source-jobs", "all"):
-            conn.execute("DELETE FROM source_job_snapshots")
-            conn.execute("DELETE FROM source_collection_runs")
-            cursor = conn.execute("DELETE FROM source_collection_jobs")
-            deleted_source_jobs += cursor.rowcount
+            standalone_job_ids = [
+                row["id"]
+                for row in conn.execute(
+                    f"SELECT id FROM source_collection_jobs WHERE {standalone_source_job_filter()}"
+                )
+            ]
+            if standalone_job_ids:
+                standalone_marks = ",".join("?" for _ in standalone_job_ids)
+                conn.execute(f"DELETE FROM source_job_snapshots WHERE job_id IN ({standalone_marks})", standalone_job_ids)
+                conn.execute(f"DELETE FROM source_collection_runs WHERE job_id IN ({standalone_marks})", standalone_job_ids)
+                cursor = conn.execute(f"DELETE FROM source_collection_jobs WHERE id IN ({standalone_marks})", standalone_job_ids)
+                deleted_source_jobs += cursor.rowcount
     result = {
         "scope": scope,
         "deleted_research_tasks": deleted_research_tasks,
@@ -2292,9 +2325,11 @@ def update_itick_config(payload: ItickConfigInput) -> dict:
     )
     save_channel_request_config("itick", config)
     with db() as conn:
+        current = conn.execute("SELECT status FROM channels WHERE id='itick'").fetchone()
+        next_status = "online" if current and current["status"] == "online" and config["api_key"] else "pending"
         conn.execute(
-            "UPDATE channels SET url=?,status='pending',updated_at=? WHERE id='itick'",
-            (config["api_base"], now()),
+            "UPDATE channels SET url=?,status=?,updated_at=? WHERE id='itick'",
+            (config["api_base"], next_status, now()),
         )
     log_event(
         logger,
@@ -3202,14 +3237,16 @@ def create_source_job(payload: SourceJobInput) -> dict:
         lower_bound = current - timedelta(days=payload.lookback_days)
         windows = []
         with db() as conn:
-            known = {row["id"] for row in conn.execute("SELECT id FROM channels")}
+            channels = {row["id"]: dict(row) for row in conn.execute("SELECT id,collection_mode FROM channels")}
             for channel_id in payload.channel_ids:
-                if channel_id not in known:
+                channel = channels.get(channel_id)
+                if not channel:
                     raise HTTPException(404, f"信源不存在: {channel_id}")
-                reserved = latest_reserved_at(conn, channel_id, scope_key)
-                if reserved and current - reserved < MIN_COLLECTION_INTERVAL:
+                bypass_watermark = should_bypass_collection_watermark(channel["collection_mode"], scope_key)
+                reserved = None if bypass_watermark else latest_reserved_at(conn, channel_id, scope_key)
+                if not bypass_watermark and reserved and current - reserved < MIN_COLLECTION_INTERVAL:
                     continue
-                window_start = max(lower_bound, reserved) if reserved else lower_bound
+                window_start = lower_bound if bypass_watermark or not reserved else max(lower_bound, reserved)
                 if window_start < current:
                     windows.append({"channel_id": channel_id, "window_start": iso(window_start), "window_end": iso(current)})
         job = {
@@ -3430,6 +3467,7 @@ def source_job_snapshots(job_id: str) -> dict:
             channel_ids = json.loads(job["channel_ids"])
             placeholders = ",".join("?" for _ in channel_ids)
             if channel_ids:
+                scope_type, scope_key = source_job_scope(job)
                 snapshots = [
                     dict(row)
                     for row in conn.execute(
@@ -3440,9 +3478,10 @@ def source_job_snapshots(job_id: str) -> dict:
                         FROM source_snapshots s
                         LEFT JOIN channels c ON c.id=s.channel_id
                         WHERE s.channel_id IN ({placeholders}) AND s.collected_at BETWEEN ? AND ?
+                          AND s.scope_type=? AND s.scope_key=?
                         ORDER BY s.occurred_at DESC
                         """,
-                        [SNAPSHOT_LIST_PREVIEW_CHARS, *channel_ids, job["started_at"], job["completed_at"]],
+                        [SNAPSHOT_LIST_PREVIEW_CHARS, *channel_ids, job["started_at"], job["completed_at"], scope_type, scope_key],
                     )
                 ]
     for snapshot in snapshots:
@@ -3720,7 +3759,10 @@ def create_task(payload: TaskInput) -> dict:
     return task
 
 
-EVIDENCE_LAYERS = ("local_source_snapshots", "akshare", "http_requests", "playwright", "model_knowledge")
+EVIDENCE_LAYERS = ("local_source_snapshots", "market_data", "http_requests", "playwright", "model_knowledge")
+EVIDENCE_LAYER_ALIASES = {"akshare": "market_data"}
+MANDATORY_RESEARCH_LAYERS = ("market_data",)
+REALTIME_STOCK_COLLECTION_MODES = {"akshare", "itick_market_data", "industry_news"}
 
 
 def record_agent_event(task_id: str, event_type: str, detail: dict | str) -> None:
@@ -3747,10 +3789,15 @@ def save_agent_state(task_id: str, state: dict, status: str | None = None, error
             )
 
 
+def normalize_evidence_layer(layer: str) -> str:
+    return EVIDENCE_LAYER_ALIASES.get(str(layer or ""), str(layer or ""))
+
+
 def channel_ids_for_layer(layer: str) -> list[str]:
+    layer = normalize_evidence_layer(layer)
     modes = {
-        "akshare": ("akshare",),
-        "http_requests": ("requests", "industry_news", "ima_knowledge_base"),
+        "market_data": ("akshare", "itick_market_data"),
+        "http_requests": ("requests", "industry_news", "wechat_rss", "ima_knowledge_base"),
         "playwright": ("playwright",),
     }.get(layer)
     if not modes:
@@ -3768,6 +3815,17 @@ def channel_ids_for_layer(layer: str) -> list[str]:
                 modes,
             )
         ]
+
+
+def should_bypass_collection_watermark(collection_mode: str, query: str) -> bool:
+    return bool(canonical_scope_key(query)) and collection_mode in REALTIME_STOCK_COLLECTION_MODES
+
+
+def first_incomplete_mandatory_layer(completed: set[str]) -> str:
+    for layer in MANDATORY_RESEARCH_LAYERS:
+        if layer not in completed and channel_ids_for_layer(layer):
+            return layer
+    return ""
 
 
 def research_refresh_channel_ids() -> list[str]:
@@ -3839,7 +3897,7 @@ def task_snapshot_context(lookback_days: int, scope_key: str) -> tuple[str, str,
 
 
 def completed_evidence_layers(task_id: str, state: dict) -> set[str]:
-    completed = set(state.get("completed_layers", []))
+    completed = {normalize_evidence_layer(layer) for layer in state.get("completed_layers", [])}
     completed.add("local_source_snapshots")
     with db() as conn:
         rows = conn.execute(
@@ -3850,7 +3908,7 @@ def completed_evidence_layers(task_id: str, state: dict) -> set[str]:
             """,
             (task_id,),
         )
-        completed.update(row["evidence_layer"] for row in rows)
+        completed.update(normalize_evidence_layer(row["evidence_layer"]) for row in rows)
     return completed
 
 
@@ -3888,18 +3946,28 @@ def advance_analysis_task(task_id: str) -> dict:
         decision = call_provider_structured(prompt, AgentDecision, purpose="stock_agent_decision").model_dump()
         record_agent_event(task_id, "model_decision", {"next_allowed_layer": next_layer, "decision": decision})
         if decision["decision"] == "final":
-            if decision.get("used_model_knowledge") and "model_knowledge" not in completed:
-                raise HTTPException(409, "模型试图提前使用自身知识库，已被红线阻止")
-            report = require_or_repair_html_report(decision["report"], purpose="stock_report")
-            with db() as conn:
-                conn.execute(
-                    "UPDATE tasks SET status='review',report=?,report_anchor=?,agent_state=?,agent_error='' WHERE id=?",
-                    (report, anchor, json.dumps(state, ensure_ascii=False), task_id),
+            forced_layer = first_incomplete_mandatory_layer(completed)
+            if forced_layer:
+                requested_layer = forced_layer
+                record_agent_event(
+                    task_id,
+                    "mandatory_layer_required",
+                    {"layer": forced_layer, "reason": "最终报告前必须先完成实时行情/公司资料补证"},
                 )
-            record_agent_event(task_id, "report_ready", {"anchor": anchor})
-            log_event(logger, "INFO", "agent.advance.completed", task_id=task_id, status="review", report_chars=len(report), anchor=anchor)
-            return {"id": task_id, "status": "review", "report": report, "report_anchor": anchor}
-        requested_layer = decision["next_source"]
+            else:
+                if decision.get("used_model_knowledge") and "model_knowledge" not in completed:
+                    raise HTTPException(409, "模型试图提前使用自身知识库，已被红线阻止")
+                report = require_or_repair_html_report(decision["report"], purpose="stock_report")
+                with db() as conn:
+                    conn.execute(
+                        "UPDATE tasks SET status='review',report=?,report_anchor=?,agent_state=?,agent_error='' WHERE id=?",
+                        (report, anchor, json.dumps(state, ensure_ascii=False), task_id),
+                    )
+                record_agent_event(task_id, "report_ready", {"anchor": anchor})
+                log_event(logger, "INFO", "agent.advance.completed", task_id=task_id, status="review", report_chars=len(report), anchor=anchor)
+                return {"id": task_id, "status": "review", "report": report, "report_anchor": anchor}
+        else:
+            requested_layer = normalize_evidence_layer(decision["next_source"])
         if next_layer == "final_report":
             raise HTTPException(409, "证据链已结束，但模型没有输出最终报告")
         if requested_layer != next_layer or requested_layer == "final_report":

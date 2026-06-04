@@ -254,6 +254,32 @@ class MainBehaviorTests(unittest.TestCase):
         self.assertIn("STOCK_A", context)
         self.assertNotIn("STOCK_B", context)
 
+    def test_dashboard_source_jobs_exclude_research_child_jobs(self) -> None:
+        now = timestamp()
+        with self.main.db() as conn:
+            conn.execute(
+                "INSERT INTO channels(id,name,type,url,collection_mode,status,updated_at) VALUES('dash-source','dash','test','','requests','online',?)",
+                (now,),
+            )
+            conn.execute(
+                """
+                INSERT INTO source_collection_jobs(id,action,channel_ids,windows,lookback_days,skill_name,report_title,status,created_at)
+                VALUES('standalone-source','collect','["dash-source"]','[]',30,'skill','standalone','completed',?)
+                """,
+                (now,),
+            )
+            conn.execute(
+                """
+                INSERT INTO source_collection_jobs(
+                  id,action,channel_ids,windows,lookback_days,skill_name,report_title,status,created_at,parent_task_id,query,evidence_layer
+                ) VALUES('research-child','collect','["dash-source"]','[]',30,'skill','research child','completed',?,'task-a','300782','akshare')
+                """,
+                (now,),
+            )
+        source_job_ids = {job["id"] for job in self.main.dashboard()["source_jobs"]}
+        self.assertIn("standalone-source", source_job_ids)
+        self.assertNotIn("research-child", source_job_ids)
+
     def test_report_submission_is_asynchronous(self) -> None:
         with self.main.db() as conn:
             conn.execute(
@@ -308,6 +334,37 @@ class MainBehaviorTests(unittest.TestCase):
         download = self.main.download_source_snapshot_content("large-snapshot")
         self.assertEqual(download.body.decode(), large_content)
         self.assertIn("alphadesk-snapshot-large-snapshot.txt", download.headers["content-disposition"])
+
+    def test_source_job_snapshot_fallback_uses_job_scope(self) -> None:
+        started_at = timestamp(-2)
+        collected_at = timestamp(-1)
+        completed_at = timestamp()
+        with self.main.db() as conn:
+            conn.execute(
+                "INSERT INTO channels(id,name,type,url,collection_mode,status,updated_at) VALUES('fallback-scope','fallback','test','','requests','online',?)",
+                (collected_at,),
+            )
+            conn.execute(
+                """
+                INSERT INTO source_collection_jobs(
+                  id,action,channel_ids,windows,lookback_days,skill_name,report_title,status,created_at,started_at,completed_at
+                ) VALUES('fallback-job','collect','["fallback-scope"]','[]',30,'skill','fallback','completed',?,?,?)
+                """,
+                (started_at, started_at, completed_at),
+            )
+            conn.executemany(
+                """
+                INSERT INTO source_snapshots(id,channel_id,occurred_at,collected_at,source_url,content,scope_type,scope_key)
+                VALUES(?,?,?,?,?,?,?,?)
+                """,
+                [
+                    ("fallback-general", "fallback-scope", collected_at, collected_at, "fallback://general", "GENERAL_ONLY", "general", ""),
+                    ("fallback-research", "fallback-scope", collected_at, collected_at, "fallback://research", "RESEARCH_CHILD", "research", "300782"),
+                ],
+            )
+        snapshots = self.main.source_job_snapshots("fallback-job")["snapshots"]
+        snapshot_ids = {item["id"] for item in snapshots}
+        self.assertEqual(snapshot_ids, {"fallback-general"})
 
     def test_fixed_normalizers_parse_mx_and_telegram(self) -> None:
         base = {
@@ -401,6 +458,20 @@ class MainBehaviorTests(unittest.TestCase):
         )
         self.assertFalse(cleared["config"]["api_key_configured"])
         self.assertEqual(self.main.channel_request_config("ima-knowledge")["api_key"], "")
+
+    def test_itick_config_preserves_online_status_when_credentials_remain(self) -> None:
+        with self.main.db() as conn:
+            conn.execute("UPDATE channels SET status='online' WHERE id='itick'")
+        self.main.update_itick_config(
+            self.main.ItickConfigInput(api_key="secret-token", default_symbols=["SH:600519"])
+        )
+        with self.main.db() as conn:
+            status = conn.execute("SELECT status FROM channels WHERE id='itick'").fetchone()["status"]
+        self.assertEqual(status, "online")
+        self.main.update_itick_config(self.main.ItickConfigInput(clear_credentials=True))
+        with self.main.db() as conn:
+            status = conn.execute("SELECT status FROM channels WHERE id='itick'").fetchone()["status"]
+        self.assertEqual(status, "pending")
 
     def test_mx_har_import_wraps_validation_errors_as_json_http_conflict(self) -> None:
         with patch("backend.import_mx_har.import_har_text", side_effect=ValueError("upstream failed")):
@@ -568,6 +639,85 @@ class MainBehaviorTests(unittest.TestCase):
         self.assertIn("RAW_CONTEXT", context)
         self.assertIn("SOURCE_REPORT_CONTEXT", context)
 
+    def test_clear_source_jobs_keeps_research_child_jobs(self) -> None:
+        now = timestamp()
+        with self.main.db() as conn:
+            conn.execute(
+                "INSERT INTO channels(id,name,type,url,collection_mode,status,updated_at) VALUES('clear-source','clear','test','','requests','online',?)",
+                (now,),
+            )
+            conn.execute(
+                "INSERT INTO tasks(id,title,target,objective,status,created_at) VALUES('task-clear','研究','300782','objective','review',?)",
+                (now,),
+            )
+            conn.execute(
+                """
+                INSERT INTO source_collection_jobs(id,action,channel_ids,windows,lookback_days,skill_name,report_title,status,created_at)
+                VALUES('clear-standalone','report','["clear-source"]','[]',30,'skill','standalone','review',?)
+                """,
+                (now,),
+            )
+            conn.execute(
+                """
+                INSERT INTO source_collection_jobs(
+                  id,action,channel_ids,windows,lookback_days,skill_name,report_title,status,created_at,parent_task_id,query,evidence_layer
+                ) VALUES('clear-child','collect','["clear-source"]','[]',30,'skill','child','completed',?,'task-clear','300782','akshare')
+                """,
+                (now,),
+            )
+            conn.execute(
+                "INSERT INTO source_collection_runs(job_id,channel_id,status) VALUES('clear-standalone','clear-source','completed')"
+            )
+            conn.execute(
+                "INSERT INTO source_collection_runs(job_id,channel_id,status) VALUES('clear-child','clear-source','completed')"
+            )
+        result = self.main.clear_task_list("source-jobs")
+        self.assertEqual(result["deleted_source_jobs"], 1)
+        with self.main.db() as conn:
+            remaining_jobs = {row["id"] for row in conn.execute("SELECT id FROM source_collection_jobs")}
+            remaining_runs = {row["job_id"] for row in conn.execute("SELECT job_id FROM source_collection_runs")}
+        self.assertEqual(remaining_jobs, {"clear-child"})
+        self.assertEqual(remaining_runs, {"clear-child"})
+
+    def test_research_layer_mapping_honors_enabled_market_and_werss_channels(self) -> None:
+        with self.main.db() as conn:
+            conn.execute("UPDATE channels SET status='offline',research_enabled=0")
+            conn.execute("UPDATE channels SET status='online',research_enabled=1 WHERE id IN ('akshare','itick','wechat-mp-rss')")
+        self.assertEqual(set(self.main.channel_ids_for_layer("market_data")), {"akshare", "itick"})
+        self.assertEqual(set(self.main.channel_ids_for_layer("akshare")), {"akshare", "itick"})
+        self.assertIn("wechat-mp-rss", self.main.channel_ids_for_layer("http_requests"))
+
+    def test_stock_realtime_sources_bypass_recent_collection_watermark(self) -> None:
+        current = timestamp()
+        with self.main.db() as conn:
+            conn.execute("UPDATE channels SET status='offline',research_enabled=0")
+            conn.execute("UPDATE channels SET status='online',research_enabled=1 WHERE id IN ('akshare','itick','industry-news')")
+            conn.execute(
+                "INSERT INTO channels(id,name,type,url,collection_mode,status,research_enabled,updated_at) VALUES('plain-http','plain','test','https://example.test/{query}','requests','online',1,?)",
+                (current,),
+            )
+            conn.executemany(
+                "INSERT OR REPLACE INTO source_collection_watermarks_v2(channel_id,scope_key,last_success_at) VALUES(?,?,?)",
+                [
+                    ("akshare", "300782", current),
+                    ("itick", "300782", current),
+                    ("industry-news", "300782", current),
+                    ("plain-http", "300782", current),
+                ],
+            )
+        result = self.main.create_source_job(
+            self.main.SourceJobInput(
+                action="collect",
+                channel_ids=["akshare", "itick", "industry-news", "plain-http"],
+                lookback_days=30,
+                parent_task_id="task-realtime",
+                query="300782",
+                evidence_layer="market_data",
+            )
+        )
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual({window["channel_id"] for window in result["windows"]}, {"akshare", "itick", "industry-news"})
+
     def test_stock_research_refreshes_all_online_sources_before_analysis(self) -> None:
         now = timestamp()
         with self.main.db() as conn:
@@ -591,6 +741,49 @@ class MainBehaviorTests(unittest.TestCase):
         self.assertEqual(job["query"], "")
         self.assertEqual(job["evidence_layer"], "local_source_snapshots")
         self.assertIsNone(self.main.refresh_general_sources_before_research(task, {"completed_layers": [], "steps": 0}))
+
+    def test_stock_research_forces_market_data_before_final_report(self) -> None:
+        now = timestamp()
+        with self.main.db() as conn:
+            conn.execute("UPDATE channels SET status='offline',research_enabled=0")
+            conn.execute("UPDATE channels SET status='online',research_enabled=1 WHERE id='akshare'")
+            conn.execute(
+                "INSERT INTO tasks(id,title,target,objective,status,created_at) VALUES('task-force-market','研究','300782','objective','analyzing',?)",
+                (now,),
+            )
+        decision = self.main.AgentDecision(
+            decision="final",
+            report="<html><head></head><body>too early</body></html>",
+            used_model_knowledge=False,
+        )
+        with patch.object(self.main, "refresh_general_sources_before_research", return_value=None), patch.object(
+            self.main,
+            "task_snapshot_context",
+            return_value=(now, timestamp(-30), "context"),
+        ), patch.object(self.main, "call_provider_structured", return_value=decision):
+            result = self.main.advance_analysis_task("task-force-market")
+        self.assertEqual(result["status"], "evidence_queued")
+        self.assertEqual(result["evidence_layer"], "market_data")
+        with self.main.db() as conn:
+            job = conn.execute(
+                "SELECT channel_ids,query,evidence_layer FROM source_collection_jobs WHERE parent_task_id='task-force-market'"
+            ).fetchone()
+        self.assertEqual(json.loads(job["channel_ids"]), ["akshare"])
+        self.assertEqual(job["query"], "300782")
+        self.assertEqual(job["evidence_layer"], "market_data")
+
+    def test_legacy_akshare_evidence_layer_counts_as_market_data(self) -> None:
+        with self.main.db() as conn:
+            conn.execute(
+                """
+                INSERT INTO source_collection_jobs(id,action,channel_ids,windows,lookback_days,skill_name,report_title,status,created_at,parent_task_id,query,evidence_layer)
+                VALUES('legacy-market','collect','["akshare"]','[]',30,'skill','legacy','completed',?,'task-legacy','300782','akshare')
+                """,
+                (timestamp(),),
+            )
+        completed = self.main.completed_evidence_layers("task-legacy", {"completed_layers": ["akshare"]})
+        self.assertIn("market_data", completed)
+        self.assertNotIn("akshare", completed)
 
     def test_general_source_report_reads_only_selected_channels(self) -> None:
         now = timestamp()
@@ -624,6 +817,35 @@ class MainBehaviorTests(unittest.TestCase):
                 self.main.SourceJobInput(action="report", channel_ids=["selected"], report_title="selected only")
             )
         self.assertIn("<html>", report)
+
+    def test_general_source_report_excludes_research_scoped_snapshots(self) -> None:
+        now = timestamp()
+        with self.main.db() as conn:
+            conn.execute(
+                "INSERT INTO channels(id,name,type,url,collection_mode,status,updated_at) VALUES(?,?,?,?,?,?,?)",
+                ("report-scope", "report-scope", "test", "", "requests", "online", now),
+            )
+            conn.executemany(
+                """
+                INSERT INTO source_snapshots(id,channel_id,occurred_at,collected_at,source_url,content,scope_type,scope_key)
+                VALUES(?,?,?,?,?,?,?,?)
+                """,
+                [
+                    ("report-general", "report-scope", now, now, "report://general", "GENERAL_REPORT_CONTENT", "general", ""),
+                    ("report-research", "report-scope", now, now, "report://research", "RESEARCH_TASK_CONTENT", "research", "300782"),
+                ],
+            )
+
+        def capture_prompt(prompt, system_prompt="", purpose=""):
+            self.assertIn("GENERAL_REPORT_CONTENT", prompt)
+            self.assertNotIn("RESEARCH_TASK_CONTENT", prompt)
+            self.assertEqual(purpose, "source_report")
+            return "<html><head></head><body>ok</body></html>"
+
+        with patch.object(self.main, "call_provider", side_effect=capture_prompt):
+            self.main.generate_source_report(
+                self.main.SourceJobInput(action="report", channel_ids=["report-scope"], report_title="general only")
+            )
 
     def test_general_source_report_repairs_non_html_provider_output(self) -> None:
         now = timestamp()

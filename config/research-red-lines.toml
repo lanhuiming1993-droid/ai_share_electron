@@ -10,7 +10,7 @@ model_knowledge_requires_low_confidence_label = true
 [evidence_escalation]
 ordered_sources = [
   "local_source_snapshots",
-  "akshare",
+  "market_data",
   "http_requests",
   "playwright",
   "model_knowledge",
