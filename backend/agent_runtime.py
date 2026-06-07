@@ -56,7 +56,7 @@ def build_analysis_prompt(*, target: str, objective: str, skill_name: str, windo
 
 严格遵守系统提示中的证据升级顺序。先检索并使用全量本地快照和已有通用信源报告。
 如果当前证据不足，不得直接使用模型知识库给出事实结论；请输出明确的 `EVIDENCE_REQUESTS` 清单，
-按 market_data（AkShare/BaoStock/TuShare/iTick）、http_requests、playwright 顺序列出仍需补充的证据。
+按 market_data（AkShare/BaoStock/TuShare/iTick）、http_requests（公开接口/行业资讯/WeRSS/IMA/X-TwtAPI）、playwright 顺序列出仍需补充的证据。
 最终报告必须是完整 HTML 文档，严禁使用 Markdown。"""
 
 

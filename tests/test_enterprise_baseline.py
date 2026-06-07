@@ -19,13 +19,15 @@ class EnterpriseBaselineTests(unittest.TestCase):
         self.assertIn("market_snapshot", sources["akshare"]["capabilities"])
         self.assertIn("stock_quote", sources["itick"]["capabilities"])
         self.assertEqual(sources["itick"]["credential_mode"], "encrypted_api_key")
+        self.assertIn("tweet_search", sources["x-twtapi"]["capabilities"])
+        self.assertEqual(sources["x-twtapi"]["credential_mode"], "encrypted_api_key")
         self.assertEqual(sources["web-rumors"]["credential_mode"], "encrypted_session_config")
         self.assertIn("wechat_official_accounts", sources["wechat-mp-rss"]["capabilities"])
         self.assertEqual(sources["wechat-mp-rss"]["credential_mode"], "optional_access_key")
         self.assertIn("knowledge_base_search", sources["ima-knowledge"]["capabilities"])
         self.assertEqual(sources["ima-knowledge"]["credential_mode"], "encrypted_openapi_key")
         self.assertEqual(CANONICAL_CHANNEL_NAMES["146aa28e21"], "TG 小作文频道")
-        self.assertEqual([tool["priority"] for tool in tool_catalog()], [1, 2, 3, 4, 5, 6])
+        self.assertEqual([tool["priority"] for tool in tool_catalog()], [1, 2, 3, 4, 5, 6, 7])
 
     def test_migration_ledger_makes_sqlite_readiness_visible(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

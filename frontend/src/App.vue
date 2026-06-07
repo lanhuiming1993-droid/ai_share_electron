@@ -30,6 +30,7 @@ const channelForm = reactive({ name: "", type: "", url: "", collection_mode: "pl
 const marketDataForm = reactive({ enable_akshare: true, enable_baostock: true, enable_tushare: true, tushare_token: "", tushare_token_configured: false, clear_tushare_token: false, component_timeout_seconds: 35 });
 const imaForm = reactive({ client_id: "", api_key: "", api_key_configured: false, skill_download_url: "https://app-dl.ima.qq.com/skills/ima-skills-1.1.7.zip", clear_credentials: false });
 const itickForm = reactive({ api_base: "https://api0.itick.org", api_key: "", api_key_configured: false, default_symbols_text: "HK:700\nUS:AAPL\nSH:600519", kline_type: 2, kline_limit: 60, timeout_seconds: 20, clear_credentials: false });
+const xTwtApiForm = reactive({ api_base: "https://api.twtapi.com/api/v1/twitter", api_key: "", api_key_configured: false, default_queries_text: "A股\n半导体\n光伏\n机器人", result_type: "Latest", max_results: 20, timeout_seconds: 20, lang: "zh", clear_credentials: false });
 const wechatRssForm = reactive({ base_url: "http://127.0.0.1:8001", feed_ids_text: "all", access_key: "", secret_key: "", credentials_configured: false, admin_username: "admin", admin_password: "", admin_password_configured: false, clear_credentials: false, timeout_seconds: 20, max_items_per_feed: 100 });
 const wechatRssComponent = reactive({ status: "pending", message: "尚未检查", ready: false, service_online: false, rss_online: false, subscription_count: 0, subscriptions: [], subscription_error: "", docker_available: false, docker_engine_available: false, managed_setup_available: false, management_url: "", onboarding_steps: [] });
 Object.assign(wechatRssComponent, { wechat_authorized: false, wechat_login_state: "unknown", wechat_message: "", admin_authorized: false, qr_available: false });
@@ -80,6 +81,7 @@ const wechatRssAuthorized = computed(() => Boolean(wechatRssComponent.wechat_aut
 const canonicalChannelNames = {
   akshare: "AkShare 市场数据",
   itick: "iTick 行情 API",
+  "x-twtapi": "X（TwtAPI）",
   "industry-news": "产业趋势公开资讯",
   "wechat-mp-rss": "微信公众号（WeRSS）",
   "ima-knowledge": "IMA 知识库",
@@ -98,6 +100,7 @@ function channelStatusDescription(channel) {
     if (channel.id === "wechat-mp-rss") return "微信公众号快照采集可用";
     if (channel.id === "ima-knowledge") return "IMA 知识库检索可用";
     if (channel.id === "itick") return "iTick 行情 API 可用";
+    if (channel.id === "x-twtapi") return "X/TwtAPI 检索可用";
     if (channel.collection_mode === "playwright") return "登录态可用";
     if (channel.id === "web-rumors") return "授权会话可用";
     return "公开采集可用";
@@ -106,6 +109,7 @@ function channelStatusDescription(channel) {
     if (channel.id === "wechat-mp-rss") return "微信公众号组件不可用，请重新登录或检查高级配置";
     if (channel.id === "ima-knowledge") return "IMA 凭证或知识库不可用，请检查渠道配置";
     if (channel.id === "itick") return "iTick 凭证或 API 不可用，请检查渠道配置";
+    if (channel.id === "x-twtapi") return "TwtAPI API Key 或接口不可用，请检查渠道配置";
     if (channel.collection_mode === "playwright") return "登录态失效，请重新登录";
     if (channel.id === "web-rumors") return "授权会话失效，请重新导入 HAR";
     return "公开采集暂不可用";
@@ -709,6 +713,8 @@ function openChannelModal(channel = null) {
   imaForm.clear_credentials = false;
   const itickConfig = channel?.itick_config || { api_base: "https://api0.itick.org", api_key: "", api_key_configured: false, default_symbols: ["HK:700", "US:AAPL", "SH:600519"], kline_type: 2, kline_limit: 60, timeout_seconds: 20 };
   Object.assign(itickForm, { ...itickConfig, api_key: "", default_symbols_text: (itickConfig.default_symbols || ["HK:700", "US:AAPL", "SH:600519"]).join("\n"), clear_credentials: false });
+  const xTwtApiConfig = channel?.x_twtapi_config || { api_base: "https://api.twtapi.com/api/v1/twitter", api_key: "", api_key_configured: false, default_queries: ["A股", "半导体", "光伏", "机器人"], result_type: "Latest", max_results: 20, timeout_seconds: 20, lang: "zh" };
+  Object.assign(xTwtApiForm, { ...xTwtApiConfig, api_key: "", default_queries_text: (xTwtApiConfig.default_queries || ["A股", "半导体", "光伏", "机器人"]).join("\n"), clear_credentials: false });
   const wechatRssConfig = channel?.wechat_rss_config || { base_url: "http://127.0.0.1:8001", feed_ids: ["all"], access_key: "", secret_key: "", credentials_configured: false, admin_username: "admin", admin_password: "", admin_password_configured: false, timeout_seconds: 20, max_items_per_feed: 100 };
   Object.assign(wechatRssForm, { ...wechatRssConfig, feed_ids_text: (wechatRssConfig.feed_ids || ["all"]).join("\n"), clear_credentials: false });
   channelModal.value = true;
@@ -745,6 +751,14 @@ async function saveItickConfiguration() {
   });
 }
 
+async function saveXTwtApiConfiguration() {
+  const { default_queries_text, ...config } = xTwtApiForm;
+  return request("/api/channels/x-twtapi/config", {
+    method: "PUT",
+    body: JSON.stringify({ ...config, default_queries: default_queries_text.split(/\r?\n|,|，|;|；/).map((item) => item.trim()).filter(Boolean) }),
+  });
+}
+
 async function saveChannel(openLoginAfterSave = false, loginWindow = null) {
   if (!editingChannel.value) {
     notice.value = "新增信源入口已关闭；信源请通过后端内置适配后发布。";
@@ -769,6 +783,9 @@ async function saveChannel(openLoginAfterSave = false, loginWindow = null) {
     }
     if (saved.id === "itick") {
       await saveItickConfiguration();
+    }
+    if (saved.id === "x-twtapi") {
+      await saveXTwtApiConfiguration();
     }
     notice.value = editingChannel.value ? "渠道配置已更新" : "新渠道已添加";
     closeChannelModal();
@@ -1664,6 +1681,7 @@ onUnmounted(() => {
                 <small v-if="channel.group_ids?.length">星球 ID：{{ channel.group_ids.join('、') }}</small>
                 <small v-if="channel.id==='akshare'">组件：AkShare · BaoStock · TuShare{{ channel.market_data_config?.tushare_token_configured ? '（token 已加密保存）' : '（等待 token）' }}</small>
                 <small v-if="channel.id==='itick'">iTick 行情 API：配置中维护 API Base、API Key 和默认代码；API Key 仅本地加密保存</small>
+                <small v-if="channel.id==='x-twtapi'">X/TwtAPI：配置中维护 API Base、API Key 和默认搜索词；个股补证会按标的实时搜索</small>
                 <small v-if="channel.id==='wechat-mp-rss'">微信扫码登录后搜索并加入公众号；采集按严格时间窗读取文章快照</small>
                 <small v-if="channel.id==='ima-knowledge'">在配置中维护 ClientID、API Key 和 IMA Skill 下载地址；API Key 仅本地加密保存</small>
                 <small>整理策略：{{ channel.parsing_strategy }} · 质量阈值 {{ channel.normalization_quality_threshold }} · 最大滚动 {{ channel.max_scrolls }}</small>
@@ -1673,7 +1691,7 @@ onUnmounted(() => {
               <div class="flex items-center gap-3">
                 <span :class="channel.status==='online'?'status-good':'status-warn'">{{ channel.status }}</span>
                 <button @click="normalizeExistingChannel(channel)" class="secondary">整理已有快照</button>
-                <button v-if="channel.collection_mode==='playwright' || ['web-rumors','akshare','industry-news','wechat-mp-rss','ima-knowledge','itick'].includes(channel.id)" @click="checkChannel(channel)" class="secondary">检查状态</button>
+                <button v-if="channel.collection_mode==='playwright' || ['web-rumors','akshare','industry-news','wechat-mp-rss','ima-knowledge','itick','x-twtapi'].includes(channel.id)" @click="checkChannel(channel)" class="secondary">检查状态</button>
                 <button @click="openChannelModal(channel)" class="secondary">配置</button>
               </div>
             </div>
@@ -2095,6 +2113,7 @@ onUnmounted(() => {
             <select v-model="channelForm.collection_mode" class="field mt-2 w-full">
               <option value="akshare">AkShare 模块</option>
               <option value="itick_market_data">iTick 行情 API</option>
+              <option value="x_twtapi">X / Twitter（TwtAPI）</option>
               <option value="industry_news">产业趋势公开资讯</option>
               <option value="wechat_rss">微信公众号 WeRSS RSS</option>
               <option value="ima_knowledge_base">IMA 知识库 OpenAPI</option>
@@ -2179,6 +2198,53 @@ onUnmounted(() => {
             <div class="mt-3 flex flex-wrap items-center gap-4">
               <label class="text-xs text-slate-400"><input v-model="itickForm.clear_credentials" type="checkbox" class="mr-2" />清除已保存 API Key</label>
               <small class="text-xs leading-5 text-slate-600">保存后点击“检查状态”即可用第一条默认代码验证当前 iTick 凭证。</small>
+            </div>
+          </div>
+          <div v-if="editingChannel?.id==='x-twtapi'" class="col-span-2 rounded-2xl border border-teal-400/20 bg-teal-400/[.04] p-4">
+            <span class="form-label">X / Twitter（TwtAPI）</span>
+            <p class="mt-1 text-xs leading-5 text-slate-500">按 TwtAPI 文档用 <code>X-API-Key</code> 调用 Search。普通信源采集使用默认搜索词，个股补证会用股票标的实时检索。</p>
+            <div class="mt-3 grid grid-cols-2 gap-3">
+              <label>
+                <span class="form-label">API Base</span>
+                <input v-model="xTwtApiForm.api_base" autocomplete="off" placeholder="https://api.twtapi.com/api/v1/twitter" class="field mt-2 w-full" />
+              </label>
+              <label>
+                <span class="form-label">API Key</span>
+                <input v-model="xTwtApiForm.api_key" type="password" autocomplete="new-password" :placeholder="xTwtApiForm.api_key_configured ? '已加密保存；不填则保留原密钥' : 'TwtAPI API Key'" class="field mt-2 w-full" />
+              </label>
+            </div>
+            <label class="mt-3 block">
+              <span class="form-label">默认搜索词</span>
+              <textarea v-model="xTwtApiForm.default_queries_text" rows="4" placeholder="A股&#10;半导体&#10;光伏&#10;机器人" class="field mt-2 w-full"></textarea>
+              <small class="mt-1 block text-xs leading-5 text-slate-600">每行一个 X 搜索表达式；个股研究时会优先使用任务标的，不受这里的默认搜索词限制。</small>
+            </label>
+            <div class="mt-3 grid grid-cols-4 gap-3">
+              <label>
+                <span class="form-label">结果类型</span>
+                <select v-model="xTwtApiForm.result_type" class="field mt-2 w-full">
+                  <option value="Latest">Latest</option>
+                  <option value="Top">Top</option>
+                  <option value="User">User</option>
+                  <option value="Image">Image</option>
+                  <option value="Video">Video</option>
+                </select>
+              </label>
+              <label>
+                <span class="form-label">单词条数</span>
+                <input v-model.number="xTwtApiForm.max_results" type="number" min="1" max="100" class="field mt-2 w-full" />
+              </label>
+              <label>
+                <span class="form-label">语言</span>
+                <input v-model="xTwtApiForm.lang" maxlength="10" placeholder="zh" class="field mt-2 w-full" />
+              </label>
+              <label>
+                <span class="form-label">超时秒数</span>
+                <input v-model.number="xTwtApiForm.timeout_seconds" type="number" min="3" max="60" class="field mt-2 w-full" />
+              </label>
+            </div>
+            <div class="mt-3 flex flex-wrap items-center gap-4">
+              <label class="text-xs text-slate-400"><input v-model="xTwtApiForm.clear_credentials" type="checkbox" class="mr-2" />清除已保存 API Key</label>
+              <small class="text-xs leading-5 text-slate-600">保存后点击“检查状态”会用第一条默认搜索词调用 Search 验证凭证。</small>
             </div>
           </div>
           <div v-if="editingChannel?.id==='wechat-mp-rss'" class="col-span-2 rounded-2xl border border-teal-400/20 bg-teal-400/[.04] p-4">

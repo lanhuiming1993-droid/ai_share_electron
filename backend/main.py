@@ -57,6 +57,17 @@ from backend.runtime_health import (
 )
 from backend.source_registry import CANONICAL_CHANNEL_NAMES, source_catalog, tool_catalog
 from backend.subprocess_utils import hidden_window_creationflags
+from backend.twtapi_source import (
+    DEFAULT_TWTAPI_API_BASE,
+    normalize_twtapi_config,
+    public_twtapi_config,
+    twtapi_status,
+    twtapi_tweet_id,
+    twtapi_tweet_text,
+    twtapi_tweet_timestamp,
+    twtapi_tweet_url,
+    twtapi_tweet_user,
+)
 from backend.wechat_rss import (
     add_werss_subscription,
     clear_werss_task_queue,
@@ -199,7 +210,7 @@ class ChannelInput(BaseModel):
     name: str
     type: str
     url: str = ""
-    collection_mode: Literal["akshare", "industry_news", "wechat_rss", "ima_knowledge_base", "itick_market_data", "requests", "playwright", "manual"] = "playwright"
+    collection_mode: Literal["akshare", "industry_news", "wechat_rss", "ima_knowledge_base", "itick_market_data", "x_twtapi", "requests", "playwright", "manual"] = "playwright"
     status: Literal["online", "pending", "offline"] = "pending"
     notes: str = ""
     validation_url: str = ""
@@ -291,6 +302,17 @@ class ItickConfigInput(BaseModel):
     kline_type: int = Field(default=2, ge=1, le=10)
     kline_limit: int = Field(default=60, ge=1, le=300)
     timeout_seconds: int = Field(default=20, ge=3, le=60)
+    clear_credentials: bool = False
+
+
+class TwtApiConfigInput(BaseModel):
+    api_base: str = Field(default=DEFAULT_TWTAPI_API_BASE, max_length=1_000)
+    api_key: str = Field(default="", repr=False)
+    default_queries: list[str] = Field(default_factory=list, max_length=100)
+    result_type: Literal["Top", "Latest", "User", "Image", "Video"] = "Latest"
+    max_results: int = Field(default=20, ge=1, le=100)
+    timeout_seconds: int = Field(default=20, ge=3, le=60)
+    lang: str = Field(default="zh", max_length=10)
     clear_credentials: bool = False
 
 
@@ -510,6 +532,14 @@ def itick_channel_config() -> dict:
 
 def itick_channel_config_public() -> dict:
     return public_itick_config(itick_channel_config())
+
+
+def x_twtapi_channel_config() -> dict:
+    return normalize_twtapi_config(channel_request_config("x-twtapi"))
+
+
+def x_twtapi_channel_config_public() -> dict:
+    return public_twtapi_config(x_twtapi_channel_config())
 
 
 def init_db() -> None:
@@ -912,6 +942,41 @@ def init_db() -> None:
             WHERE id='itick'
             """,
             (DEFAULT_ITICK_API_BASE,),
+        )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO channels(
+              id,name,type,url,collection_mode,status,notes,parsing_strategy,
+              normalization_quality_threshold,max_scrolls,research_enabled,builtin,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "x-twtapi",
+                "X（TwtAPI）",
+                "X/Twitter 实时检索",
+                DEFAULT_TWTAPI_API_BASE,
+                "x_twtapi",
+                "pending",
+                "通过 TwtAPI 调用 X/Twitter Search 与 Trends；API Key 仅在本机加密保存，个股补证按标的实时检索。",
+                "fixed",
+                78,
+                1,
+                1,
+                1,
+                now(),
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE channels
+            SET name='X（TwtAPI）',type='X/Twitter 实时检索',url=?,
+                collection_mode='x_twtapi',
+                notes='通过 TwtAPI 调用 X/Twitter Search 与 Trends；API Key 仅在本机加密保存，个股补证按标的实时检索。',
+                parsing_strategy='fixed',normalization_quality_threshold=78,max_scrolls=1,
+                research_enabled=1,builtin=1
+            WHERE id='x-twtapi'
+            """,
+            (DEFAULT_TWTAPI_API_BASE,),
         )
         provider_count = conn.execute("SELECT COUNT(*) AS count FROM model_providers").fetchone()["count"]
         legacy_provider = conn.execute("SELECT value FROM settings WHERE key='provider'").fetchone()
@@ -1472,6 +1537,71 @@ def fixed_normalized_items(snapshot: sqlite3.Row, mode: str = "fixed") -> tuple[
         if items:
             return items, ""
         return [], "IMA knowledge base returned no displayable results"
+    if isinstance(payload, dict) and payload.get("platform") == "x_twtapi":
+        if payload.get("category") == "collector_diagnostics":
+            failures = payload.get("failures") if isinstance(payload.get("failures"), dict) else {}
+            title = "TwtAPI collector diagnostics"
+            item_content = json.dumps(failures, ensure_ascii=False, default=str, indent=2)
+            return [
+                {
+                    "item_key": stable_item_key(snapshot["channel_id"], source_url, occurred_at, title, item_content),
+                    "occurred_at": occurred_at,
+                    "author": "TwtAPI",
+                    "title": title,
+                    "content": item_content,
+                    "source_url": source_url,
+                    "attachments": [],
+                    "metadata": {
+                        "platform": payload["platform"],
+                        "adapter": payload.get("adapter", ""),
+                        "category": payload.get("category", ""),
+                        "query": payload.get("query", ""),
+                        "api_base_host": payload.get("api_base_host", ""),
+                    },
+                    "quality_score": 58,
+                    "normalization_mode": mode,
+                }
+            ], ""
+        tweets = payload.get("tweets") if isinstance(payload.get("tweets"), list) else []
+        items = []
+        for tweet in tweets[:100]:
+            if not isinstance(tweet, dict):
+                continue
+            text = twtapi_tweet_text(tweet)
+            if not text:
+                continue
+            user = twtapi_tweet_user(tweet)
+            tweet_id = twtapi_tweet_id(tweet)
+            item_source_url = twtapi_tweet_url(tweet, source_url)
+            item_occurred_at = normalized_occurred_at(twtapi_tweet_timestamp(tweet), occurred_at)
+            author = f"@{user['username']}" if user.get("username") else (user.get("name") or "X/Twitter")
+            title = re.sub(r"\s+", " ", text).strip()[:120] or "X/Twitter post"
+            items.append(
+                {
+                    "item_key": stable_item_key(snapshot["channel_id"], item_source_url, item_occurred_at, title, text),
+                    "occurred_at": item_occurred_at,
+                    "author": author[:255],
+                    "title": title[:500],
+                    "content": text,
+                    "source_url": item_source_url,
+                    "attachments": [],
+                    "metadata": {
+                        "platform": payload["platform"],
+                        "adapter": payload.get("adapter", ""),
+                        "query": payload.get("query", ""),
+                        "tweet_id": tweet_id,
+                        "user": user,
+                        "collection_window": payload.get("collection_window", {}),
+                        "api_base_host": payload.get("api_base_host", ""),
+                        "result_type": payload.get("result_type", ""),
+                    },
+                    "quality_score": 84 if tweet_id else 76,
+                    "normalization_mode": mode,
+                }
+            )
+        if items:
+            return items, ""
+        return [], "TwtAPI returned no displayable tweets"
     if isinstance(payload, dict) and payload.get("platform") == "itick_market_data":
         symbol = payload.get("symbol") if isinstance(payload.get("symbol"), dict) else {}
         region = str(symbol.get("region") or "").strip()
@@ -1966,6 +2096,8 @@ def dashboard() -> dict:
             channel["ima_config"] = ima_channel_config_public()
         if channel["id"] == "itick":
             channel["itick_config"] = itick_channel_config_public()
+        if channel["id"] == "x-twtapi":
+            channel["x_twtapi_config"] = x_twtapi_channel_config_public()
     skills = [
         {"name": item.name, "path": str(item.relative_to(ROOT)), "status": "loaded"}
         for item in SKILLS_DIR.iterdir()
@@ -2341,6 +2473,48 @@ def update_itick_config(payload: ItickConfigInput) -> dict:
         default_symbol_count=len(config["default_symbols"]),
     )
     return {"status": "saved", "config": itick_channel_config_public()}
+
+
+@app.put("/api/channels/x-twtapi/config")
+def update_x_twtapi_config(payload: TwtApiConfigInput) -> dict:
+    existing = x_twtapi_channel_config()
+    supplied_api_key = payload.api_key.strip()
+    if payload.clear_credentials:
+        api_key = ""
+    elif supplied_api_key and supplied_api_key != MASKED_SECRET:
+        api_key = supplied_api_key
+    else:
+        api_key = str(existing.get("api_key") or "")
+    config = normalize_twtapi_config(
+        {
+            "adapter": "x_twtapi",
+            "api_base": payload.api_base.strip() or DEFAULT_TWTAPI_API_BASE,
+            "api_key": api_key,
+            "default_queries": payload.default_queries or existing.get("default_queries") or [],
+            "result_type": payload.result_type,
+            "max_results": payload.max_results,
+            "timeout_seconds": payload.timeout_seconds,
+            "lang": payload.lang,
+        }
+    )
+    save_channel_request_config("x-twtapi", config)
+    with db() as conn:
+        current = conn.execute("SELECT status FROM channels WHERE id='x-twtapi'").fetchone()
+        next_status = "online" if current and current["status"] == "online" and config["api_key"] else "pending"
+        conn.execute(
+            "UPDATE channels SET url=?,status=?,updated_at=? WHERE id='x-twtapi'",
+            (config["api_base"], next_status, now()),
+        )
+    log_event(
+        logger,
+        "INFO",
+        "channel.x_twtapi.config.saved",
+        channel_id="x-twtapi",
+        api_base_host=urlsplit(config["api_base"]).netloc,
+        api_key_configured=bool(config["api_key"]),
+        default_query_count=len(config["default_queries"]),
+    )
+    return {"status": "saved", "config": x_twtapi_channel_config_public()}
 
 
 @app.get("/api/channels/wechat-mp-rss/component-status")
@@ -2836,6 +3010,15 @@ def check_channel(channel_id: str) -> dict:
             conn.execute(
                 "UPDATE channels SET status=?,last_check=?,updated_at=? WHERE id=?",
                 (result["status"], result["checked_at"], result["checked_at"], channel_id),
+        )
+        log_event(logger, "INFO" if result["status"] == "online" else "WARNING", "channel.check.completed", channel_id=channel_id, status=result["status"], message=result["message"])
+        return result
+    if channel_id == "x-twtapi" and channel:
+        result = twtapi_status(x_twtapi_channel_config())
+        with db() as conn:
+            conn.execute(
+                "UPDATE channels SET status=?,last_check=?,updated_at=? WHERE id=?",
+                (result["status"], result["checked_at"], result["checked_at"], channel_id),
             )
         log_event(logger, "INFO" if result["status"] == "online" else "WARNING", "channel.check.completed", channel_id=channel_id, status=result["status"], message=result["message"])
         return result
@@ -2892,11 +3075,11 @@ def refresh_browser_channel_states() -> None:
         channels = [
             dict(row)
             for row in conn.execute(
-                "SELECT id FROM channels WHERE collection_mode='playwright' OR id IN ('web-rumors','akshare','industry-news','wechat-mp-rss','ima-knowledge','itick')"
+                "SELECT id FROM channels WHERE collection_mode='playwright' OR id IN ('web-rumors','akshare','industry-news','wechat-mp-rss','ima-knowledge','itick','x-twtapi')"
             )
         ]
     for channel in channels:
-        if channel["id"] in ("web-rumors", "akshare", "industry-news", "wechat-mp-rss", "ima-knowledge", "itick") or browser_profile(channel["id"]).exists():
+        if channel["id"] in ("web-rumors", "akshare", "industry-news", "wechat-mp-rss", "ima-knowledge", "itick", "x-twtapi") or browser_profile(channel["id"]).exists():
             try:
                 check_channel(channel["id"])
             except Exception as exc:
@@ -3762,7 +3945,7 @@ def create_task(payload: TaskInput) -> dict:
 EVIDENCE_LAYERS = ("local_source_snapshots", "market_data", "http_requests", "playwright", "model_knowledge")
 EVIDENCE_LAYER_ALIASES = {"akshare": "market_data"}
 MANDATORY_RESEARCH_LAYERS = ("market_data",)
-REALTIME_STOCK_COLLECTION_MODES = {"akshare", "itick_market_data", "industry_news"}
+REALTIME_STOCK_COLLECTION_MODES = {"akshare", "itick_market_data", "industry_news", "x_twtapi"}
 
 
 def record_agent_event(task_id: str, event_type: str, detail: dict | str) -> None:
@@ -3797,7 +3980,7 @@ def channel_ids_for_layer(layer: str) -> list[str]:
     layer = normalize_evidence_layer(layer)
     modes = {
         "market_data": ("akshare", "itick_market_data"),
-        "http_requests": ("requests", "industry_news", "wechat_rss", "ima_knowledge_base"),
+        "http_requests": ("requests", "industry_news", "wechat_rss", "ima_knowledge_base", "x_twtapi"),
         "playwright": ("playwright",),
     }.get(layer)
     if not modes:

@@ -423,6 +423,37 @@ class MainBehaviorTests(unittest.TestCase):
         self.assertIn("卓胜微", items[0]["content"])
         self.assertEqual(items[0]["metadata"]["platform"], "ima_knowledge_base")
 
+    def test_fixed_normalizer_splits_x_twtapi_results(self) -> None:
+        snapshot = {
+            "channel_id": "x-twtapi",
+            "occurred_at": "2026-06-04T13:00:00+08:00",
+            "collected_at": "2026-06-04T13:00:00+08:00",
+            "source_url": "https://x.com/search?q=601869&f=live",
+            "content": json.dumps(
+                {
+                    "platform": "x_twtapi",
+                    "adapter": "twtapi_search",
+                    "query": "长飞光纤 601869",
+                    "collection_window": {},
+                    "tweets": [
+                        {
+                            "id": "123",
+                            "text": "长飞光纤订单与产能讨论",
+                            "created_at": "2026-06-04T12:00:00+08:00",
+                            "user": {"screen_name": "market_watch", "name": "Market Watch"},
+                        }
+                    ],
+                },
+                ensure_ascii=False,
+            ),
+        }
+        items, note = self.main.fixed_normalized_items(snapshot)
+        self.assertEqual(note, "")
+        self.assertEqual(items[0]["content"], "长飞光纤订单与产能讨论")
+        self.assertEqual(items[0]["author"], "@market_watch")
+        self.assertEqual(items[0]["source_url"], "https://x.com/market_watch/status/123")
+        self.assertEqual(items[0]["metadata"]["platform"], "x_twtapi")
+
     def test_ima_config_is_encrypted_masked_and_preserved(self) -> None:
         saved = self.main.update_ima_config(
             self.main.ImaConfigInput(
@@ -471,6 +502,20 @@ class MainBehaviorTests(unittest.TestCase):
         self.main.update_itick_config(self.main.ItickConfigInput(clear_credentials=True))
         with self.main.db() as conn:
             status = conn.execute("SELECT status FROM channels WHERE id='itick'").fetchone()["status"]
+        self.assertEqual(status, "pending")
+
+    def test_x_twtapi_config_preserves_online_status_when_credentials_remain(self) -> None:
+        with self.main.db() as conn:
+            conn.execute("UPDATE channels SET status='online' WHERE id='x-twtapi'")
+        self.main.update_x_twtapi_config(
+            self.main.TwtApiConfigInput(api_key="secret-token", default_queries=["A股"])
+        )
+        with self.main.db() as conn:
+            status = conn.execute("SELECT status FROM channels WHERE id='x-twtapi'").fetchone()["status"]
+        self.assertEqual(status, "online")
+        self.main.update_x_twtapi_config(self.main.TwtApiConfigInput(clear_credentials=True))
+        with self.main.db() as conn:
+            status = conn.execute("SELECT status FROM channels WHERE id='x-twtapi'").fetchone()["status"]
         self.assertEqual(status, "pending")
 
     def test_mx_har_import_wraps_validation_errors_as_json_http_conflict(self) -> None:
@@ -682,16 +727,17 @@ class MainBehaviorTests(unittest.TestCase):
     def test_research_layer_mapping_honors_enabled_market_and_werss_channels(self) -> None:
         with self.main.db() as conn:
             conn.execute("UPDATE channels SET status='offline',research_enabled=0")
-            conn.execute("UPDATE channels SET status='online',research_enabled=1 WHERE id IN ('akshare','itick','wechat-mp-rss')")
+            conn.execute("UPDATE channels SET status='online',research_enabled=1 WHERE id IN ('akshare','itick','wechat-mp-rss','x-twtapi')")
         self.assertEqual(set(self.main.channel_ids_for_layer("market_data")), {"akshare", "itick"})
         self.assertEqual(set(self.main.channel_ids_for_layer("akshare")), {"akshare", "itick"})
         self.assertIn("wechat-mp-rss", self.main.channel_ids_for_layer("http_requests"))
+        self.assertIn("x-twtapi", self.main.channel_ids_for_layer("http_requests"))
 
     def test_stock_realtime_sources_bypass_recent_collection_watermark(self) -> None:
         current = timestamp()
         with self.main.db() as conn:
             conn.execute("UPDATE channels SET status='offline',research_enabled=0")
-            conn.execute("UPDATE channels SET status='online',research_enabled=1 WHERE id IN ('akshare','itick','industry-news')")
+            conn.execute("UPDATE channels SET status='online',research_enabled=1 WHERE id IN ('akshare','itick','industry-news','x-twtapi')")
             conn.execute(
                 "INSERT INTO channels(id,name,type,url,collection_mode,status,research_enabled,updated_at) VALUES('plain-http','plain','test','https://example.test/{query}','requests','online',1,?)",
                 (current,),
@@ -702,13 +748,14 @@ class MainBehaviorTests(unittest.TestCase):
                     ("akshare", "300782", current),
                     ("itick", "300782", current),
                     ("industry-news", "300782", current),
+                    ("x-twtapi", "300782", current),
                     ("plain-http", "300782", current),
                 ],
             )
         result = self.main.create_source_job(
             self.main.SourceJobInput(
                 action="collect",
-                channel_ids=["akshare", "itick", "industry-news", "plain-http"],
+                channel_ids=["akshare", "itick", "industry-news", "x-twtapi", "plain-http"],
                 lookback_days=30,
                 parent_task_id="task-realtime",
                 query="300782",
@@ -716,7 +763,7 @@ class MainBehaviorTests(unittest.TestCase):
             )
         )
         self.assertEqual(result["status"], "queued")
-        self.assertEqual({window["channel_id"] for window in result["windows"]}, {"akshare", "itick", "industry-news"})
+        self.assertEqual({window["channel_id"] for window in result["windows"]}, {"akshare", "itick", "industry-news", "x-twtapi"})
 
     def test_stock_research_refreshes_all_online_sources_before_analysis(self) -> None:
         now = timestamp()
