@@ -30,7 +30,7 @@ const channelForm = reactive({ name: "", type: "", url: "", collection_mode: "pl
 const marketDataForm = reactive({ enable_akshare: true, enable_baostock: true, enable_tushare: true, tushare_token: "", tushare_token_configured: false, clear_tushare_token: false, component_timeout_seconds: 35 });
 const imaForm = reactive({ client_id: "", api_key: "", api_key_configured: false, skill_download_url: "https://app-dl.ima.qq.com/skills/ima-skills-1.1.7.zip", clear_credentials: false });
 const itickForm = reactive({ api_base: "https://api0.itick.org", api_key: "", api_key_configured: false, default_symbols_text: "HK:700\nUS:AAPL\nSH:600519", kline_type: 2, kline_limit: 60, timeout_seconds: 20, clear_credentials: false });
-const xTwtApiForm = reactive({ api_base: "https://api.twtapi.com/api/v1/twitter", api_key: "", api_key_configured: false, default_queries_text: "A股\n半导体\n光伏\n机器人", result_type: "Latest", max_results: 20, timeout_seconds: 20, lang: "zh", clear_credentials: false });
+const xTwtApiForm = reactive({ api_base: "https://api.twtapi.com/api/v1/twitter", api_key: "", api_key_configured: false, default_queries_text: "A股\n半导体\n光伏\n机器人", tracked_users_text: "", result_type: "Latest", max_results: 20, timeout_seconds: 20, lang: "zh", clear_credentials: false });
 const wechatRssForm = reactive({ base_url: "http://127.0.0.1:8001", feed_ids_text: "all", access_key: "", secret_key: "", credentials_configured: false, admin_username: "admin", admin_password: "", admin_password_configured: false, clear_credentials: false, timeout_seconds: 20, max_items_per_feed: 100 });
 const wechatRssComponent = reactive({ status: "pending", message: "尚未检查", ready: false, service_online: false, rss_online: false, subscription_count: 0, subscriptions: [], subscription_error: "", docker_available: false, docker_engine_available: false, managed_setup_available: false, management_url: "", onboarding_steps: [] });
 Object.assign(wechatRssComponent, { wechat_authorized: false, wechat_login_state: "unknown", wechat_message: "", admin_authorized: false, qr_available: false });
@@ -713,8 +713,8 @@ function openChannelModal(channel = null) {
   imaForm.clear_credentials = false;
   const itickConfig = channel?.itick_config || { api_base: "https://api0.itick.org", api_key: "", api_key_configured: false, default_symbols: ["HK:700", "US:AAPL", "SH:600519"], kline_type: 2, kline_limit: 60, timeout_seconds: 20 };
   Object.assign(itickForm, { ...itickConfig, api_key: "", default_symbols_text: (itickConfig.default_symbols || ["HK:700", "US:AAPL", "SH:600519"]).join("\n"), clear_credentials: false });
-  const xTwtApiConfig = channel?.x_twtapi_config || { api_base: "https://api.twtapi.com/api/v1/twitter", api_key: "", api_key_configured: false, default_queries: ["A股", "半导体", "光伏", "机器人"], result_type: "Latest", max_results: 20, timeout_seconds: 20, lang: "zh" };
-  Object.assign(xTwtApiForm, { ...xTwtApiConfig, api_key: "", default_queries_text: (xTwtApiConfig.default_queries || ["A股", "半导体", "光伏", "机器人"]).join("\n"), clear_credentials: false });
+  const xTwtApiConfig = channel?.x_twtapi_config || { api_base: "https://api.twtapi.com/api/v1/twitter", api_key: "", api_key_configured: false, default_queries: ["A股", "半导体", "光伏", "机器人"], tracked_users: [], result_type: "Latest", max_results: 20, timeout_seconds: 20, lang: "zh" };
+  Object.assign(xTwtApiForm, { ...xTwtApiConfig, api_key: "", default_queries_text: (xTwtApiConfig.default_queries || ["A股", "半导体", "光伏", "机器人"]).join("\n"), tracked_users_text: (xTwtApiConfig.tracked_users || []).join("\n"), clear_credentials: false });
   const wechatRssConfig = channel?.wechat_rss_config || { base_url: "http://127.0.0.1:8001", feed_ids: ["all"], access_key: "", secret_key: "", credentials_configured: false, admin_username: "admin", admin_password: "", admin_password_configured: false, timeout_seconds: 20, max_items_per_feed: 100 };
   Object.assign(wechatRssForm, { ...wechatRssConfig, feed_ids_text: (wechatRssConfig.feed_ids || ["all"]).join("\n"), clear_credentials: false });
   channelModal.value = true;
@@ -752,10 +752,11 @@ async function saveItickConfiguration() {
 }
 
 async function saveXTwtApiConfiguration() {
-  const { default_queries_text, ...config } = xTwtApiForm;
+  const { default_queries_text, tracked_users_text, ...config } = xTwtApiForm;
+  const splitLines = (text) => text.split(/\r?\n|,|，|;|；/).map((item) => item.trim()).filter(Boolean);
   return request("/api/channels/x-twtapi/config", {
     method: "PUT",
-    body: JSON.stringify({ ...config, default_queries: default_queries_text.split(/\r?\n|,|，|;|；/).map((item) => item.trim()).filter(Boolean) }),
+    body: JSON.stringify({ ...config, default_queries: splitLines(default_queries_text), tracked_users: splitLines(tracked_users_text) }),
   });
 }
 
@@ -1681,7 +1682,7 @@ onUnmounted(() => {
                 <small v-if="channel.group_ids?.length">星球 ID：{{ channel.group_ids.join('、') }}</small>
                 <small v-if="channel.id==='akshare'">组件：AkShare · BaoStock · TuShare{{ channel.market_data_config?.tushare_token_configured ? '（token 已加密保存）' : '（等待 token）' }}</small>
                 <small v-if="channel.id==='itick'">iTick 行情 API：配置中维护 API Base、API Key 和默认代码；API Key 仅本地加密保存</small>
-                <small v-if="channel.id==='x-twtapi'">X/TwtAPI：配置中维护 API Base、API Key 和默认搜索词；个股补证会按标的实时搜索</small>
+                <small v-if="channel.id==='x-twtapi'">X/TwtAPI：配置中维护 API Base、API Key、默认搜索词和指定博主；个股补证会按标的实时搜索</small>
                 <small v-if="channel.id==='wechat-mp-rss'">微信扫码登录后搜索并加入公众号；采集按严格时间窗读取文章快照</small>
                 <small v-if="channel.id==='ima-knowledge'">在配置中维护 ClientID、API Key 和 IMA Skill 下载地址；API Key 仅本地加密保存</small>
                 <small>整理策略：{{ channel.parsing_strategy }} · 质量阈值 {{ channel.normalization_quality_threshold }} · 最大滚动 {{ channel.max_scrolls }}</small>
@@ -2202,7 +2203,7 @@ onUnmounted(() => {
           </div>
           <div v-if="editingChannel?.id==='x-twtapi'" class="col-span-2 rounded-2xl border border-teal-400/20 bg-teal-400/[.04] p-4">
             <span class="form-label">X / Twitter（TwtAPI）</span>
-            <p class="mt-1 text-xs leading-5 text-slate-500">按 TwtAPI 文档用 <code>X-API-Key</code> 调用 Search。普通信源采集使用默认搜索词，个股补证会用股票标的实时检索。</p>
+            <p class="mt-1 text-xs leading-5 text-slate-500">按 TwtAPI 文档用 <code>X-API-Key</code> 调用 Search 和用户时间线。普通信源采集使用默认搜索词与指定博主，个股补证会用股票标的实时检索。</p>
             <div class="mt-3 grid grid-cols-2 gap-3">
               <label>
                 <span class="form-label">API Base</span>
@@ -2217,6 +2218,11 @@ onUnmounted(() => {
               <span class="form-label">默认搜索词</span>
               <textarea v-model="xTwtApiForm.default_queries_text" rows="4" placeholder="A股&#10;半导体&#10;光伏&#10;机器人" class="field mt-2 w-full"></textarea>
               <small class="mt-1 block text-xs leading-5 text-slate-600">每行一个 X 搜索表达式；个股研究时会优先使用任务标的，不受这里的默认搜索词限制。</small>
+            </label>
+            <label class="mt-3 block">
+              <span class="form-label">指定博主</span>
+              <textarea v-model="xTwtApiForm.tracked_users_text" rows="3" placeholder="https://x.com/aleabitoreddit&#10;或 @aleabitoreddit" class="field mt-2 w-full"></textarea>
+              <small class="mt-1 block text-xs leading-5 text-slate-600">每行一个 X 用户名或主页 URL。采集器会先解析用户 ID，再读取该账号最新 tweets。</small>
             </label>
             <div class="mt-3 grid grid-cols-4 gap-3">
               <label>

@@ -13,6 +13,7 @@ from backend.http_policy import browser_headers
 
 DEFAULT_TWTAPI_API_BASE = "https://api.twtapi.com/api/v1/twitter"
 DEFAULT_TWTAPI_QUERIES = ("A股", "半导体", "光伏", "机器人")
+DEFAULT_TWTAPI_TRACKED_USERS: tuple[str, ...] = ()
 MASKED_SECRET = "****************"
 VALID_RESULT_TYPES = {"Top", "Latest", "User", "Image", "Video"}
 
@@ -25,6 +26,35 @@ def _string_list(value: Any) -> list[str]:
     return []
 
 
+def normalize_twtapi_username(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    text = text.split()[0].strip().rstrip("/")
+    match = re.search(r"(?:https?://)?(?:www\.)?(?:x|twitter)\.com/([^/?#]+)", text, re.IGNORECASE)
+    if match:
+        text = match.group(1)
+    text = text.strip().lstrip("@").split("/", 1)[0]
+    if not re.fullmatch(r"[A-Za-z0-9_]{1,15}", text):
+        return ""
+    return text
+
+
+def _username_list(value: Any) -> list[str]:
+    users: list[str] = []
+    seen: set[str] = set()
+    for item in _string_list(value):
+        username = normalize_twtapi_username(item)
+        if not username:
+            continue
+        key = username.casefold()
+        if key in seen:
+            continue
+        users.append(username)
+        seen.add(key)
+    return users
+
+
 def normalize_twtapi_config(config: dict[str, Any] | None, include_fallback: bool = True) -> dict[str, Any]:
     config = dict(config or {})
     api_base = str(config.get("api_base") or config.get("base_url") or (DEFAULT_TWTAPI_API_BASE if include_fallback else "")).strip()
@@ -34,9 +64,19 @@ def normalize_twtapi_config(config: dict[str, Any] | None, include_fallback: boo
         parsed = urlsplit(api_base)
         if parsed.netloc == "api.twtapi.com" and parsed.path.rstrip("/") in {"", "/"}:
             api_base = DEFAULT_TWTAPI_API_BASE
-    queries = _string_list(config.get("default_queries") or config.get("queries"))
-    if not queries and include_fallback:
+    raw_queries = config.get("default_queries") if "default_queries" in config else config.get("queries")
+    queries = _string_list(raw_queries)
+    if not queries and include_fallback and raw_queries is None:
         queries = list(DEFAULT_TWTAPI_QUERIES)
+    if "tracked_users" in config:
+        raw_tracked_users = config.get("tracked_users")
+    elif "usernames" in config:
+        raw_tracked_users = config.get("usernames")
+    else:
+        raw_tracked_users = config.get("screen_names")
+    tracked_users = _username_list(raw_tracked_users)
+    if not tracked_users and include_fallback and raw_tracked_users is None:
+        tracked_users = list(DEFAULT_TWTAPI_TRACKED_USERS)
     result_type = str(config.get("result_type") or "Latest").strip() or "Latest"
     if result_type not in VALID_RESULT_TYPES:
         result_type = "Latest"
@@ -54,6 +94,7 @@ def normalize_twtapi_config(config: dict[str, Any] | None, include_fallback: boo
         "api_base": api_base.rstrip("/") if api_base else "",
         "api_key": str(config.get("api_key") or "").strip(),
         "default_queries": queries[:100],
+        "tracked_users": tracked_users[:100],
         "result_type": result_type,
         "max_results": max(1, min(max_results, 100)),
         "timeout_seconds": max(3, min(timeout_seconds, 60)),
@@ -164,15 +205,18 @@ def twtapi_tweet_user(tweet: dict[str, Any]) -> dict[str, str]:
         candidates.append(legacy_user)
     for user in candidates:
         legacy = user.get("legacy") if isinstance(user.get("legacy"), dict) else {}
+        profile_core = user.get("core") if isinstance(user.get("core"), dict) else {}
         username = str(
             user.get("screen_name")
             or user.get("username")
             or user.get("userName")
+            or profile_core.get("screen_name")
+            or profile_core.get("username")
             or legacy.get("screen_name")
             or legacy.get("username")
             or ""
         ).strip().lstrip("@")
-        name = str(user.get("name") or legacy.get("name") or username).strip()
+        name = str(user.get("name") or profile_core.get("name") or legacy.get("name") or username).strip()
         user_id = str(user.get("id") or user.get("id_str") or user.get("rest_id") or legacy.get("id_str") or "").strip()
         if username or name or user_id:
             return {"id": user_id, "username": username, "name": name}
@@ -263,6 +307,9 @@ def extract_twtapi_tweets(payload: Any, limit: int = 200) -> list[dict[str, Any]
             for key in ("tweet", "tweets", "items", "results", "statuses", "entries", "data", "search_results", "timeline"):
                 if key in value:
                     walk(value[key])
+            for item in value.values():
+                if isinstance(item, (dict, list)):
+                    walk(item)
         elif isinstance(value, list):
             for item in value:
                 walk(item)
@@ -273,10 +320,117 @@ def extract_twtapi_tweets(payload: Any, limit: int = 200) -> list[dict[str, Any]
     return tweets
 
 
+def _extract_user_id(payload: Any) -> str:
+    payload = _unwrap_payload(payload)
+    if isinstance(payload, (int, float)):
+        value = str(int(payload))
+        return value if value.isdigit() else ""
+    if isinstance(payload, str):
+        value = payload.strip()
+        return value if re.fullmatch(r"\d{2,30}", value) else ""
+    if isinstance(payload, dict):
+        for key in ("user_id", "rest_id", "restId", "id_str", "id"):
+            value = payload.get(key)
+            if value not in (None, ""):
+                found = _extract_user_id(value)
+                if found:
+                    return found
+        for key in ("user", "result", "legacy", "data", "profile", "user_results"):
+            value = payload.get(key)
+            if isinstance(value, (dict, list, str, int, float)):
+                found = _extract_user_id(value)
+                if found:
+                    return found
+        for value in payload.values():
+            if isinstance(value, (dict, list)):
+                found = _extract_user_id(value)
+                if found:
+                    return found
+    if isinstance(payload, list):
+        for item in payload:
+            found = _extract_user_id(item)
+            if found:
+                return found
+    return ""
+
+
+def resolve_twtapi_user(session: requests.Session, config: dict[str, Any], username: str) -> dict[str, Any]:
+    username = normalize_twtapi_username(username)
+    if not username:
+        raise RuntimeError("Invalid TwtAPI username")
+    errors: list[str] = []
+    for endpoint, params in (
+        ("/UsernameToUserId", {"username": username}),
+        ("/UserResultByScreenName", {"username": username}),
+    ):
+        try:
+            payload = _request_json(session, config, endpoint, params)
+        except Exception as exc:
+            errors.append(f"{endpoint}: {exc}")
+            continue
+        user_id = _extract_user_id(payload)
+        if user_id:
+            return {"username": username, "user_id": user_id, "profile": payload, "resolver_endpoint": endpoint.lstrip("/")}
+        errors.append(f"{endpoint}: response did not include a user id")
+    raise RuntimeError("; ".join(errors) or f"TwtAPI user not found: {username}")
+
+
+def _collect_tracked_user(
+    session: requests.Session,
+    config: dict[str, Any],
+    username: str,
+    channel_id: str,
+    window: dict[str, str],
+    query: str,
+    collected_at: str,
+) -> dict[str, str]:
+    resolved = resolve_twtapi_user(session, config, username)
+    raw_payload = _request_json(session, config, "/UserTweets", {"user_id": resolved["user_id"]})
+    tweets = extract_twtapi_tweets(raw_payload, limit=config["max_results"])
+    payload = {
+        "platform": "x_twtapi",
+        "adapter": "twtapi_user_timeline",
+        "endpoint": "UserTweets",
+        "query": query,
+        "collection_window": window,
+        "collected_at": collected_at,
+        "api_base_host": _safe_host(config["api_base"]),
+        "tracked_user": {"username": resolved["username"], "user_id": resolved["user_id"]},
+        "profile": resolved["profile"],
+        "resolver_endpoint": resolved["resolver_endpoint"],
+        "max_results": config["max_results"],
+        "tweets": tweets,
+        "response": raw_payload,
+        "diagnostics": {"tweet_count": len(tweets)},
+    }
+    return {
+        "channel_id": channel_id,
+        "occurred_at": collected_at,
+        "source_url": f"https://x.com/{resolved['username']}",
+        "content": json.dumps(payload, ensure_ascii=False, default=str),
+    }
+
+
 def twtapi_status(config: dict[str, Any], session: requests.Session | None = None) -> dict[str, Any]:
     checked_at = datetime.now().astimezone().isoformat(timespec="seconds")
     config = normalize_twtapi_config(config)
     session = session or requests.Session()
+    if config["tracked_users"]:
+        sample_user = config["tracked_users"][0]
+        try:
+            resolved = resolve_twtapi_user(session, config, sample_user)
+            payload = _request_json(session, config, "/UserTweets", {"user_id": resolved["user_id"]})
+        except Exception as exc:
+            return {"status": "offline", "message": f"TwtAPI user timeline unavailable: {exc}", "checked_at": checked_at}
+        return {
+            "status": "online",
+            "message": f"TwtAPI X user timeline is available, verified @{resolved['username']}",
+            "checked_at": checked_at,
+            "sample_user": resolved["username"],
+            "sample_user_id": resolved["user_id"],
+            "sample_available": bool(extract_twtapi_tweets(payload, limit=5)),
+            "api_base_host": _safe_host(config["api_base"]),
+        }
     sample_query = (config["default_queries"] or ["A股"])[0]
     try:
         payload = _request_json(
@@ -307,8 +461,9 @@ def collect_twtapi_search(
     config = normalize_twtapi_config(config)
     queries = [query.strip()] if query.strip() else list(config["default_queries"])
     queries = [item for item in queries if item]
-    if not queries:
-        raise RuntimeError("No TwtAPI search queries are configured")
+    tracked_users = list(config["tracked_users"])
+    if not queries and not tracked_users:
+        raise RuntimeError("No TwtAPI search queries or tracked users are configured")
     session = session or requests.Session()
     collected_at = datetime.now().astimezone().isoformat(timespec="seconds")
     snapshots: list[dict[str, str]] = []
@@ -347,6 +502,11 @@ def collect_twtapi_search(
                 "content": json.dumps(payload, ensure_ascii=False, default=str),
             }
         )
+    for username in tracked_users[:20]:
+        try:
+            snapshots.append(_collect_tracked_user(session, config, username, channel_id, window, query.strip(), collected_at))
+        except Exception as exc:
+            failures[f"@{username}"] = str(exc)
     if not snapshots and failures:
         raise RuntimeError(json.dumps(failures, ensure_ascii=False))
     if failures:

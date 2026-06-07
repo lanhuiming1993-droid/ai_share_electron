@@ -309,6 +309,7 @@ class TwtApiConfigInput(BaseModel):
     api_base: str = Field(default=DEFAULT_TWTAPI_API_BASE, max_length=1_000)
     api_key: str = Field(default="", repr=False)
     default_queries: list[str] = Field(default_factory=list, max_length=100)
+    tracked_users: list[str] = Field(default_factory=list, max_length=100)
     result_type: Literal["Top", "Latest", "User", "Image", "Video"] = "Latest"
     max_results: int = Field(default=20, ge=1, le=100)
     timeout_seconds: int = Field(default=20, ge=3, le=60)
@@ -957,7 +958,7 @@ def init_db() -> None:
                 DEFAULT_TWTAPI_API_BASE,
                 "x_twtapi",
                 "pending",
-                "通过 TwtAPI 调用 X/Twitter Search 与 Trends；API Key 仅在本机加密保存，个股补证按标的实时检索。",
+                "通过 TwtAPI 调用 X/Twitter Search、Trends 与指定博主时间线；API Key 仅在本机加密保存，个股补证按标的实时检索。",
                 "fixed",
                 78,
                 1,
@@ -971,7 +972,7 @@ def init_db() -> None:
             UPDATE channels
             SET name='X（TwtAPI）',type='X/Twitter 实时检索',url=?,
                 collection_mode='x_twtapi',
-                notes='通过 TwtAPI 调用 X/Twitter Search 与 Trends；API Key 仅在本机加密保存，个股补证按标的实时检索。',
+                notes='通过 TwtAPI 调用 X/Twitter Search、Trends 与指定博主时间线；API Key 仅在本机加密保存，个股补证按标的实时检索。',
                 parsing_strategy='fixed',normalization_quality_threshold=78,max_scrolls=1,
                 research_enabled=1,builtin=1
             WHERE id='x-twtapi'
@@ -1591,6 +1592,7 @@ def fixed_normalized_items(snapshot: sqlite3.Row, mode: str = "fixed") -> tuple[
                         "query": payload.get("query", ""),
                         "tweet_id": tweet_id,
                         "user": user,
+                        "tracked_user": payload.get("tracked_user", {}),
                         "collection_window": payload.get("collection_window", {}),
                         "api_base_host": payload.get("api_base_host", ""),
                         "result_type": payload.get("result_type", ""),
@@ -2490,7 +2492,8 @@ def update_x_twtapi_config(payload: TwtApiConfigInput) -> dict:
             "adapter": "x_twtapi",
             "api_base": payload.api_base.strip() or DEFAULT_TWTAPI_API_BASE,
             "api_key": api_key,
-            "default_queries": payload.default_queries or existing.get("default_queries") or [],
+            "default_queries": payload.default_queries,
+            "tracked_users": payload.tracked_users,
             "result_type": payload.result_type,
             "max_results": payload.max_results,
             "timeout_seconds": payload.timeout_seconds,
@@ -2513,6 +2516,7 @@ def update_x_twtapi_config(payload: TwtApiConfigInput) -> dict:
         api_base_host=urlsplit(config["api_base"]).netloc,
         api_key_configured=bool(config["api_key"]),
         default_query_count=len(config["default_queries"]),
+        tracked_user_count=len(config["tracked_users"]),
     )
     return {"status": "saved", "config": x_twtapi_channel_config_public()}
 

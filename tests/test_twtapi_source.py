@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 
-from backend.twtapi_source import collect_twtapi_search, public_twtapi_config, twtapi_status
+from backend.twtapi_source import collect_twtapi_search, public_twtapi_config, twtapi_status, twtapi_tweet_text, twtapi_tweet_user
 
 
 class FakeResponse:
@@ -24,6 +24,52 @@ class FakeSession:
 
     def get(self, url, params=None, headers=None, timeout=None):
         self.calls.append({"url": url, "params": params or {}, "headers": headers or {}, "timeout": timeout})
+        if url.endswith("/UsernameToUserId"):
+            return FakeResponse({"code": 0, "data": {"user_id": "42"}})
+        if url.endswith("/UserTweets"):
+            return FakeResponse(
+                {
+                    "code": 0,
+                    "data": {
+                        "user_result_by_rest_id": {
+                            "rest_id": params["user_id"],
+                            "result": {
+                                "profile_timeline_v2": {
+                                    "timeline": {
+                                        "instructions": [
+                                            {
+                                                "entry": {
+                                                    "content": {
+                                                        "content": {
+                                                            "tweet_results": {
+                                                                "result": {
+                                                                    "rest_id": "456",
+                                                                    "core": {
+                                                                        "user_results": {
+                                                                            "result": {
+                                                                                "rest_id": params["user_id"],
+                                                                                "core": {"screen_name": "aleabitoreddit", "name": "Alea"},
+                                                                            }
+                                                                        }
+                                                                    },
+                                                                    "legacy": {
+                                                                        "full_text": "Tracked user latest tweet",
+                                                                        "created_at": "Fri Jun 05 02:00:00 +0000 2026",
+                                                                    },
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        ]
+                                    }
+                                }
+                            },
+                        }
+                    },
+                }
+            )
         if url.endswith("/Search"):
             return FakeResponse(
                 {
@@ -45,10 +91,18 @@ class FakeSession:
 
 class TwtApiSourceTests(unittest.TestCase):
     def test_public_config_masks_api_key(self) -> None:
-        config = public_twtapi_config({"api_base": "api.twtapi.com", "api_key": "secret-token", "default_queries": ["A股"]})
+        config = public_twtapi_config(
+            {
+                "api_base": "api.twtapi.com",
+                "api_key": "secret-token",
+                "default_queries": ["A股"],
+                "tracked_users": ["https://x.com/aleabitoreddit", "@aleabitoreddit"],
+            }
+        )
         self.assertEqual(config["api_base"], "https://api.twtapi.com/api/v1/twitter")
         self.assertEqual(config["api_key"], "****************")
         self.assertTrue(config["api_key_configured"])
+        self.assertEqual(config["tracked_users"], ["aleabitoreddit"])
 
     def test_collects_search_results_without_leaking_key(self) -> None:
         session = FakeSession()
@@ -70,12 +124,45 @@ class TwtApiSourceTests(unittest.TestCase):
         self.assertEqual(payload["platform"], "x_twtapi")
         self.assertEqual(payload["tweets"][0]["text"], "长飞光纤订单与产能讨论")
 
+    def test_collects_tracked_user_timeline(self) -> None:
+        session = FakeSession()
+        snapshots = collect_twtapi_search(
+            "x-twtapi",
+            {"window_start": "2026-06-01T00:00:00+08:00", "window_end": "2026-06-05T13:00:00+08:00"},
+            "",
+            {
+                "api_base": "https://api.twtapi.com/api/v1/twitter",
+                "api_key": "secret-token",
+                "default_queries": [],
+                "tracked_users": ["https://x.com/aleabitoreddit"],
+            },
+            session=session,
+        )
+        self.assertEqual(len(snapshots), 1)
+        self.assertEqual([call["url"].rsplit("/", 1)[-1] for call in session.calls], ["UsernameToUserId", "UserTweets"])
+        self.assertEqual(session.calls[0]["params"], {"username": "aleabitoreddit"})
+        self.assertEqual(session.calls[1]["params"], {"user_id": "42"})
+        self.assertEqual(snapshots[0]["source_url"], "https://x.com/aleabitoreddit")
+        self.assertNotIn("secret-token", snapshots[0]["content"])
+        payload = json.loads(snapshots[0]["content"])
+        self.assertEqual(payload["adapter"], "twtapi_user_timeline")
+        self.assertEqual(payload["tracked_user"], {"username": "aleabitoreddit", "user_id": "42"})
+        self.assertEqual(twtapi_tweet_text(payload["tweets"][0]), "Tracked user latest tweet")
+        self.assertEqual(twtapi_tweet_user(payload["tweets"][0])["username"], "aleabitoreddit")
+
     def test_status_verifies_search_endpoint(self) -> None:
         session = FakeSession()
         status = twtapi_status({"api_key": "secret-token", "default_queries": ["机器人"]}, session=session)
         self.assertEqual(status["status"], "online")
         self.assertEqual(status["sample_query"], "机器人")
         self.assertTrue(status["sample_available"])
+
+    def test_status_verifies_first_tracked_user_when_configured(self) -> None:
+        session = FakeSession()
+        status = twtapi_status({"api_key": "secret-token", "tracked_users": ["aleabitoreddit"]}, session=session)
+        self.assertEqual(status["status"], "online")
+        self.assertEqual(status["sample_user"], "aleabitoreddit")
+        self.assertEqual(status["sample_user_id"], "42")
 
 
 if __name__ == "__main__":

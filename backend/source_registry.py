@@ -51,10 +51,10 @@ SOURCES = (
         display_name="X（TwtAPI）",
         category="social_media_search",
         collection_mode="x_twtapi",
-        capabilities=("tweet_search", "trends", "social_signal", "stock_research_evidence"),
+        capabilities=("tweet_search", "user_timeline", "trends", "social_signal", "stock_research_evidence"),
         credential_mode="encrypted_api_key",
         risk_level="medium",
-        detail="通过 TwtAPI 调用 X/Twitter Search 与 Trends；API Key 仅在本机加密保存，个股补证按标的实时检索。",
+        detail="通过 TwtAPI 调用 X/Twitter Search、Trends 与指定博主时间线；API Key 仅在本机加密保存，个股补证按标的实时检索。",
     ),
     SourceDefinition(
         id="industry-news",
@@ -149,7 +149,7 @@ TOOLS = (
         kind="python_http",
         priority=4,
         status="ready",
-        detail="专用 TwtAPI REST 适配器，按默认搜索词或个股标的读取 X 搜索结果，API Key 本机加密保存。",
+        detail="专用 TwtAPI REST 适配器，按默认搜索词、指定博主或个股标的读取 X 搜索与用户时间线，API Key 本机加密保存。",
     ),
     ToolDefinition(
         id="ima_openapi",

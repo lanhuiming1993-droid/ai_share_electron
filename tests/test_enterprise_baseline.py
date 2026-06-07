@@ -20,6 +20,7 @@ class EnterpriseBaselineTests(unittest.TestCase):
         self.assertIn("stock_quote", sources["itick"]["capabilities"])
         self.assertEqual(sources["itick"]["credential_mode"], "encrypted_api_key")
         self.assertIn("tweet_search", sources["x-twtapi"]["capabilities"])
+        self.assertIn("user_timeline", sources["x-twtapi"]["capabilities"])
         self.assertEqual(sources["x-twtapi"]["credential_mode"], "encrypted_api_key")
         self.assertEqual(sources["web-rumors"]["credential_mode"], "encrypted_session_config")
         self.assertIn("wechat_official_accounts", sources["wechat-mp-rss"]["capabilities"])

@@ -508,8 +508,14 @@ class MainBehaviorTests(unittest.TestCase):
         with self.main.db() as conn:
             conn.execute("UPDATE channels SET status='online' WHERE id='x-twtapi'")
         self.main.update_x_twtapi_config(
-            self.main.TwtApiConfigInput(api_key="secret-token", default_queries=["A股"])
+            self.main.TwtApiConfigInput(
+                api_key="secret-token",
+                default_queries=["A股"],
+                tracked_users=["https://x.com/aleabitoreddit"],
+            )
         )
+        saved_config = self.main.channel_request_config("x-twtapi")
+        self.assertEqual(saved_config["tracked_users"], ["aleabitoreddit"])
         with self.main.db() as conn:
             status = conn.execute("SELECT status FROM channels WHERE id='x-twtapi'").fetchone()["status"]
         self.assertEqual(status, "online")
