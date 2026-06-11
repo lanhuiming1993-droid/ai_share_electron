@@ -120,6 +120,11 @@ function channelStatusDescription(channel) {
   }
   return channel.collection_mode === "playwright" ? "等待登录配置" : "等待渠道配置";
 }
+function providerProtocolLabel(protocol) {
+  if (protocol === "openai_responses") return "OpenAI Responses API";
+  if (protocol === "anthropic_messages") return "Anthropic Messages API";
+  return "OpenAI Chat Completions";
+}
 function jobChannelNames(job) {
   return job.channel_names?.length ? job.channel_names : (job.channel_ids || []).map(channelDisplayName);
 }
@@ -1802,7 +1807,7 @@ onUnmounted(() => {
                   <b :class="item.status==='online'?'status-good':item.status==='failed'?'status-warn':'text-slate-600'" class="text-xs">{{ item.status }}</b>
                   <b v-if="item.latency_ms" class="text-xs text-amber-300">{{ item.latency_ms }} ms</b>
                 </span>
-                <small class="truncate">{{ item.base_url }} · {{ item.model }} · {{ item.protocol === 'openai_responses' ? 'Responses API' : 'Chat Completions' }}</small>
+                <small class="truncate">{{ item.base_url }} · {{ item.model }} · {{ providerProtocolLabel(item.protocol) }}</small>
               </span>
               <div class="flex shrink-0 items-center gap-2">
                 <button v-if="!item.is_default" @click="activateProvider(item.id)" class="secondary">设为默认</button>
@@ -2246,6 +2251,7 @@ onUnmounted(() => {
             <select v-model="provider.protocol" class="field mt-2 w-full">
               <option value="openai_chat_completions">OpenAI Chat Completions</option>
               <option value="openai_responses">OpenAI Responses API</option>
+              <option value="anthropic_messages">Anthropic Messages API</option>
             </select>
           </label>
           <label class="block"><span class="form-label">额外参数 JSON</span><textarea v-model="provider.extra_body_text" rows="4" class="field mt-2 w-full"></textarea></label>

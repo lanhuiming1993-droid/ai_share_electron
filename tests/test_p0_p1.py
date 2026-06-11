@@ -10,6 +10,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from pydantic import BaseModel
+
 from backend.collectors import collect_http
 from backend.industry_news_sources import collect_public_industry_news
 from backend.model_gateway import GatewayResult, ModelGateway, ProviderRuntimeConfig
@@ -934,6 +936,19 @@ class MainBehaviorTests(unittest.TestCase):
 
 
 class ModelGatewayBehaviorTests(unittest.TestCase):
+    class AnthropicStructuredProbe(BaseModel):
+        status: str
+        confidence: int
+
+    class FakeAnthropicResponse:
+        def __init__(self, payload: dict, status_code: int = 200) -> None:
+            self.payload = payload
+            self.status_code = status_code
+            self.text = json.dumps(payload, ensure_ascii=False)
+
+        def json(self):
+            return self.payload
+
     def test_responses_model_disables_remote_storage(self) -> None:
         gateway = ModelGateway()
         config = ProviderRuntimeConfig(
@@ -961,6 +976,91 @@ class ModelGatewayBehaviorTests(unittest.TestCase):
         settings = gateway._model_settings(config)
         self.assertEqual(settings["temperature"], 0.2)
         self.assertEqual(settings["extra_body"], {"top_p": 0.9})
+
+    def test_anthropic_text_uses_messages_api(self) -> None:
+        gateway = ModelGateway(timeout_seconds=11, connect_timeout_seconds=3, network_retries=0)
+        config = ProviderRuntimeConfig(
+            id="anthropic",
+            base_url="https://api.anthropic.com",
+            model="claude-test",
+            protocol="anthropic_messages",
+            api_key="secret",
+            extra_body={"max_tokens": 123, "top_p": 0.8, "anthropic_version": "2023-06-01", "anthropic_beta": "test-beta"},
+        )
+        calls = []
+
+        def fake_post(url, **kwargs):
+            calls.append({"url": url, **kwargs})
+            return self.FakeAnthropicResponse(
+                {
+                    "content": [{"type": "text", "text": "模型通道可用"}],
+                    "usage": {"input_tokens": 7, "output_tokens": 4},
+                }
+            )
+
+        with patch("backend.model_gateway.requests.post", side_effect=fake_post):
+            result = gateway.run_text(config, "只回复：模型通道可用", instructions="system rules")
+
+        self.assertEqual(result.output, "模型通道可用")
+        self.assertEqual(result.input_tokens, 7)
+        self.assertEqual(result.output_tokens, 4)
+        call = calls[0]
+        self.assertEqual(call["url"], "https://api.anthropic.com/v1/messages")
+        self.assertEqual(call["headers"]["x-api-key"], "secret")
+        self.assertEqual(call["headers"]["anthropic-version"], "2023-06-01")
+        self.assertEqual(call["headers"]["anthropic-beta"], "test-beta")
+        self.assertEqual(call["timeout"], (3, 11))
+        self.assertEqual(call["json"]["model"], "claude-test")
+        self.assertEqual(call["json"]["system"], "system rules")
+        self.assertEqual(call["json"]["messages"], [{"role": "user", "content": "只回复：模型通道可用"}])
+        self.assertEqual(call["json"]["max_tokens"], 123)
+        self.assertEqual(call["json"]["temperature"], 0.2)
+        self.assertEqual(call["json"]["top_p"], 0.8)
+        self.assertNotIn("anthropic_version", call["json"])
+        self.assertNotIn("anthropic_beta", call["json"])
+
+    def test_anthropic_structured_uses_forced_tool_schema(self) -> None:
+        gateway = ModelGateway(timeout_seconds=11, connect_timeout_seconds=3, network_retries=0)
+        config = ProviderRuntimeConfig(
+            id="anthropic",
+            base_url="https://gateway.example/v1",
+            model="claude-test",
+            protocol="anthropic_messages",
+            api_key="secret",
+            extra_body={},
+        )
+        calls = []
+
+        def fake_post(url, **kwargs):
+            calls.append({"url": url, **kwargs})
+            return self.FakeAnthropicResponse(
+                {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "name": "emit_structured_response",
+                            "input": {"status": "ok", "confidence": 91},
+                        }
+                    ],
+                    "usage": {"input_tokens": 9, "output_tokens": 6},
+                }
+            )
+
+        with patch("backend.model_gateway.requests.post", side_effect=fake_post):
+            result = gateway.run_structured(
+                config,
+                "返回结构化状态",
+                instructions="system rules",
+                output_type=self.AnthropicStructuredProbe,
+            )
+
+        self.assertEqual(result.output.status, "ok")
+        self.assertEqual(result.output.confidence, 91)
+        call = calls[0]
+        self.assertEqual(call["url"], "https://gateway.example/v1/messages")
+        self.assertEqual(call["json"]["tool_choice"], {"type": "tool", "name": "emit_structured_response"})
+        self.assertEqual(call["json"]["tools"][0]["name"], "emit_structured_response")
+        self.assertIn("confidence", call["json"]["tools"][0]["input_schema"]["properties"])
 
 
 class PaginationBehaviorTests(unittest.TestCase):

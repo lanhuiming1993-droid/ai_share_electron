@@ -196,7 +196,7 @@ class ProviderInput(BaseModel):
     base_url: str = "https://api.deepseek.com"
     model: str = "deepseek-chat"
     api_key: str = Field(default="", repr=False)
-    protocol: Literal["openai_chat_completions", "openai_responses"] = "openai_chat_completions"
+    protocol: Literal["openai_chat_completions", "openai_responses", "anthropic_messages"] = "openai_chat_completions"
     enabled: bool = True
     extra_body: dict = Field(default_factory=dict)
 
