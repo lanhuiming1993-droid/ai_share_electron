@@ -45,6 +45,7 @@ const mxHarFile = ref(null);
 const mxHarImporting = ref(false);
 const inventoryCleanupSubmitting = ref(false);
 const taskListCleanupSubmitting = ref(false);
+const sourceWeightsDirty = ref(false);
 const sourceWeightsSaving = ref(false);
 const diagnosticLogs = ref([]);
 const diagnosticConfig = reactive({ directory: "", active_file: "", max_file_mb: 0, backup_count: 0, files: [] });
@@ -125,18 +126,71 @@ function jobChannelNames(job) {
 function sourceWeightItem(channelId) {
   return (data.source_weights?.weights || []).find((item) => item.channel_id === channelId);
 }
-function sourceWeightValue(channelId) {
-  return sourceWeightItem(channelId)?.weight ?? 0;
+
+function roundedPercent(value) {
+  const weight = Number(value);
+  if (!Number.isFinite(weight)) return 0;
+  return Math.max(0, Math.min(100, Math.round(weight * 100) / 100));
 }
+
+function normalizeSourceWeightRows(rows) {
+  if (!rows.length) return;
+  const total = rows.reduce((sum, item) => sum + Number(item.weight || 0), 0);
+  if (total <= 0) {
+    const basisPoints = 10000;
+    const base = Math.floor(basisPoints / rows.length);
+    const remainder = basisPoints % rows.length;
+    rows.forEach((item, index) => {
+      item.weight = Number(((base + (index < remainder ? 1 : 0)) / 100).toFixed(2));
+    });
+    return;
+  }
+  rows.forEach((item) => {
+    item.weight = roundedPercent(Number(item.weight || 0) * 100 / total);
+  });
+  const diff = Number((100 - rows.reduce((sum, item) => sum + Number(item.weight || 0), 0)).toFixed(2));
+  if (Math.abs(diff) >= 0.01) {
+    const target = rows.reduce((best, item) => Number(item.weight || 0) > Number(best.weight || 0) ? item : best, rows[0]);
+    target.weight = roundedPercent(Number(target.weight || 0) + diff);
+  }
+}
+
 function setSourceWeight(channelId, value) {
+  const rows = data.source_weights?.weights || [];
   const item = sourceWeightItem(channelId);
   if (!item) return;
-  const weight = Number(value);
-  item.weight = Number.isFinite(weight) ? Math.max(0, Math.min(100, Math.round(weight * 100) / 100)) : 0;
+  sourceWeightsDirty.value = true;
+  item.weight = roundedPercent(value);
+  const otherRows = rows.filter((row) => row.channel_id !== channelId);
+  const remaining = Number((100 - item.weight).toFixed(2));
+  if (!otherRows.length) return;
+  const otherTotal = otherRows.reduce((sum, row) => sum + Number(row.weight || 0), 0);
+  if (remaining <= 0) {
+    otherRows.forEach((row) => { row.weight = 0; });
+    return;
+  }
+  if (otherTotal <= 0) {
+    const basisPoints = Math.round(remaining * 100);
+    const base = Math.floor(basisPoints / otherRows.length);
+    const remainder = basisPoints % otherRows.length;
+    otherRows.forEach((row, index) => {
+      row.weight = Number(((base + (index < remainder ? 1 : 0)) / 100).toFixed(2));
+    });
+  } else {
+    otherRows.forEach((row) => {
+      row.weight = roundedPercent(Number(row.weight || 0) * remaining / otherTotal);
+    });
+  }
+  const diff = Number((100 - rows.reduce((sum, row) => sum + Number(row.weight || 0), 0)).toFixed(2));
+  if (Math.abs(diff) >= 0.01) {
+    const target = otherRows.reduce((best, row) => Number(row.weight || 0) > Number(best.weight || 0) ? row : best, otherRows[0]);
+    target.weight = roundedPercent(Number(target.weight || 0) + diff);
+  }
 }
 function resetSourceWeightsEvenly() {
   const channels = data.channels || [];
   if (!channels.length) return;
+  sourceWeightsDirty.value = true;
   const basisPoints = 10000;
   const base = Math.floor(basisPoints / channels.length);
   const remainder = basisPoints % channels.length;
@@ -361,10 +415,14 @@ function formatDiagnosticFields(fields) {
 
 async function refresh() {
   const [dashboard, audit] = await Promise.all([request("/api/dashboard"), request("/api/audit")]);
+  if (sourceWeightsDirty.value || sourceWeightsSaving.value) {
+    dashboard.source_weights = data.source_weights;
+  }
   Object.assign(data, dashboard, { audit });
 }
 
 async function saveSourceWeights() {
+  normalizeSourceWeightRows(data.source_weights?.weights || []);
   if (!sourceWeightsValid.value) {
     notice.value = `信源权重总和必须等于 100%，当前为 ${sourceWeightTotal.value}%`;
     return;
@@ -373,6 +431,7 @@ async function saveSourceWeights() {
   try {
     const weights = (data.source_weights?.weights || []).map((item) => ({ channel_id: item.channel_id, weight: Number(item.weight || 0) }));
     data.source_weights = await request("/api/settings/source-weights", { method: "PUT", body: JSON.stringify({ weights }) });
+    sourceWeightsDirty.value = false;
     notice.value = "信源分析权重已保存；采集任务仍按原规则执行";
     await refresh();
   } catch (error) {
@@ -1724,7 +1783,7 @@ onUnmounted(() => {
               <div class="flex items-center gap-2">
                 <span class="text-xs" :class="sourceWeightsValid ? 'text-emerald-300' : 'text-amber-300'">合计 {{ sourceWeightTotal }}%</span>
                 <button @click="resetSourceWeightsEvenly" :disabled="sourceWeightsSaving" class="secondary disabled:cursor-wait disabled:opacity-60">均分</button>
-                <button @click="saveSourceWeights" :disabled="sourceWeightsSaving || !sourceWeightsValid" class="primary disabled:cursor-wait disabled:opacity-60">{{ sourceWeightsSaving ? '保存中...' : '保存权重' }}</button>
+                <button @click="saveSourceWeights" :disabled="sourceWeightsSaving || !(data.source_weights?.weights || []).length" class="primary disabled:cursor-wait disabled:opacity-60">{{ sourceWeightsSaving ? '保存中...' : '保存权重' }}</button>
               </div>
             </div>
             <div v-if="!(data.source_weights?.weights || []).length" class="empty">尚无可配置信源</div>
@@ -1735,7 +1794,7 @@ onUnmounted(() => {
                   <small class="text-slate-600">{{ item.channel_id }}</small>
                 </span>
                 <span class="flex shrink-0 items-center gap-2">
-                  <input :value="sourceWeightValue(item.channel_id)" @input="setSourceWeight(item.channel_id, $event.target.value)" :disabled="sourceWeightsSaving" type="number" min="0" max="100" step="0.01" class="field w-24 text-right disabled:cursor-wait disabled:opacity-60" />
+                  <input v-model.number="item.weight" @input="setSourceWeight(item.channel_id, $event.target.value)" @change="setSourceWeight(item.channel_id, $event.target.value)" @blur="setSourceWeight(item.channel_id, $event.target.value)" :disabled="sourceWeightsSaving" type="number" min="0" max="100" step="0.01" class="field w-24 text-right disabled:cursor-wait disabled:opacity-60" />
                   <span class="text-xs text-slate-500">%</span>
                 </span>
               </label>
