@@ -194,6 +194,14 @@ class WerssApiSession:
         return FakeResponse("", url, {"code": 0, "data": None})
 
 
+class StaleQrStatusSession(WerssApiSession):
+    def get(self, url: str, **kwargs):
+        if url.endswith("/auth/qr/status"):
+            self.calls.append({"method": "GET", "url": url, **kwargs})
+            return FakeResponse("", url, {"code": 0, "data": {"login_status": False, "qr_code": False}})
+        return super().get(url, **kwargs)
+
+
 class WechatRssTests(unittest.TestCase):
     def test_managed_sidecar_enables_rate_limited_full_text_collection(self) -> None:
         compose = (Path(__file__).parents[1] / "integrations" / "werss" / "compose.yaml").read_text(encoding="utf-8")
@@ -350,6 +358,14 @@ class WechatRssTests(unittest.TestCase):
         self.assertTrue(status["authorized"])
         self.assertFalse(any(call["url"].endswith("/auth/qr/code") for call in session.calls))
 
+    def test_authorization_check_uses_search_probe_when_qr_status_is_stale(self) -> None:
+        session = StaleQrStatusSession(persistent_authorization=True, qr_login_status=False)
+        config = {"base_url": "http://127.0.0.1:8132"}
+        authorization = verify_werss_wechat_authorization(config, session=session, force_refresh=True)
+        self.assertTrue(authorization["authorized"])
+        self.assertEqual(authorization["login_state"], "authorized")
+        self.assertTrue(any("/mps/search/AlphaDeskAuthProbe" in call["url"] for call in session.calls))
+
     def test_search_add_and_delete_subscription_are_proxied_through_werss(self) -> None:
         session = WerssApiSession(persistent_authorization=True)
         config = {"base_url": "http://127.0.0.1:8125"}
@@ -371,6 +387,16 @@ class WechatRssTests(unittest.TestCase):
         authorization = verify_werss_wechat_authorization(config, session=WerssApiSession(persistent_authorization=True))
         self.assertFalse(authorization["authorized"])
         self.assertEqual(authorization["login_state"], "expired")
+
+    def test_successful_search_clears_expired_wechat_authorization_marker(self) -> None:
+        config = {"base_url": "http://127.0.0.1:8131"}
+        with self.assertRaises(WerssWechatAuthorizationExpired):
+            search_werss_public_accounts(config, "产业", session=WerssApiSession(persistent_authorization=False))
+        results = search_werss_public_accounts(config, "产业", session=WerssApiSession(persistent_authorization=True))
+        authorization = verify_werss_wechat_authorization(config, session=WerssApiSession(persistent_authorization=False))
+        self.assertEqual(results[0]["name"], "产业研究")
+        self.assertTrue(authorization["authorized"])
+        self.assertEqual(authorization["login_state"], "authorized")
 
     def test_expired_search_authorization_allows_new_qr_code(self) -> None:
         config = {"base_url": "http://127.0.0.1:8130"}

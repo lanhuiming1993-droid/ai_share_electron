@@ -279,6 +279,7 @@ def search_werss_public_accounts(config: dict[str, Any] | None, keyword: str, se
         raise
     if not isinstance(data, dict) or not isinstance(data.get("list"), list):
         raise RuntimeError("微信公众号授权尚未生效，请重新扫码")
+    remember_werss_wechat_authorization(normalized, True)
     return [
         {
             "id": str(row.get("fakeid") or ""),
@@ -432,6 +433,24 @@ def mark_werss_wechat_authorization_expired(config: dict[str, Any]) -> None:
     _WERSS_WECHAT_AUTH[normalized["base_url"]] = (False, expires_at)
 
 
+def probe_werss_wechat_search_authorization(config: dict[str, Any], session=None) -> bool:
+    normalized = normalize_werss_config(config)
+    try:
+        data = werss_admin_get(
+            normalized,
+            f"mps/search/{quote('AlphaDeskAuthProbe', safe='')}",
+            params={"limit": 1, "offset": 0},
+            session=session,
+        )
+    except RuntimeError as exc:
+        if is_werss_wechat_authorization_error(str(exc)):
+            mark_werss_wechat_authorization_expired(normalized)
+        return False
+    except Exception:
+        return False
+    return isinstance(data, dict) and isinstance(data.get("list"), list)
+
+
 def remember_werss_wechat_authorization(config: dict[str, Any], authorized: bool) -> bool:
     normalized = normalize_werss_config(config)
     ttl = WERSS_WECHAT_AUTH_TRUE_TTL_SECONDS if authorized else WERSS_WECHAT_AUTH_FALSE_TTL_SECONDS
@@ -485,8 +504,8 @@ def verify_werss_wechat_authorization(config: dict[str, Any] | None = None, sess
         }
     login_status = bool(data.get("login_status")) if isinstance(data, dict) else False
     qr_exists = bool(data.get("qr_code")) if isinstance(data, dict) else False
-    remember_werss_wechat_authorization(normalized, login_status)
     if login_status:
+        remember_werss_wechat_authorization(normalized, True)
         return {
             "authorized": True,
             "admin_authorized": True,
@@ -494,6 +513,16 @@ def verify_werss_wechat_authorization(config: dict[str, Any] | None = None, sess
             "message": "微信授权有效",
             "qr_available": qr_exists,
         }
+    if probe_werss_wechat_search_authorization(normalized, session=session):
+        remember_werss_wechat_authorization(normalized, True)
+        return {
+            "authorized": True,
+            "admin_authorized": True,
+            "login_state": "authorized",
+            "message": "微信授权有效",
+            "qr_available": qr_exists,
+        }
+    remember_werss_wechat_authorization(normalized, False)
     return {
         "authorized": False,
         "admin_authorized": True,

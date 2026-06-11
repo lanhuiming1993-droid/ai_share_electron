@@ -419,6 +419,9 @@ async function refresh() {
     dashboard.source_weights = data.source_weights;
   }
   Object.assign(data, dashboard, { audit });
+  if (channelModal.value && editingChannel.value?.id === "wechat-mp-rss" && wechatRssLoginFlowActive()) {
+    void refreshWechatRssComponentStatus({ forceLoginStatus: true, quiet: true });
+  }
 }
 
 async function saveSourceWeights() {
@@ -972,14 +975,56 @@ async function openWechatRssConsole(path = "", baseUrlOverride = "") {
   }
 }
 
-async function refreshWechatRssComponentStatus() {
-  wechatRssComponentLoading.value = true;
+function wechatRssLoginFlowActive() {
+  return Boolean(
+    wechatRssLoginLoading.value ||
+    wechatRssLoginModal.value ||
+    (!wechatRssLogin.authorized && wechatRssLogin.qr_base_url) ||
+    ["starting", "waiting_scan"].includes(wechatRssLogin.login_state)
+  );
+}
+
+function applyWechatRssLoginStatus(result, { updateComponent = false } = {}) {
+  const authorized = Boolean(result.wechat_authorized ?? result.authorized);
+  Object.assign(wechatRssLogin, result, { authorized });
+  if (authorized || updateComponent) {
+    Object.assign(wechatRssComponent, {
+      ready: Boolean(result.ready),
+      subscriptions: result.subscriptions || wechatRssComponent.subscriptions || [],
+      subscription_count: result.subscription_count ?? wechatRssComponent.subscription_count ?? 0,
+      wechat_authorized: authorized,
+      wechat_login_state: result.wechat_login_state || result.login_state || wechatRssComponent.wechat_login_state,
+      wechat_message: result.wechat_message || result.message || wechatRssComponent.wechat_message,
+    });
+  }
+  if (authorized) {
+    Object.assign(wechatRssLogin, { qr_image_url: "", qr_base_url: "", qr_loaded: false });
+  }
+  return authorized;
+}
+
+let wechatRssComponentStatusInFlight = false;
+async function refreshWechatRssComponentStatus({ forceLoginStatus = false, quiet = false } = {}) {
+  if (wechatRssComponentStatusInFlight) return null;
+  wechatRssComponentStatusInFlight = true;
+  if (!quiet) wechatRssComponentLoading.value = true;
   try {
     Object.assign(wechatRssComponent, await request("/api/channels/wechat-mp-rss/component-status"));
+    if (forceLoginStatus || wechatRssLoginFlowActive()) {
+      try {
+        const loginStatus = await request("/api/channels/wechat-mp-rss/wechat-login/status");
+        applyWechatRssLoginStatus(loginStatus);
+      } catch (error) {
+        if (!quiet) wechatRssComponent.wechat_message = error.message;
+      }
+    }
+    return wechatRssComponent;
   } catch (error) {
     Object.assign(wechatRssComponent, { status: "offline", message: error.message, service_online: false, rss_online: false, wechat_authorized: false, wechat_login_state: "failed", wechat_message: error.message });
+    return null;
   } finally {
-    wechatRssComponentLoading.value = false;
+    if (!quiet) wechatRssComponentLoading.value = false;
+    wechatRssComponentStatusInFlight = false;
   }
 }
 
@@ -1023,9 +1068,11 @@ function markWechatRssQrLoaded() {
 }
 
 function closeWechatRssLogin() {
+  const shouldSyncLoginStatus = channelModal.value && editingChannel.value?.id === "wechat-mp-rss" && wechatRssLoginFlowActive();
   stopWechatRssLoginPolling();
   stopWechatRssQrRefresh();
   wechatRssLoginModal.value = false;
+  if (shouldSyncLoginStatus) void refreshWechatRssComponentStatus({ forceLoginStatus: true, quiet: true });
 }
 
 async function syncWechatRssSubscriptions({ quiet = false } = {}) {
@@ -1205,18 +1252,10 @@ async function clearWechatRssTaskQueue(queueType = "main", clearHistory = false)
 async function pollWechatRssLoginStatus() {
   try {
     const result = await request("/api/channels/wechat-mp-rss/wechat-login/status");
-    Object.assign(wechatRssLogin, result);
-    if (result.authorized) {
+    const authorized = applyWechatRssLoginStatus(result);
+    if (authorized) {
       stopWechatRssLoginPolling();
       stopWechatRssQrRefresh();
-      Object.assign(wechatRssComponent, {
-        ready: Boolean(result.ready),
-        subscriptions: result.subscriptions || [],
-        subscription_count: result.subscription_count || 0,
-        wechat_authorized: Boolean(result.wechat_authorized ?? result.authorized),
-        wechat_login_state: result.wechat_login_state || result.login_state,
-        wechat_message: result.wechat_message || result.message,
-      });
       wechatRssLoginModal.value = false;
       notice.value = result.ready
         ? `微信扫码成功，已同步 ${result.subscription_count} 个公众号，信源可用`
@@ -1244,16 +1283,7 @@ async function beginWechatRssLogin() {
     await saveWechatRssConfiguration();
     try {
       const current = await request("/api/channels/wechat-mp-rss/wechat-login/status");
-      Object.assign(wechatRssLogin, current, { authorized: Boolean(current.authorized) });
-      if (current.authorized) {
-        Object.assign(wechatRssComponent, {
-          ready: Boolean(current.ready),
-          subscriptions: current.subscriptions || wechatRssComponent.subscriptions,
-          subscription_count: current.subscription_count ?? wechatRssComponent.subscription_count,
-          wechat_authorized: true,
-          wechat_login_state: current.wechat_login_state || current.login_state,
-          wechat_message: current.wechat_message || current.message,
-        });
+      if (applyWechatRssLoginStatus(current)) {
         await syncWechatRssSubscriptions({ quiet: true });
         notice.value = "微信授权仍然有效，可直接管理公众号订阅";
         return;
@@ -1264,7 +1294,7 @@ async function beginWechatRssLogin() {
     wechatRssLoginModal.value = true;
     const result = await request("/api/channels/wechat-mp-rss/wechat-login", { method: "POST" });
     Object.assign(wechatRssLogin, result, { qr_base_url: result.qr_image_url || "", qr_loaded: false, authorized: Boolean(result.authorized) });
-    if (result.authorized) {
+    if (applyWechatRssLoginStatus(result)) {
       wechatRssLoginModal.value = false;
       await syncWechatRssSubscriptions({ quiet: true });
       notice.value = "微信授权仍然有效，可直接管理公众号订阅";
