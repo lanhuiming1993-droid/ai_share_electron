@@ -44,10 +44,16 @@ WERSS_API_PREFIX = "/api/v1/wx"
 WERSS_TOKEN_TTL_SECONDS = 25 * 60
 WERSS_WECHAT_AUTH_TRUE_TTL_SECONDS = 5 * 60
 WERSS_WECHAT_AUTH_FALSE_TTL_SECONDS = 10
+WERSS_WECHAT_SEARCH_AUTH_EXPIRED_TTL_SECONDS = 30 * 60
 WERSS_QR_IMAGE_RETRY_COUNT = 15
 _WERSS_ADMIN_TOKENS: dict[str, tuple[str, float]] = {}
 _WERSS_WECHAT_AUTH: dict[str, tuple[bool, float]] = {}
+_WERSS_WECHAT_SEARCH_AUTH_EXPIRED: dict[str, float] = {}
 _WERSS_QR_IMAGE_URLS: dict[str, str] = {}
+
+
+class WerssWechatAuthorizationExpired(RuntimeError):
+    pass
 
 
 def normalize_werss_config(config: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -259,12 +265,18 @@ def search_werss_public_accounts(config: dict[str, Any] | None, keyword: str, se
     query = str(keyword or "").strip()
     if not query:
         raise ValueError("请输入公众号名称或关键词")
-    data = werss_admin_get(
-        normalized,
-        f"mps/search/{quote(query, safe='')}",
-        params={"limit": min(max(int(limit), 1), 20), "offset": 0},
-        session=session,
-    )
+    try:
+        data = werss_admin_get(
+            normalized,
+            f"mps/search/{quote(query, safe='')}",
+            params={"limit": min(max(int(limit), 1), 20), "offset": 0},
+            session=session,
+        )
+    except RuntimeError as exc:
+        if is_werss_wechat_authorization_error(str(exc)):
+            mark_werss_wechat_authorization_expired(normalized)
+            raise WerssWechatAuthorizationExpired("WeRSS 微信搜索授权已失效，请点击“重新扫码授权”后再搜索公众号。") from exc
+        raise
     if not isinstance(data, dict) or not isinstance(data.get("list"), list):
         raise RuntimeError("微信公众号授权尚未生效，请重新扫码")
     return [
@@ -399,15 +411,46 @@ def clear_werss_task_queue(
     }
 
 
+def is_werss_wechat_authorization_error(message: str) -> bool:
+    normalized = str(message or "").casefold()
+    return any(marker in normalized for marker in ("invalid session", "200003", "重新扫码", "扫码授权", "授权失效"))
+
+
+def werss_wechat_authorization_expired(config: dict[str, Any]) -> bool:
+    normalized = normalize_werss_config(config)
+    expires_at = _WERSS_WECHAT_SEARCH_AUTH_EXPIRED.get(normalized["base_url"], 0)
+    if expires_at > time.time():
+        return True
+    _WERSS_WECHAT_SEARCH_AUTH_EXPIRED.pop(normalized["base_url"], None)
+    return False
+
+
+def mark_werss_wechat_authorization_expired(config: dict[str, Any]) -> None:
+    normalized = normalize_werss_config(config)
+    expires_at = time.time() + WERSS_WECHAT_SEARCH_AUTH_EXPIRED_TTL_SECONDS
+    _WERSS_WECHAT_SEARCH_AUTH_EXPIRED[normalized["base_url"]] = expires_at
+    _WERSS_WECHAT_AUTH[normalized["base_url"]] = (False, expires_at)
+
+
 def remember_werss_wechat_authorization(config: dict[str, Any], authorized: bool) -> bool:
     normalized = normalize_werss_config(config)
     ttl = WERSS_WECHAT_AUTH_TRUE_TTL_SECONDS if authorized else WERSS_WECHAT_AUTH_FALSE_TTL_SECONDS
     _WERSS_WECHAT_AUTH[normalized["base_url"]] = (authorized, time.time() + ttl)
+    if authorized:
+        _WERSS_WECHAT_SEARCH_AUTH_EXPIRED.pop(normalized["base_url"], None)
     return authorized
 
 
 def verify_werss_wechat_authorization(config: dict[str, Any] | None = None, session=None, force_refresh: bool = False) -> dict[str, Any]:
     normalized = normalize_werss_config(config)
+    if not force_refresh and werss_wechat_authorization_expired(normalized):
+        return {
+            "authorized": False,
+            "admin_authorized": True,
+            "login_state": "expired",
+            "message": "WeRSS 微信搜索授权已失效，请重新扫码授权",
+            "qr_available": False,
+        }
     cached = _WERSS_WECHAT_AUTH.get(normalized["base_url"])
     if not force_refresh and cached and cached[1] > time.time():
         authorized = cached[0]
@@ -466,7 +509,8 @@ def probe_werss_wechat_authorization(config: dict[str, Any] | None = None, sessi
 
 def start_werss_wechat_login(config: dict[str, Any] | None = None, session=None) -> dict[str, Any]:
     normalized = normalize_werss_config(config)
-    authorization = verify_werss_wechat_authorization(normalized, session=session, force_refresh=True)
+    search_auth_expired = werss_wechat_authorization_expired(normalized)
+    authorization = {"authorized": False} if search_auth_expired else verify_werss_wechat_authorization(normalized, session=session, force_refresh=True)
     if authorization["authorized"]:
         return {
             "login_state": "authorized",
@@ -480,6 +524,7 @@ def start_werss_wechat_login(config: dict[str, Any] | None = None, session=None)
         raise RuntimeError("WeRSS 尚未生成微信扫码二维码，请稍后重试")
     qr_image_url = urljoin(f"{normalized['base_url']}/", qr_path.lstrip("/"))
     _WERSS_QR_IMAGE_URLS[normalized["base_url"]] = qr_image_url
+    _WERSS_WECHAT_SEARCH_AUTH_EXPIRED.pop(normalized["base_url"], None)
     return {
         "login_state": "waiting_scan",
         "message": "请使用微信扫描二维码完成授权",

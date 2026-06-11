@@ -20,8 +20,10 @@ from backend.wechat_rss import (
     search_werss_public_accounts,
     start_managed_werss,
     start_werss_wechat_login,
+    verify_werss_wechat_authorization,
     werss_wechat_login_status,
     werss_headers,
+    WerssWechatAuthorizationExpired,
 )
 
 
@@ -361,6 +363,24 @@ class WechatRssTests(unittest.TestCase):
         self.assertEqual(add_call["json"]["mp_id"], "ZmFrZS1pZA==")
         delete_call = next(call for call in session.calls if call["method"] == "DELETE")
         self.assertTrue(delete_call["url"].endswith("/mps/MP_WXS_1"))
+
+    def test_invalid_search_session_marks_wechat_authorization_expired(self) -> None:
+        config = {"base_url": "http://127.0.0.1:8129"}
+        with self.assertRaises(WerssWechatAuthorizationExpired):
+            search_werss_public_accounts(config, "产业", session=WerssApiSession(persistent_authorization=False))
+        authorization = verify_werss_wechat_authorization(config, session=WerssApiSession(persistent_authorization=True))
+        self.assertFalse(authorization["authorized"])
+        self.assertEqual(authorization["login_state"], "expired")
+
+    def test_expired_search_authorization_allows_new_qr_code(self) -> None:
+        config = {"base_url": "http://127.0.0.1:8130"}
+        with self.assertRaises(WerssWechatAuthorizationExpired):
+            search_werss_public_accounts(config, "产业", session=WerssApiSession(persistent_authorization=False))
+        session = WerssApiSession(persistent_authorization=True, qr_login_status=True)
+        qr = start_werss_wechat_login(config, session=session)
+        self.assertEqual(qr["login_state"], "waiting_scan")
+        self.assertEqual(qr["qr_image_url"], "http://127.0.0.1:8130/static/wx_qrcode.png?t=1")
+        self.assertTrue(any(call["url"].endswith("/auth/qr/code") for call in session.calls))
 
     def test_refresh_subscription_articles_uses_werss_update_endpoint(self) -> None:
         session = WerssApiSession(persistent_authorization=True)

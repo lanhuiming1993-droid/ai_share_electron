@@ -39,7 +39,7 @@ const wechatRssStarting = ref(false);
 const wechatRssLoginModal = ref(false);
 const wechatRssLoginLoading = ref(false);
 const wechatRssLogin = reactive({ login_state: "idle", message: "点击登录后获取微信二维码", qr_image_url: "", qr_base_url: "", qr_loaded: false, authorized: false });
-const wechatRssSearch = reactive({ query: "", items: [], loading: false, adding_id: "", removing_id: "", backfilling_id: "", backfilling_all: false, adding_panel_open: false, backfill_start_page: 0, backfill_end_page: 1 });
+const wechatRssSearch = reactive({ query: "", items: [], loading: false, error: "", adding_id: "", removing_id: "", backfilling_id: "", backfilling_all: false, adding_panel_open: false, backfill_start_page: 0, backfill_end_page: 1 });
 const wechatRssQueueClearing = ref("");
 const mxHarFile = ref(null);
 const mxHarImporting = ref(false);
@@ -1051,12 +1051,25 @@ async function searchWechatRssAccounts() {
   const query = wechatRssSearch.query.trim();
   if (!query) return notice.value = "请输入公众号名称或关键词";
   wechatRssSearch.loading = true;
+  wechatRssSearch.error = "";
+  wechatRssSearch.items = [];
   try {
     const result = await request(`/api/channels/wechat-mp-rss/subscriptions/search?q=${encodeURIComponent(query)}`);
     wechatRssSearch.items = result.items || [];
-    notice.value = result.count ? `已找到 ${result.count} 个公众号候选` : "没有找到匹配的公众号，请换一个关键词";
+    wechatRssSearch.error = result.count ? "" : "没有找到匹配的公众号，请换一个关键词";
+    notice.value = result.count ? `已找到 ${result.count} 个公众号候选` : wechatRssSearch.error;
   } catch (error) {
-    notice.value = `搜索公众号失败：${error.message}`;
+    const message = `搜索公众号失败：${error.message}`;
+    wechatRssSearch.error = message;
+    notice.value = message;
+    if (error.message.includes("重新扫码") || error.message.includes("授权")) {
+      Object.assign(wechatRssComponent, {
+        ready: false,
+        wechat_authorized: false,
+        wechat_login_state: "expired",
+        wechat_message: "WeRSS 微信搜索授权已失效，请重新扫码授权",
+      });
+    }
   } finally {
     wechatRssSearch.loading = false;
   }
@@ -1067,6 +1080,7 @@ function openWechatRssSubscriptionPanel() {
     notice.value = "微信授权无效，请先扫码登录微信公众号";
     return;
   }
+  wechatRssSearch.error = "";
   wechatRssSearch.adding_panel_open = true;
 }
 
@@ -2431,9 +2445,10 @@ onUnmounted(() => {
                   <div class="flex gap-2">
                     <input v-model="wechatRssSearch.query" @keyup.enter="searchWechatRssAccounts" placeholder="搜索公众号，例如 半导体、证券时报" class="field min-w-0 flex-1" />
                     <button type="button" @click="searchWechatRssAccounts" :disabled="wechatRssSearch.loading" class="primary disabled:cursor-wait disabled:opacity-60">{{ wechatRssSearch.loading ? '搜索中...' : '搜索' }}</button>
-                    <button type="button" @click="wechatRssSearch.adding_panel_open=false; wechatRssSearch.items=[]; wechatRssSearch.query=''" class="secondary">收起</button>
+                    <button type="button" @click="wechatRssSearch.adding_panel_open=false; wechatRssSearch.items=[]; wechatRssSearch.query=''; wechatRssSearch.error=''" class="secondary">收起</button>
                   </div>
                   <p class="mt-2 text-xs leading-5 text-slate-500">输入公众号名称或关键词，搜索后点击“加入订阅”。授权有效时不需要重新扫码。</p>
+                  <p v-if="wechatRssSearch.error" class="mt-2 rounded-lg border border-amber-400/20 bg-amber-400/[.06] px-3 py-2 text-xs leading-5 text-amber-200">{{ wechatRssSearch.error }}</p>
                   <div v-if="wechatRssSearch.items.length" class="mt-3 max-h-48 space-y-2 overflow-y-auto">
                     <div v-for="item in wechatRssSearch.items" :key="item.id" class="flex items-center justify-between gap-3 rounded-lg border border-white/[.07] bg-black/10 px-3 py-2">
                       <div class="min-w-0">

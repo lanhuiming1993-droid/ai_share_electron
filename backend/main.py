@@ -81,6 +81,7 @@ from backend.wechat_rss import (
     search_werss_public_accounts,
     start_managed_werss,
     start_werss_wechat_login,
+    WerssWechatAuthorizationExpired,
     werss_wechat_login_status,
 )
 from backend.worker import CollectionWorker
@@ -2846,6 +2847,19 @@ def wechat_rss_subscriptions() -> dict:
 def search_wechat_rss_subscriptions(q: str = Query(min_length=1, max_length=100)) -> dict:
     try:
         items = search_werss_public_accounts(wechat_rss_config(), q)
+    except WerssWechatAuthorizationExpired as exc:
+        status = persist_wechat_rss_status(managed_werss_status(wechat_rss_config()))
+        log_exception(logger, "channel.wechat_rss.subscriptions.search_auth_expired", exc, channel_id="wechat-mp-rss")
+        raise HTTPException(
+            409,
+            {
+                "message": str(exc),
+                "wechat_authorized": False,
+                "wechat_login_state": "expired",
+                "wechat_message": status.get("wechat_message") or str(exc),
+                "subscription_count": status.get("subscription_count", 0),
+            },
+        ) from exc
     except Exception as exc:
         log_exception(logger, "channel.wechat_rss.subscriptions.search_failed", exc, channel_id="wechat-mp-rss")
         raise HTTPException(409, str(exc)) from exc
