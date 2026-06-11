@@ -117,6 +117,8 @@ MARKET_DATA_DEFAULT_CONFIG = {
     "tushare_token": "",
     "component_timeout_seconds": 35,
 }
+SOURCE_WEIGHT_SETTING_KEY = "source_weights"
+SOURCE_CONTEXT_BUDGET_CHARS = 120_000
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 logger = get_logger("api")
 frontend_logger = get_logger("frontend")
@@ -232,6 +234,15 @@ class SourceJobInput(BaseModel):
     parent_task_id: str = ""
     query: str = ""
     evidence_layer: str = ""
+
+
+class SourceWeightItemInput(BaseModel):
+    channel_id: str = Field(min_length=1, max_length=255)
+    weight: float = Field(ge=0, le=100)
+
+
+class SourceWeightConfigInput(BaseModel):
+    weights: list[SourceWeightItemInput] = Field(min_length=1)
 
 
 class SourceSnapshotInput(BaseModel):
@@ -541,6 +552,183 @@ def x_twtapi_channel_config() -> dict:
 
 def x_twtapi_channel_config_public() -> dict:
     return public_twtapi_config(x_twtapi_channel_config())
+
+
+def even_source_weights(channel_ids: list[str]) -> dict[str, float]:
+    unique_ids = list(dict.fromkeys(channel_ids))
+    if not unique_ids:
+        return {}
+    basis_points = 10_000
+    base = basis_points // len(unique_ids)
+    remainder = basis_points % len(unique_ids)
+    return {
+        channel_id: round((base + (1 if index < remainder else 0)) / 100, 2)
+        for index, channel_id in enumerate(unique_ids)
+    }
+
+
+def source_weight_setting(conn: sqlite3.Connection) -> tuple[bool, dict[str, float], str]:
+    row = conn.execute("SELECT value FROM settings WHERE key=?", (SOURCE_WEIGHT_SETTING_KEY,)).fetchone()
+    if not row:
+        return False, {}, ""
+    try:
+        payload = json.loads(row["value"])
+    except json.JSONDecodeError:
+        return False, {}, ""
+    weights: dict[str, float] = {}
+    for item in payload.get("weights", []):
+        channel_id = str(item.get("channel_id") or "").strip()
+        if not channel_id:
+            continue
+        try:
+            weights[channel_id] = round(float(item.get("weight") or 0), 2)
+        except (TypeError, ValueError):
+            continue
+    return True, weights, str(payload.get("updated_at") or "")
+
+
+def validate_source_weight_payload(payload: SourceWeightConfigInput, valid_channel_ids: set[str]) -> list[dict[str, float | str]]:
+    seen: set[str] = set()
+    weights: list[dict[str, float | str]] = []
+    for item in payload.weights:
+        channel_id = item.channel_id.strip()
+        if channel_id in seen:
+            raise HTTPException(400, f"Duplicate source weight channel: {channel_id}")
+        if channel_id not in valid_channel_ids:
+            raise HTTPException(400, f"Unknown source weight channel: {channel_id}")
+        seen.add(channel_id)
+        weights.append({"channel_id": channel_id, "weight": round(float(item.weight), 2)})
+    total = round(sum(float(item["weight"]) for item in weights), 2)
+    if abs(total - 100.0) > 0.01:
+        raise HTTPException(400, f"Source weights must sum to 100%, current total is {total}%")
+    if not any(float(item["weight"]) > 0 for item in weights):
+        raise HTTPException(400, "At least one source weight must be greater than 0%")
+    return weights
+
+
+def source_weight_config(conn: sqlite3.Connection | None = None) -> dict:
+    if conn is None:
+        with db() as scoped_conn:
+            return source_weight_config(scoped_conn)
+    channels = [
+        dict(row)
+        for row in conn.execute("SELECT id,name FROM channels ORDER BY builtin DESC,updated_at")
+    ]
+    channel_ids = [row["id"] for row in channels]
+    configured, stored_weights, updated_at = source_weight_setting(conn)
+    weights = stored_weights if configured else even_source_weights(channel_ids)
+    rows = [
+        {
+            "channel_id": channel["id"],
+            "name": channel["name"],
+            "weight": round(float(weights.get(channel["id"], 0)), 2),
+        }
+        for channel in channels
+    ]
+    return {
+        "configured": configured,
+        "updated_at": updated_at,
+        "total_weight": round(sum(float(item["weight"]) for item in rows), 2),
+        "weights": rows,
+    }
+
+
+def effective_source_weight_rows(channel_ids: list[str]) -> list[dict[str, float | str]]:
+    selected_ids = list(dict.fromkeys(channel_ids))
+    if not selected_ids:
+        return []
+    placeholders = ",".join("?" for _ in selected_ids)
+    with db() as conn:
+        names = {
+            row["id"]: row["name"]
+            for row in conn.execute(f"SELECT id,name FROM channels WHERE id IN ({placeholders})", selected_ids)
+        }
+        configured, stored_weights, _updated_at = source_weight_setting(conn)
+    if configured:
+        configured_weights = {channel_id: round(float(stored_weights.get(channel_id, 0)), 2) for channel_id in selected_ids}
+    else:
+        configured_weights = even_source_weights(selected_ids)
+    selected_total = round(sum(configured_weights.values()), 2)
+    if selected_total <= 0:
+        configured_weights = even_source_weights(selected_ids)
+        selected_total = round(sum(configured_weights.values()), 2)
+    return [
+        {
+            "channel_id": channel_id,
+            "name": names.get(channel_id, CANONICAL_CHANNEL_NAMES.get(channel_id, channel_id)),
+            "configured_weight": round(float(stored_weights.get(channel_id, 0)), 2) if configured else configured_weights[channel_id],
+            "effective_weight": round(configured_weights[channel_id] * 100 / selected_total, 2),
+        }
+        for channel_id in selected_ids
+    ]
+
+
+def source_weight_instruction_text(channel_ids: list[str]) -> str:
+    rows = effective_source_weight_rows(channel_ids)
+    if not rows:
+        return ""
+    lines = [
+        "Source weight allocation for analysis only:",
+        "- Collection, deduplication, snapshot storage, and watermarks ignore these weights.",
+        "- During model analysis, use effective_weight_percent for evidence attention, conflict resolution, and report space.",
+        "- High weight never permits inventing facts; low weight evidence must still be cited when it contains material risk or contradiction.",
+    ]
+    for row in rows:
+        lines.append(
+            f"- {row['channel_id']} ({row['name']}): configured={row['configured_weight']}%, effective={row['effective_weight']}%"
+        )
+    return "\n".join(lines)
+
+
+def bounded_context_chunk(chunk: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if len(chunk) <= max_chars:
+        return chunk
+    marker = "\n[source-weight-budget-truncated]"
+    if max_chars <= len(marker) + 40:
+        return ""
+    return chunk[: max_chars - len(marker)].rstrip() + marker
+
+
+def select_chunks_by_source_weight(
+    chunks: list[tuple[str, str]],
+    weight_rows: list[dict[str, float | str]],
+    *,
+    budget_chars: int = SOURCE_CONTEXT_BUDGET_CHARS,
+) -> list[str]:
+    if not chunks:
+        return []
+    weights = {str(row["channel_id"]): float(row["effective_weight"]) for row in weight_rows}
+    budgets = {channel_id: int(budget_chars * weight / 100) for channel_id, weight in weights.items()}
+    used_by_channel = {channel_id: 0 for channel_id in budgets}
+    selected: list[str] = []
+    deferred: list[tuple[str, str]] = []
+    total_used = 0
+    for channel_id, chunk in chunks:
+        remaining = budgets.get(channel_id, 0) - used_by_channel.get(channel_id, 0)
+        if remaining <= 0:
+            deferred.append((channel_id, chunk))
+            continue
+        bounded = bounded_context_chunk(chunk, remaining)
+        if not bounded:
+            deferred.append((channel_id, chunk))
+            continue
+        selected.append(bounded)
+        used_by_channel[channel_id] = used_by_channel.get(channel_id, 0) + len(bounded)
+        total_used += len(bounded)
+    remaining_total = budget_chars - total_used
+    for channel_id, chunk in deferred:
+        if remaining_total <= 0:
+            break
+        if weights.get(channel_id, 0) <= 0:
+            continue
+        bounded = bounded_context_chunk(chunk, remaining_total)
+        if not bounded:
+            continue
+        selected.append(bounded)
+        remaining_total -= len(bounded)
+    return selected
 
 
 def init_db() -> None:
@@ -2086,6 +2274,7 @@ def dashboard() -> dict:
             ],
         )
         channels = [dict(row) for row in conn.execute("SELECT * FROM channels ORDER BY builtin DESC, updated_at")]
+        source_weights = source_weight_config(conn)
         schema = migration_status(conn)
     for channel in channels:
         channel["group_ids"] = json.loads(channel.get("group_ids") or "[]")
@@ -2112,12 +2301,32 @@ def dashboard() -> dict:
         "research_red_lines": research_red_lines(),
         "tools": TOOLS,
         "source_catalog": source_catalog(),
+        "source_weights": source_weights,
         "schema": schema,
         "channels": channels,
         "skills": skills,
         "tasks": tasks,
         "source_jobs": source_jobs,
     }
+
+
+@app.put("/api/settings/source-weights")
+def save_source_weights(payload: SourceWeightConfigInput) -> dict:
+    with db() as conn:
+        valid_channel_ids = {row["id"] for row in conn.execute("SELECT id FROM channels")}
+        weights = validate_source_weight_payload(payload, valid_channel_ids)
+        conn.execute(
+            """
+            INSERT INTO settings(key,value)
+            VALUES(?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+            """,
+            (
+                SOURCE_WEIGHT_SETTING_KEY,
+                json.dumps({"weights": weights, "updated_at": now()}, ensure_ascii=False),
+            ),
+        )
+    return source_weight_config()
 
 
 def inventory_summary(conn: sqlite3.Connection) -> dict:
@@ -3214,11 +3423,17 @@ def local_snapshot_context(
         ] if include_source_reports else []
     if not normalized_items and not snapshots:
         raise HTTPException(409, "本地快照存在，但所选时间窗口内没有可用于报告的内容。")
+    weight_rows = effective_source_weight_rows(channel_ids)
+    weight_by_channel = {str(row["channel_id"]): float(row["effective_weight"]) for row in weight_rows}
     normalized_chunks = [
         (
-            f"[normalized:{item['channel_id']}] {item['occurred_at']} quality={item['quality_score']} "
-            f"mode={item['normalization_mode']} source={normalized_source_label(item)} title={item['title']} {item['source_url']}\n"
-            f"{item['content'][:8_000]}"
+            item["channel_id"],
+            (
+                f"[normalized:{item['channel_id']} weight={weight_by_channel.get(item['channel_id'], 0)}%] "
+                f"{item['occurred_at']} quality={item['quality_score']} "
+                f"mode={item['normalization_mode']} source={normalized_source_label(item)} title={item['title']} {item['source_url']}\n"
+                f"{item['content'][:8_000]}"
+            ),
         )
         for item in normalized_items
     ]
@@ -3229,7 +3444,10 @@ def local_snapshot_context(
         if item["channel_id"] not in normalized_channels or item["normalization_status"] in {"pending", "failed"}
     ]
     raw_chunks = [
-        f"[raw:{item['channel_id']}] {item['occurred_at']} {item['source_url']}\n{item['content'][:12_000]}"
+        (
+            item["channel_id"],
+            f"[raw:{item['channel_id']} weight={weight_by_channel.get(item['channel_id'], 0)}%] {item['occurred_at']} {item['source_url']}\n{item['content'][:12_000]}",
+        )
         for item in raw_fallbacks
     ]
     report_chunks = [
@@ -3237,18 +3455,20 @@ def local_snapshot_context(
         for item in source_reports
     ]
     if normalized_chunks:
-        chunks = [
-            (
-                f"{chunk}"
-            )
-            for chunk in [*normalized_chunks, *raw_chunks, *report_chunks]
-        ]
+        source_chunks = [*normalized_chunks, *raw_chunks]
     else:
-        chunks = [*raw_chunks, *report_chunks]
+        source_chunks = raw_chunks
+    chunks = [
+        source_weight_instruction_text(channel_ids),
+        *select_chunks_by_source_weight(source_chunks, weight_rows),
+        *report_chunks,
+    ]
     selected: list[str] = []
     length = 0
     for chunk in chunks:
-        if length + len(chunk) > 120_000:
+        if not chunk:
+            continue
+        if length + len(chunk) > SOURCE_CONTEXT_BUDGET_CHARS:
             break
         selected.append(chunk)
         length += len(chunk)

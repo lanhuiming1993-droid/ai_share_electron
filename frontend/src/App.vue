@@ -3,7 +3,7 @@ import { computed, onMounted, onUnmounted, reactive, ref, watch } from "vue";
 
 const API = import.meta.env.VITE_API_BASE_URL || "";
 const webOrigin = window.location.origin;
-const data = reactive({ tools: [], channels: [], skills: [], tasks: [], source_jobs: [], provider: null, providers: [], codex_policy: null, research_red_lines: null, audit: { jobs: [], watermarks: [], snapshots: [], normalized: [], events: [], inventory: { snapshot_count: 0, normalized_item_count: 0, source_report_count: 0, research_report_count: 0 } } });
+const data = reactive({ tools: [], channels: [], skills: [], tasks: [], source_jobs: [], provider: null, providers: [], codex_policy: null, research_red_lines: null, source_weights: { configured: false, total_weight: 0, weights: [] }, audit: { jobs: [], watermarks: [], snapshots: [], normalized: [], events: [], inventory: { snapshot_count: 0, normalized_item_count: 0, source_report_count: 0, research_report_count: 0 } } });
 const provider = reactive({ name: "", base_url: "", model: "", api_key: "", protocol: "openai_chat_completions", enabled: true, extra_body_text: "{}" });
 const task = reactive({ title: "成长股六维研究", target: "", objective: "识别财务拐点、赛道卡位、客户订单、产能交付、机构变化和未来催化", skill_name: "a-share-growth-hunter", lookback_days: 30 });
 const sourceJob = reactive({ action: "collect", channel_ids: [], lookback_days: 30, report_title: "近 30 天信源聚合报告", skill_name: "a-share-growth-hunter" });
@@ -45,6 +45,7 @@ const mxHarFile = ref(null);
 const mxHarImporting = ref(false);
 const inventoryCleanupSubmitting = ref(false);
 const taskListCleanupSubmitting = ref(false);
+const sourceWeightsSaving = ref(false);
 const diagnosticLogs = ref([]);
 const diagnosticConfig = reactive({ directory: "", active_file: "", max_file_mb: 0, backup_count: 0, files: [] });
 const diagnosticFilters = reactive({ level: "", component: "", search: "" });
@@ -78,6 +79,8 @@ const pendingChannels = computed(() => data.channels.filter((x) => x.status === 
 const pageTitle = computed(() => pageMeta[activePage.value][0]);
 const pageSubtitle = computed(() => pageMeta[activePage.value][1]);
 const wechatRssAuthorized = computed(() => Boolean(wechatRssComponent.wechat_authorized || wechatRssLogin.authorized || wechatRssComponent.ready));
+const sourceWeightTotal = computed(() => Number((data.source_weights?.weights || []).reduce((sum, item) => sum + Number(item.weight || 0), 0).toFixed(2)));
+const sourceWeightsValid = computed(() => Math.abs(sourceWeightTotal.value - 100) <= 0.01 && (data.source_weights?.weights || []).some((item) => Number(item.weight || 0) > 0));
 const canonicalChannelNames = {
   akshare: "AkShare 市场数据",
   itick: "iTick 行情 API",
@@ -118,6 +121,35 @@ function channelStatusDescription(channel) {
 }
 function jobChannelNames(job) {
   return job.channel_names?.length ? job.channel_names : (job.channel_ids || []).map(channelDisplayName);
+}
+function sourceWeightItem(channelId) {
+  return (data.source_weights?.weights || []).find((item) => item.channel_id === channelId);
+}
+function sourceWeightValue(channelId) {
+  return sourceWeightItem(channelId)?.weight ?? 0;
+}
+function setSourceWeight(channelId, value) {
+  const item = sourceWeightItem(channelId);
+  if (!item) return;
+  const weight = Number(value);
+  item.weight = Number.isFinite(weight) ? Math.max(0, Math.min(100, Math.round(weight * 100) / 100)) : 0;
+}
+function resetSourceWeightsEvenly() {
+  const channels = data.channels || [];
+  if (!channels.length) return;
+  const basisPoints = 10000;
+  const base = Math.floor(basisPoints / channels.length);
+  const remainder = basisPoints % channels.length;
+  data.source_weights = {
+    configured: false,
+    updated_at: "",
+    total_weight: 100,
+    weights: channels.map((channel, index) => ({
+      channel_id: channel.id,
+      name: channelDisplayName(channel),
+      weight: Number(((base + (index < remainder ? 1 : 0)) / 100).toFixed(2)),
+    })),
+  };
 }
 function sourceRunSummary(job) {
   return (job.runs || [])
@@ -330,6 +362,24 @@ function formatDiagnosticFields(fields) {
 async function refresh() {
   const [dashboard, audit] = await Promise.all([request("/api/dashboard"), request("/api/audit")]);
   Object.assign(data, dashboard, { audit });
+}
+
+async function saveSourceWeights() {
+  if (!sourceWeightsValid.value) {
+    notice.value = `信源权重总和必须等于 100%，当前为 ${sourceWeightTotal.value}%`;
+    return;
+  }
+  sourceWeightsSaving.value = true;
+  try {
+    const weights = (data.source_weights?.weights || []).map((item) => ({ channel_id: item.channel_id, weight: Number(item.weight || 0) }));
+    data.source_weights = await request("/api/settings/source-weights", { method: "PUT", body: JSON.stringify({ weights }) });
+    notice.value = "信源分析权重已保存；采集任务仍按原规则执行";
+    await refresh();
+  } catch (error) {
+    notice.value = error.message;
+  } finally {
+    sourceWeightsSaving.value = false;
+  }
 }
 
 async function saveProvider() {
@@ -1665,6 +1715,32 @@ onUnmounted(() => {
         </template>
 
         <template v-else-if="activePage==='channels'">
+          <section class="panel mb-5 p-5">
+            <div class="mb-4 flex items-center justify-between gap-4">
+              <div>
+                <h2 class="section-title">信源分析权重</h2>
+                <p class="mt-1 text-xs text-slate-500">百分比只在大模型分析阶段生效；采集、去重、水位和原始快照保存不按权重处理。</p>
+              </div>
+              <div class="flex items-center gap-2">
+                <span class="text-xs" :class="sourceWeightsValid ? 'text-emerald-300' : 'text-amber-300'">合计 {{ sourceWeightTotal }}%</span>
+                <button @click="resetSourceWeightsEvenly" :disabled="sourceWeightsSaving" class="secondary disabled:cursor-wait disabled:opacity-60">均分</button>
+                <button @click="saveSourceWeights" :disabled="sourceWeightsSaving || !sourceWeightsValid" class="primary disabled:cursor-wait disabled:opacity-60">{{ sourceWeightsSaving ? '保存中...' : '保存权重' }}</button>
+              </div>
+            </div>
+            <div v-if="!(data.source_weights?.weights || []).length" class="empty">尚无可配置信源</div>
+            <div v-else class="grid grid-cols-2 gap-3">
+              <label v-for="item in data.source_weights.weights" :key="item.channel_id" class="flex items-center justify-between gap-3 rounded-xl border border-white/[.06] bg-black/10 px-4 py-3">
+                <span class="min-w-0">
+                  <strong class="block truncate text-sm text-slate-200">{{ channelDisplayName({ id: item.channel_id, name: item.name }) }}</strong>
+                  <small class="text-slate-600">{{ item.channel_id }}</small>
+                </span>
+                <span class="flex shrink-0 items-center gap-2">
+                  <input :value="sourceWeightValue(item.channel_id)" @input="setSourceWeight(item.channel_id, $event.target.value)" :disabled="sourceWeightsSaving" type="number" min="0" max="100" step="0.01" class="field w-24 text-right disabled:cursor-wait disabled:opacity-60" />
+                  <span class="text-xs text-slate-500">%</span>
+                </span>
+              </label>
+            </div>
+          </section>
           <section class="panel overflow-hidden">
             <div class="flex items-center justify-between border-b border-white/[.06] p-5">
               <div>
