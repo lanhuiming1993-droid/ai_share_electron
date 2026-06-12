@@ -35,7 +35,7 @@ def normalize_zsxq_mcp_config(config: dict | None) -> dict[str, Any]:
         "adapter": "zsxq_mcp",
         "mcp_url": mcp_url,
         "timeout_seconds": _bounded_int(raw.get("timeout_seconds"), 20, 3, 120),
-        "page_limit": _bounded_int(raw.get("page_limit"), 20, 1, 30),
+        "page_limit": _bounded_int(raw.get("page_limit"), 10, 1, 30),
         "max_pages": _bounded_int(raw.get("max_pages"), 10, 1, 100),
         "include_comments": bool(raw.get("include_comments", False)),
         "comment_limit": _bounded_int(raw.get("comment_limit"), 20, 1, 30),
@@ -98,20 +98,31 @@ def _parse_event_stream(response: requests.Response) -> list[dict[str, Any]]:
         return payload if isinstance(payload, list) else [payload]
     events: list[dict[str, Any]] = []
     data_lines: list[str] = []
-    for line in text.splitlines():
-        if not line.strip():
-            if data_lines:
-                data = "\n".join(data_lines).strip()
-                data_lines = []
-                if data and data != "[DONE]":
-                    events.append(json.loads(data))
-            continue
-        if line.startswith("data:"):
-            data_lines.append(line[5:].lstrip())
-    if data_lines:
-        data = "\n".join(data_lines).strip()
+
+    def flush_event() -> None:
+        if not data_lines:
+            return
+        data = "".join(data_lines).strip()
+        data_lines.clear()
         if data and data != "[DONE]":
             events.append(json.loads(data))
+
+    for line in text.splitlines():
+        if not line.strip():
+            flush_event()
+            continue
+        if line.startswith("data:"):
+            if data_lines:
+                data_lines.append("\n")
+            data_lines.append(line[5:].lstrip())
+        elif data_lines and not line.startswith(("event:", "id:", "retry:", ":")):
+            # Some MCP gateways emit raw multiline text inside a JSON string without
+            # repeating the SSE "data:" prefix. Repair that non-standard stream by
+            # treating only the physical line break as an escaped newline; the rest
+            # of the line may still contain the JSON-RPC closing syntax.
+            data_lines.append("\\n")
+            data_lines.append(line)
+    flush_event()
     return events
 
 
@@ -161,6 +172,45 @@ def _response_by_id(events: list[dict[str, Any]], request_id: str) -> dict[str, 
     raise ZsxqMcpError(f"ZSXQ MCP response missing id {request_id}")
 
 
+def _escape_control_chars_in_json_strings(text: str) -> str:
+    repaired: list[str] = []
+    in_string = False
+    escaped = False
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if escaped:
+            repaired.append(char)
+            escaped = False
+        elif char == "\\":
+            repaired.append(char)
+            escaped = True
+        elif char == '"':
+            repaired.append(char)
+            in_string = not in_string
+        elif in_string and char == "\r":
+            repaired.append("\\n")
+            if index + 1 < len(text) and text[index + 1] == "\n":
+                index += 1
+        elif in_string and char == "\n":
+            repaired.append("\\n")
+        elif in_string and char == "\t":
+            repaired.append("\\t")
+        elif in_string and ord(char) < 0x20:
+            repaired.append(f"\\u{ord(char):04x}")
+        else:
+            repaired.append(char)
+        index += 1
+    return "".join(repaired)
+
+
+def _loads_json_maybe_repaired(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return json.loads(_escape_control_chars_in_json_strings(text))
+
+
 def _tool_result_payload(result: dict[str, Any]) -> Any:
     if result.get("isError"):
         texts = [
@@ -178,7 +228,7 @@ def _tool_result_payload(result: dict[str, Any]) -> Any:
         ]
         if len(texts) == 1:
             try:
-                return json.loads(texts[0])
+                return _loads_json_maybe_repaired(texts[0])
             except json.JSONDecodeError:
                 return texts[0]
         if texts:

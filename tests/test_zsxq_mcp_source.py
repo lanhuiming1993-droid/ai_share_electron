@@ -4,7 +4,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from backend.zsxq_mcp_source import _parse_event_stream, collect_zsxq_mcp, normalize_zsxq_group_ids
+from backend.zsxq_mcp_source import _parse_event_stream, _tool_result_payload, collect_zsxq_mcp, normalize_zsxq_group_ids
 
 
 class FakeResponse:
@@ -22,6 +22,18 @@ class ZsxqMcpSourceTests(unittest.TestCase):
             )
         )
         self.assertEqual(events[0]["id"], "tool-call")
+
+    def test_parse_event_stream_repairs_unprefixed_multiline_text(self) -> None:
+        response = FakeResponse(
+            (
+                'event: message\n'
+                'data: {"jsonrpc":"2.0","id":"tool-call","result":{"content":[{"type":"text","text":"{\\n  \\"success\\": true,\\n  \\"topics_brief\\": [{\\"topic_id\\": \\"1\\", \\"content\\": \\"第一行\n'
+                '第二行\\"}]\\n}"}]}}\n\n'
+            ).encode("utf-8")
+        )
+        events = _parse_event_stream(response)
+        payload = _tool_result_payload(events[0]["result"])
+        self.assertEqual(payload["topics_brief"][0]["content"], "第一行\n第二行")
 
     def test_group_ids_are_limited_to_long_term_source(self) -> None:
         self.assertEqual(normalize_zsxq_group_ids(["88882281482852", "28888222124181"]), ["28888222124181"])

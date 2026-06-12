@@ -339,7 +339,7 @@ class TwtApiConfigInput(BaseModel):
 class ZsxqMcpConfigInput(BaseModel):
     mcp_url: str = Field(default="", repr=False, max_length=2_000)
     timeout_seconds: int = Field(default=20, ge=3, le=120)
-    page_limit: int = Field(default=20, ge=1, le=30)
+    page_limit: int = Field(default=10, ge=1, le=30)
     max_pages: int = Field(default=10, ge=1, le=100)
     include_comments: bool = False
     clear_credentials: bool = False
