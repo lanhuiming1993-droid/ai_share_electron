@@ -22,6 +22,7 @@ from backend.itick_source import collect_itick_market_data
 from backend.subprocess_utils import hidden_window_creationflags
 from backend.twtapi_source import collect_twtapi_search
 from backend.wechat_rss import collect_werss
+from backend.zsxq_mcp_source import collect_zsxq_mcp
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -433,9 +434,7 @@ def collect_http(channel: dict[str, Any], window: dict[str, str], query: str = "
 
 def collect_playwright(channel: dict[str, Any], window: dict[str, str], profile: Path, query: str = "") -> list[dict[str, str]]:
     urls: list[str] = []
-    if channel["id"] == "zsxq" and channel.get("group_ids"):
-        urls = [f"https://wx.zsxq.com/group/{group_id}" for group_id in channel["group_ids"]]
-    elif channel["url"]:
+    if channel["url"]:
         urls = [render_query_url(channel["url"], query)]
     if not urls:
         raise ValueError("Playwright channel URL is empty")
@@ -486,6 +485,8 @@ def collect_channel(channel: dict[str, Any], window: dict[str, str], profile: Pa
         return collect_itick_market_data(channel["id"], window, query, channel.get("request_config") or {})
     if mode == "x_twtapi":
         return collect_twtapi_search(channel["id"], window, query, channel.get("request_config") or {})
+    if mode == "zsxq_mcp":
+        return collect_zsxq_mcp(channel, window, query)
     if mode == "requests":
         if (channel.get("request_config") or {}).get("adapter") == "mx_authorized_request_replay":
             return collect_mx(channel, window, query)

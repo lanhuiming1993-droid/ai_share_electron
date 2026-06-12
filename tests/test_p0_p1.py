@@ -398,6 +398,43 @@ class MainBehaviorTests(unittest.TestCase):
         self.assertEqual(tg_items[0]["content"], "world")
         self.assertGreaterEqual(tg_items[0]["quality_score"], 80)
 
+    def test_fixed_normalizer_preserves_zsxq_mcp_topic_fields(self) -> None:
+        snapshot = {
+            "channel_id": "zsxq",
+            "occurred_at": "2026-06-12T10:33:08+08:00",
+            "collected_at": "2026-06-12T10:34:00+08:00",
+            "source_url": "zsxq://group/28888222124181/topic/22255225848488181",
+            "content": json.dumps(
+                {
+                    "platform": "zsxq_mcp",
+                    "adapter": "zsxq_mcp",
+                    "query": "半导体",
+                    "collection_window": {},
+                    "topic": {
+                        "topic_id": "22255225848488181",
+                        "title": "午盘0612",
+                        "type": "talk",
+                        "create_time": "2026-06-12T10:33:08.636+0800",
+                        "content": "风险偏好在持续小幅回升",
+                        "owner": {"user_id": "88842481581212", "name": "橙子不糊涂"},
+                        "group": {"group_id": "28888222124181", "name": "橙子不糊涂的科技花园"},
+                        "counts": {"likes": 127, "comments": 0},
+                        "files": [{"file_id": "file-1", "name": "report.pdf"}],
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        }
+        items, note = self.main.fixed_normalized_items(snapshot)
+        self.assertEqual(note, "")
+        self.assertEqual(items[0]["item_key"], "zsxq:22255225848488181")
+        self.assertEqual(items[0]["author"], "橙子不糊涂")
+        self.assertEqual(items[0]["title"], "午盘0612")
+        self.assertEqual(items[0]["content"], "风险偏好在持续小幅回升")
+        self.assertEqual(items[0]["attachments"], ["report.pdf"])
+        self.assertEqual(items[0]["metadata"]["group"]["group_id"], "28888222124181")
+        self.assertGreaterEqual(items[0]["quality_score"], 90)
+
     def test_fixed_normalizer_splits_ima_knowledge_results(self) -> None:
         snapshot = {
             "channel_id": "ima-knowledge",
@@ -555,70 +592,73 @@ class MainBehaviorTests(unittest.TestCase):
     def test_playwright_login_returns_browser_workspace_url(self) -> None:
         with self.main.db() as conn:
             conn.execute(
-                "UPDATE channels SET url='https://wx.zsxq.com',collection_mode='playwright' WHERE id='zsxq'"
+                "UPDATE channels SET url='https://example.test/login',collection_mode='playwright' WHERE id='web-rumors'"
             )
         with patch.object(self.main, "BROWSER_WORKSPACE_PUBLIC_URL", "http://127.0.0.1:7900/vnc.html"), patch.object(
             self.main.subprocess,
             "Popen",
         ) as popen:
-            result = self.main.launch_channel_login("zsxq")
+            result = self.main.launch_channel_login("web-rumors")
         self.assertEqual(result["login_url"], "http://127.0.0.1:7900/vnc.html")
         popen.assert_called_once()
 
     def test_playwright_login_reuses_running_browser_process(self) -> None:
         with self.main.db() as conn:
             conn.execute(
-                "UPDATE channels SET url='https://wx.zsxq.com',collection_mode='playwright' WHERE id='zsxq'"
+                "UPDATE channels SET url='https://example.test/login',collection_mode='playwright' WHERE id='web-rumors'"
             )
         process = Mock()
         process.poll.return_value = None
         with patch.object(self.main.subprocess, "Popen", return_value=process) as popen:
-            self.main.launch_channel_login("zsxq")
-            result = self.main.launch_channel_login("zsxq")
+            self.main.launch_channel_login("web-rumors")
+            result = self.main.launch_channel_login("web-rumors")
         self.assertEqual(result["status"], "opened")
         popen.assert_called_once()
 
-    def test_zsxq_login_opens_configured_group_page(self) -> None:
-        with self.main.db() as conn:
-            conn.execute(
-                """
-                UPDATE channels
-                SET url='https://wx.zsxq.com',validation_url='',group_ids='["28888222124181"]',
-                    collection_mode='playwright'
-                WHERE id='zsxq'
-                """
-            )
-        with patch.object(self.main.subprocess, "Popen") as popen:
-            self.main.launch_channel_login("zsxq")
-        command = popen.call_args.args[0]
-        self.assertEqual(command[command.index("--url") + 1], "https://wx.zsxq.com/group/28888222124181")
-
-    def test_zsxq_check_uses_configured_group_page(self) -> None:
-        with self.main.db() as conn:
-            conn.execute(
-                """
-                UPDATE channels
-                SET url='https://wx.zsxq.com',validation_url='',success_url_contains='/group',
-                    group_ids='["28888222124181"]',collection_mode='playwright'
-                WHERE id='zsxq'
-                """
-            )
-        completed = Mock(
-            stdout=json.dumps(
-                {
-                    "available": True,
-                    "message": "已识别知识星球登录后的星球页面",
-                    "final_url": "https://wx.zsxq.com/group/28888222124181",
-                },
-                ensure_ascii=False,
+    def test_zsxq_mcp_config_is_encrypted_masked_and_preserved(self) -> None:
+        saved = self.main.update_zsxq_mcp_config(
+            self.main.ZsxqMcpConfigInput(
+                mcp_url="https://mcp.example.test/topic/mcp?api_key=secret-a",
+                timeout_seconds=12,
+                page_limit=7,
+                max_pages=3,
+                include_comments=True,
             )
         )
-        with patch.object(self.main.subprocess, "run", return_value=completed) as run:
+        self.assertTrue(saved["config"]["mcp_url_configured"])
+        self.assertNotIn("secret-a", saved["config"].get("mcp_url_display", ""))
+        stored = self.main.channel_request_config("zsxq")
+        self.assertEqual(stored["mcp_url"], "https://mcp.example.test/topic/mcp?api_key=secret-a")
+        self.assertEqual(stored["page_limit"], 7)
+        with self.main.db() as conn:
+            row = conn.execute("SELECT collection_mode,url,group_ids,parsing_strategy FROM channels WHERE id='zsxq'").fetchone()
+        self.assertEqual(row["collection_mode"], "zsxq_mcp")
+        self.assertEqual(row["url"], "mcp://zsxq")
+        self.assertEqual(json.loads(row["group_ids"]), ["28888222124181"])
+        self.assertEqual(row["parsing_strategy"], "fixed")
+
+        self.main.update_zsxq_mcp_config(self.main.ZsxqMcpConfigInput(page_limit=9, max_pages=2))
+        self.assertEqual(self.main.channel_request_config("zsxq")["mcp_url"], "https://mcp.example.test/topic/mcp?api_key=secret-a")
+
+        cleared = self.main.update_zsxq_mcp_config(self.main.ZsxqMcpConfigInput(clear_credentials=True))
+        self.assertFalse(cleared["config"]["mcp_url_configured"])
+        self.assertEqual(self.main.channel_request_config("zsxq")["mcp_url"], "")
+
+    def test_zsxq_check_uses_mcp_status_without_browser_subprocess(self) -> None:
+        expected = {
+            "status": "online",
+            "message": "ok",
+            "checked_at": timestamp(),
+            "group_id": "28888222124181",
+        }
+        with patch.object(self.main, "zsxq_mcp_status", return_value=expected) as status_check, patch.object(
+            self.main.subprocess,
+            "run",
+        ) as run:
             result = self.main.check_channel("zsxq")
-        command = run.call_args.args[0]
-        self.assertEqual(command[command.index("--url") + 1], "https://wx.zsxq.com/group/28888222124181")
-        self.assertEqual(command[command.index("--channel-id") + 1], "zsxq")
         self.assertEqual(result["status"], "online")
+        status_check.assert_called_once()
+        run.assert_not_called()
 
     def test_werss_normalizer_preserves_specific_public_account(self) -> None:
         snapshot = {

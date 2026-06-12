@@ -21,28 +21,28 @@ from backend.browser_session import (
 
 
 class BrowserSessionTests(unittest.TestCase):
-    def test_zsxq_group_page_is_accepted_as_authenticated(self) -> None:
+    def test_success_url_rule_controls_authenticated_state(self) -> None:
         available, message = evaluate_login_url(
-            "https://wx.zsxq.com/group/28888222124181",
-            "/legacy-path",
-            "zsxq",
+            "https://example.test/dashboard",
+            "/dashboard",
+            "web-rumors",
         )
         self.assertTrue(available)
-        self.assertIn("知识星球", message)
+        self.assertIn("matches", message)
 
     def test_login_state_round_trip_tracks_active_browser(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             profile = Path(temp_dir)
-            write_login_state(profile, "https://wx.zsxq.com/group/28888222124181", active=True)
+            write_login_state(profile, "https://example.test/dashboard", active=True)
             state = read_login_state(profile)
         self.assertTrue(state["active"])
-        self.assertEqual(state["url"], "https://wx.zsxq.com/group/28888222124181")
+        self.assertEqual(state["url"], "https://example.test/dashboard")
         self.assertLess(time.time() - state["updated_at"], 2)
 
     def test_check_reads_live_state_when_login_browser_owns_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             profile = Path(temp_dir)
-            write_login_state(profile, "https://wx.zsxq.com/group/28888222124181", active=True)
+            write_login_state(profile, "https://example.test/dashboard", active=True)
             playwright = MagicMock()
             playwright.chromium.launch_persistent_context.side_effect = PlaywrightError(
                 "The profile appears to be in use by another Chromium process"
@@ -51,10 +51,10 @@ class BrowserSessionTests(unittest.TestCase):
             manager.__enter__.return_value = playwright
             output = StringIO()
             with patch("backend.browser_session.sync_playwright", return_value=manager), redirect_stdout(output):
-                check(profile, "https://wx.zsxq.com/group/28888222124181", "/group", "", "zsxq")
+                check(profile, "https://example.test/dashboard", "/dashboard", "", "web-rumors")
         result = json.loads(output.getvalue())
         self.assertTrue(result["available"])
-        self.assertIn("知识星球", result["message"])
+        self.assertIn("matches", result["message"])
 
     def test_cleanup_removes_singleton_files_left_by_old_container(self) -> None:
         with patch("backend.browser_session.os.readlink", return_value="old-container-42"), patch(

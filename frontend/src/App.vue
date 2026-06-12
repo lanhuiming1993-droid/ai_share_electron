@@ -31,6 +31,7 @@ const marketDataForm = reactive({ enable_akshare: true, enable_baostock: true, e
 const imaForm = reactive({ client_id: "", api_key: "", api_key_configured: false, skill_download_url: "https://app-dl.ima.qq.com/skills/ima-skills-1.1.7.zip", clear_credentials: false });
 const itickForm = reactive({ api_base: "https://api0.itick.org", api_key: "", api_key_configured: false, default_symbols_text: "HK:700\nUS:AAPL\nSH:600519", kline_type: 2, kline_limit: 60, timeout_seconds: 20, clear_credentials: false });
 const xTwtApiForm = reactive({ api_base: "https://api.twtapi.com/api/v1/twitter", api_key: "", api_key_configured: false, default_queries_text: "A股\n半导体\n光伏\n机器人", tracked_users_text: "", result_type: "Latest", max_results: 20, timeout_seconds: 20, lang: "zh", clear_credentials: false });
+const zsxqMcpForm = reactive({ mcp_url: "", mcp_url_configured: false, mcp_url_display: "", timeout_seconds: 20, page_limit: 20, max_pages: 10, include_comments: false, clear_credentials: false });
 const wechatRssForm = reactive({ base_url: "http://127.0.0.1:8001", feed_ids_text: "all", access_key: "", secret_key: "", credentials_configured: false, admin_username: "admin", admin_password: "", admin_password_configured: false, clear_credentials: false, timeout_seconds: 20, max_items_per_feed: 100 });
 const wechatRssComponent = reactive({ status: "pending", message: "尚未检查", ready: false, service_online: false, rss_online: false, subscription_count: 0, subscriptions: [], subscription_error: "", docker_available: false, docker_engine_available: false, managed_setup_available: false, management_url: "", onboarding_steps: [] });
 Object.assign(wechatRssComponent, { wechat_authorized: false, wechat_login_state: "unknown", wechat_message: "", admin_authorized: false, qr_available: false });
@@ -105,6 +106,7 @@ function channelStatusDescription(channel) {
     if (channel.id === "ima-knowledge") return "IMA 知识库检索可用";
     if (channel.id === "itick") return "iTick 行情 API 可用";
     if (channel.id === "x-twtapi") return "X/TwtAPI 检索可用";
+    if (channel.id === "zsxq") return "知识星球 MCP 可用";
     if (channel.collection_mode === "playwright") return "登录态可用";
     if (channel.id === "web-rumors") return "授权会话可用";
     return "公开采集可用";
@@ -114,10 +116,12 @@ function channelStatusDescription(channel) {
     if (channel.id === "ima-knowledge") return "IMA 凭证或知识库不可用，请检查渠道配置";
     if (channel.id === "itick") return "iTick 凭证或 API 不可用，请检查渠道配置";
     if (channel.id === "x-twtapi") return "TwtAPI API Key 或接口不可用，请检查渠道配置";
+    if (channel.id === "zsxq") return "知识星球 MCP 不可用，请检查 MCP URL";
     if (channel.collection_mode === "playwright") return "登录态失效，请重新登录";
     if (channel.id === "web-rumors") return "授权会话失效，请重新导入 HAR";
     return "公开采集暂不可用";
   }
+  if (channel.id === "zsxq") return "等待 MCP URL 配置";
   return channel.collection_mode === "playwright" ? "等待登录配置" : "等待渠道配置";
 }
 function providerProtocolLabel(protocol) {
@@ -832,6 +836,8 @@ function openChannelModal(channel = null) {
   Object.assign(itickForm, { ...itickConfig, api_key: "", default_symbols_text: (itickConfig.default_symbols || ["HK:700", "US:AAPL", "SH:600519"]).join("\n"), clear_credentials: false });
   const xTwtApiConfig = channel?.x_twtapi_config || { api_base: "https://api.twtapi.com/api/v1/twitter", api_key: "", api_key_configured: false, default_queries: ["A股", "半导体", "光伏", "机器人"], tracked_users: [], result_type: "Latest", max_results: 20, timeout_seconds: 20, lang: "zh" };
   Object.assign(xTwtApiForm, { ...xTwtApiConfig, api_key: "", default_queries_text: (xTwtApiConfig.default_queries || ["A股", "半导体", "光伏", "机器人"]).join("\n"), tracked_users_text: (xTwtApiConfig.tracked_users || []).join("\n"), clear_credentials: false });
+  const zsxqMcpConfig = channel?.zsxq_mcp_config || { mcp_url: "", mcp_url_configured: false, mcp_url_display: "", timeout_seconds: 20, page_limit: 20, max_pages: 10, include_comments: false };
+  Object.assign(zsxqMcpForm, { ...zsxqMcpConfig, mcp_url: "", clear_credentials: false });
   const wechatRssConfig = channel?.wechat_rss_config || { base_url: "http://127.0.0.1:8001", feed_ids: ["all"], access_key: "", secret_key: "", credentials_configured: false, admin_username: "admin", admin_password: "", admin_password_configured: false, timeout_seconds: 20, max_items_per_feed: 100 };
   Object.assign(wechatRssForm, { ...wechatRssConfig, feed_ids_text: (wechatRssConfig.feed_ids || ["all"]).join("\n"), clear_credentials: false });
   channelModal.value = true;
@@ -877,6 +883,13 @@ async function saveXTwtApiConfiguration() {
   });
 }
 
+async function saveZsxqMcpConfiguration() {
+  return request("/api/channels/zsxq/config", {
+    method: "PUT",
+    body: JSON.stringify(zsxqMcpForm),
+  });
+}
+
 async function saveChannel(openLoginAfterSave = false, loginWindow = null) {
   if (!editingChannel.value) {
     notice.value = "新增信源入口已关闭；信源请通过后端内置适配后发布。";
@@ -904,6 +917,9 @@ async function saveChannel(openLoginAfterSave = false, loginWindow = null) {
     }
     if (saved.id === "x-twtapi") {
       await saveXTwtApiConfiguration();
+    }
+    if (saved.id === "zsxq") {
+      await saveZsxqMcpConfiguration();
     }
     notice.value = editingChannel.value ? "渠道配置已更新" : "新渠道已添加";
     closeChannelModal();
@@ -940,7 +956,7 @@ async function openChannelLogin() {
 }
 
 async function checkChannel(channel) {
-  notice.value = `正在检查 ${channelDisplayName(channel)} 登录状态...`;
+  notice.value = `正在检查 ${channelDisplayName(channel)} 状态...`;
   try {
     frontendLog("info", "channel.check.clicked", "", { channel_id: channel.id });
     const result = await request(`/api/channels/${channel.id}/check`, { method: "POST" });
@@ -1355,6 +1371,14 @@ function normalizeChannelForm() {
   const groupMatch = channelForm.url.match(/\/group\/(\d+)/);
   if (groupMatch && !channelForm.group_ids.includes(groupMatch[1])) channelForm.group_ids.push(groupMatch[1]);
   channelForm.group_ids = channelForm.group_ids.map((id) => id.trim()).filter(Boolean);
+  if (editingChannel.value?.id === "zsxq") {
+    channelForm.url = "mcp://zsxq";
+    channelForm.collection_mode = "zsxq_mcp";
+    channelForm.group_ids = ["28888222124181"];
+    channelForm.parsing_strategy = "fixed";
+    channelForm.normalization_quality_threshold = 90;
+    channelForm.max_scrolls = 1;
+  }
   channelForm.normalization_quality_threshold = Number(channelForm.normalization_quality_threshold);
   channelForm.max_scrolls = Number(channelForm.max_scrolls);
 }
@@ -1867,6 +1891,7 @@ onUnmounted(() => {
                 <small v-if="channel.id==='akshare'">组件：AkShare · BaoStock · TuShare{{ channel.market_data_config?.tushare_token_configured ? '（token 已加密保存）' : '（等待 token）' }}</small>
                 <small v-if="channel.id==='itick'">iTick 行情 API：配置中维护 API Base、API Key 和默认代码；API Key 仅本地加密保存</small>
                 <small v-if="channel.id==='x-twtapi'">X/TwtAPI：配置中维护 API Base、API Key、默认搜索词和指定博主；个股补证会按标的实时搜索</small>
+                <small v-if="channel.id==='zsxq'">知识星球 MCP：{{ channel.zsxq_mcp_config?.mcp_url_configured ? 'MCP URL 已加密保存' : '等待填写 MCP URL' }}；长期星球 28888222124181</small>
                 <small v-if="channel.id==='wechat-mp-rss'">微信扫码登录后搜索并加入公众号；采集按严格时间窗读取文章快照</small>
                 <small v-if="channel.id==='ima-knowledge'">在配置中维护 ClientID、API Key 和 IMA Skill 下载地址；API Key 仅本地加密保存</small>
                 <small>整理策略：{{ channel.parsing_strategy }} · 质量阈值 {{ channel.normalization_quality_threshold }} · 最大滚动 {{ channel.max_scrolls }}</small>
@@ -1876,7 +1901,7 @@ onUnmounted(() => {
               <div class="flex items-center gap-3">
                 <span :class="channel.status==='online'?'status-good':'status-warn'">{{ channel.status }}</span>
                 <button @click="normalizeExistingChannel(channel)" class="secondary">整理已有快照</button>
-                <button v-if="channel.collection_mode==='playwright' || ['web-rumors','akshare','industry-news','wechat-mp-rss','ima-knowledge','itick','x-twtapi'].includes(channel.id)" @click="checkChannel(channel)" class="secondary">检查状态</button>
+                <button v-if="channel.collection_mode==='playwright' || ['web-rumors','akshare','industry-news','wechat-mp-rss','ima-knowledge','itick','x-twtapi','zsxq'].includes(channel.id)" @click="checkChannel(channel)" class="secondary">检查状态</button>
                 <button @click="openChannelModal(channel)" class="secondary">配置</button>
               </div>
             </div>
@@ -2285,21 +2310,25 @@ onUnmounted(() => {
             <span class="form-label">渠道类型</span>
             <input v-model="channelForm.type" placeholder="例如 登录态信息差" class="field mt-2 w-full" />
           </label>
-          <label class="col-span-2">
+          <label v-if="editingChannel?.id!=='zsxq'" class="col-span-2">
             <span class="form-label">入口 URL</span>
             <input v-model="channelForm.url" placeholder="https://...；个股补证入口可使用 {query}" class="field mt-2 w-full" />
             <small class="mt-1 block text-xs leading-5 text-slate-600">需要按股票动态检索时，可在 URL 中使用 <code>{query}</code>。HTTP requests 和 Playwright 都会在个股补证时替换为股票代码或名称。</small>
           </label>
+          <div v-else class="col-span-2 rounded-2xl border border-white/[.07] bg-black/10 p-4 text-xs leading-5 text-slate-500">
+            知识星球已切换为 MCP 结构化采集，不再使用网页入口 URL 或浏览器登录态。
+          </div>
           <label v-if="channelForm.collection_mode==='playwright'" class="col-span-2">
             <span class="form-label">登录态检查 URL</span>
             <input v-model="channelForm.validation_url" placeholder="留空时使用入口 URL" class="field mt-2 w-full" />
           </label>
           <label>
             <span class="form-label">采集方式</span>
-            <select v-model="channelForm.collection_mode" class="field mt-2 w-full">
+            <select v-model="channelForm.collection_mode" :disabled="editingChannel?.id==='zsxq'" class="field mt-2 w-full disabled:cursor-not-allowed disabled:opacity-70">
               <option value="akshare">AkShare 模块</option>
               <option value="itick_market_data">iTick 行情 API</option>
               <option value="x_twtapi">X / Twitter（TwtAPI）</option>
+              <option value="zsxq_mcp">知识星球 MCP</option>
               <option value="industry_news">产业趋势公开资讯</option>
               <option value="wechat_rss">微信公众号 WeRSS RSS</option>
               <option value="ima_knowledge_base">IMA 知识库 OpenAPI</option>
@@ -2629,18 +2658,35 @@ onUnmounted(() => {
             <span class="form-label">登录后页面选择器（可选，优先级更高）</span>
             <input v-model="channelForm.success_selector" placeholder="例如 .user-avatar 或 [data-testid=user-menu]" class="field mt-2 w-full" />
           </label>
-          <div v-if="editingChannel?.id==='zsxq' || channelForm.name.includes('知识星球')" class="col-span-2 rounded-2xl border border-white/[.07] bg-black/10 p-4">
-            <div class="flex items-center justify-between">
-              <div>
-                <span class="form-label">星球 ID 列表</span>
-                <p class="mt-1 text-xs text-slate-600">支持配置一个或多个星球，采集器将逐个访问对应 `/group/&lt;id&gt;` 页面。</p>
-              </div>
-              <button @click="addGroupId" type="button" class="secondary">添加 ID</button>
+          <div v-if="editingChannel?.id==='zsxq' || channelForm.name.includes('知识星球')" class="col-span-2 rounded-2xl border border-teal-400/20 bg-teal-400/[.04] p-4">
+            <span class="form-label">知识星球 MCP</span>
+            <p class="mt-1 text-xs leading-5 text-slate-500">使用 MCP 读取结构化 topic 列表，不再打开 wx.zsxq.com 页面。长期信源固定为 28888222124181；88882281482852 不再作为默认采集源。</p>
+            <div class="mt-3 grid grid-cols-2 gap-3">
+              <label class="col-span-2">
+                <span class="form-label">MCP URL</span>
+                <input v-model="zsxqMcpForm.mcp_url" type="password" autocomplete="new-password" :placeholder="zsxqMcpForm.mcp_url_configured ? '已加密保存；不填写则保留原 MCP URL' : 'https://mcp.zsxq.com/topic/mcp?api_key=...'" class="field mt-2 w-full" />
+                <small v-if="zsxqMcpForm.mcp_url_display" class="mt-1 block break-all text-xs leading-5 text-slate-600">当前：{{ zsxqMcpForm.mcp_url_display }}</small>
+              </label>
+              <label>
+                <span class="form-label">长期星球 ID</span>
+                <input value="28888222124181" readonly class="field mt-2 w-full cursor-not-allowed opacity-70" />
+              </label>
+              <label>
+                <span class="form-label">每页主题数</span>
+                <input v-model.number="zsxqMcpForm.page_limit" type="number" min="1" max="30" class="field mt-2 w-full" />
+              </label>
+              <label>
+                <span class="form-label">最多翻页数</span>
+                <input v-model.number="zsxqMcpForm.max_pages" type="number" min="1" max="100" class="field mt-2 w-full" />
+              </label>
+              <label>
+                <span class="form-label">请求超时秒数</span>
+                <input v-model.number="zsxqMcpForm.timeout_seconds" type="number" min="3" max="120" class="field mt-2 w-full" />
+              </label>
             </div>
-            <div v-if="!channelForm.group_ids.length" class="mt-3 rounded-xl border border-dashed border-white/[.1] px-3 py-4 text-center text-xs text-slate-600">尚未配置星球 ID</div>
-            <div v-for="(_, index) in channelForm.group_ids" :key="index" class="mt-3 flex gap-2">
-              <input v-model="channelForm.group_ids[index]" placeholder="例如 28888222124181" class="field flex-1" />
-              <button @click="removeGroupId(index)" type="button" class="rounded-xl px-3 text-xs font-semibold text-rose-300 transition hover:bg-rose-400/10">移除</button>
+            <div class="mt-3 flex flex-wrap items-center gap-4">
+              <label class="text-xs text-slate-400"><input v-model="zsxqMcpForm.include_comments" type="checkbox" class="mr-2" />同步主题评论</label>
+              <label class="text-xs text-slate-400"><input v-model="zsxqMcpForm.clear_credentials" type="checkbox" class="mr-2" />清除已保存 MCP URL</label>
             </div>
           </div>
           <div v-if="editingChannel?.id==='web-rumors'" class="col-span-2 rounded-2xl border border-teal-400/20 bg-teal-400/[.04] p-4">

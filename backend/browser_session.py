@@ -8,7 +8,6 @@ import socket
 import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlsplit
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
@@ -76,19 +75,12 @@ def is_profile_in_use_error(exc: PlaywrightError) -> bool:
     return "Opening in existing browser session" in detail or "profile appears to be in use" in detail
 
 
-def is_zsxq_group_url(url: str) -> bool:
-    parsed = urlsplit(url)
-    return parsed.hostname == "wx.zsxq.com" and re.match(r"^/group/\d+(?:/|$)", parsed.path) is not None
-
-
 def evaluate_login_url(final_url: str, success_url_contains: str, channel_id: str = "") -> tuple[bool, str]:
-    if channel_id == "zsxq" and is_zsxq_group_url(final_url):
-        return True, "已识别知识星球登录后的星球页面"
     if success_url_contains:
         available = success_url_contains in final_url
-        return available, f"当前页面 {'符合' if available else '不符合'}登录后 URL 规则"
+        return available, f"Current URL {'matches' if available else 'does not match'} the success rule"
     available = not any(word in final_url.lower() for word in ("login", "signin", "passport"))
-    return available, "已按页面重定向结果完成基础检查"
+    return available, "Basic redirect check completed"
 
 
 def login(profile: Path, url: str) -> None:
@@ -131,9 +123,9 @@ def check(profile: Path, url: str, success_url_contains: str, success_selector: 
             available, message = evaluate_login_url(final_url, success_url_contains, channel_id)
             if not active:
                 available = False
-                message = "登录浏览器仍在启动，请稍候重试；如已完成登录，可关闭登录窗口后再次检查"
+                message = "Login browser is still starting or the profile is inactive; close it and retry if login is complete"
             elif success_selector and not available:
-                message = "登录浏览器仍在运行，暂时无法检查页面选择器；请完成登录或关闭登录窗口后重试"
+                message = "Login browser owns the profile, so the selector cannot be checked until it is closed"
             print(json.dumps({"available": available, "message": message, "final_url": final_url}))
             return
         page = context.pages[0] if context.pages else context.new_page()
@@ -142,7 +134,7 @@ def check(profile: Path, url: str, success_url_contains: str, success_selector: 
         final_url = page.url
         if success_selector:
             available = page.locator(success_selector).count() > 0
-            message = f"页面选择器 {'已匹配' if available else '未匹配'}: {success_selector}"
+            message = f"Selector {'matched' if available else 'did not match'}: {success_selector}"
         else:
             available, message = evaluate_login_url(final_url, success_url_contains, channel_id)
         context.close()
@@ -158,20 +150,15 @@ def collect(profile: Path, urls: list[str], window_start: str, window_end: str, 
         for url in urls:
             page.goto(url, wait_until="domcontentloaded", timeout=30_000)
             page.wait_for_timeout(1800)
-            is_zsxq_group = "wx.zsxq.com/group/" in url
             final_url = page.url.lower()
             if any(word in final_url for word in ("login", "signin", "passport")):
                 raise RuntimeError(f"Browser profile is no longer authenticated: {page.url}")
-            if is_zsxq_group and "/group/" not in final_url:
-                raise RuntimeError(f"ZSXQ login state is unavailable: {page.url}")
             window_start_dt = datetime.fromisoformat(window_start)
             text = ""
             timestamps: list[datetime] = []
             for _ in range(max_scrolls):
                 text = re.sub(r"\s+", " ", page.locator("body").inner_text()).strip()
                 timestamps = visible_timestamps(text, window_start_dt.tzinfo)
-                if is_zsxq_group and timestamps and min(timestamps) <= window_start_dt:
-                    break
                 page.mouse.wheel(0, 1600)
                 page.wait_for_timeout(650)
             if not text:
@@ -180,37 +167,20 @@ def collect(profile: Path, urls: list[str], window_start: str, window_end: str, 
                 continue
             captured_at = datetime.now().astimezone().isoformat(timespec="seconds")
             raw_html = page.content()
-            if is_zsxq_group:
-                group_match = re.search(r"/group/(\d+)", url)
-                body = json.dumps(
-                    {
-                        "platform": "zsxq",
-                        "group_id": group_match.group(1) if group_match else "",
-                        "collection_window": {"start": window_start, "end": window_end},
-                        "captured_at": captured_at,
-                        "visible_timestamps": [value.isoformat(timespec="minutes") for value in timestamps],
-                        "query": query,
-                        "visible_text": text[:120_000],
-                        "visible_text_truncated": len(text) > 120_000,
-                        "raw_html": raw_html[:200_000],
-                        "raw_html_truncated": len(raw_html) > 200_000,
-                    },
-                    ensure_ascii=False,
-                )
-            else:
-                body = json.dumps(
-                    {
-                        "platform": "web",
-                        "collection_window": {"start": window_start, "end": window_end},
-                        "captured_at": captured_at,
-                        "query": query,
-                        "visible_text": text[:120_000],
-                        "visible_text_truncated": len(text) > 120_000,
-                        "raw_html": raw_html[:200_000],
-                        "raw_html_truncated": len(raw_html) > 200_000,
-                    },
-                    ensure_ascii=False,
-                )
+            body = json.dumps(
+                {
+                    "platform": "web",
+                    "collection_window": {"start": window_start, "end": window_end},
+                    "captured_at": captured_at,
+                    "query": query,
+                    "visible_timestamps": [value.isoformat(timespec="minutes") for value in timestamps],
+                    "visible_text": text[:120_000],
+                    "visible_text_truncated": len(text) > 120_000,
+                    "raw_html": raw_html[:200_000],
+                    "raw_html_truncated": len(raw_html) > 200_000,
+                },
+                ensure_ascii=False,
+            )
             snapshots.append(
                 {
                     "channel_id": profile.name,
@@ -233,9 +203,9 @@ def main() -> None:
     parser.add_argument("--window-end", default="")
     parser.add_argument("--query", default="")
     parser.add_argument("--max-scrolls", type=int, default=8)
-    parser.add_argument("--channel-id", default="")
     parser.add_argument("--success-url-contains", default="")
     parser.add_argument("--success-selector", default="")
+    parser.add_argument("--channel-id", default="")
     args = parser.parse_args()
     profile = Path(args.profile)
     profile.mkdir(parents=True, exist_ok=True)
@@ -244,7 +214,14 @@ def main() -> None:
     elif args.action == "check":
         check(profile, args.url, args.success_url_contains, args.success_selector, args.channel_id)
     else:
-        collect(profile, json.loads(args.urls_json), args.window_start, args.window_end, args.query, args.max_scrolls)
+        collect(
+            profile,
+            json.loads(args.urls_json),
+            args.window_start,
+            args.window_end,
+            args.query,
+            args.max_scrolls,
+        )
 
 
 if __name__ == "__main__":

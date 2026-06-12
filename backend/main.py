@@ -85,6 +85,13 @@ from backend.wechat_rss import (
     werss_wechat_login_status,
 )
 from backend.worker import CollectionWorker
+from backend.zsxq_mcp_source import (
+    DEFAULT_ZSXQ_GROUP_ID,
+    normalize_zsxq_group_ids,
+    normalize_zsxq_mcp_config,
+    public_zsxq_mcp_config,
+    zsxq_mcp_status,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION_PATH = ROOT / "VERSION"
@@ -213,7 +220,7 @@ class ChannelInput(BaseModel):
     name: str
     type: str
     url: str = ""
-    collection_mode: Literal["akshare", "industry_news", "wechat_rss", "ima_knowledge_base", "itick_market_data", "x_twtapi", "requests", "playwright", "manual"] = "playwright"
+    collection_mode: Literal["akshare", "industry_news", "wechat_rss", "ima_knowledge_base", "itick_market_data", "x_twtapi", "zsxq_mcp", "requests", "playwright", "manual"] = "playwright"
     status: Literal["online", "pending", "offline"] = "pending"
     notes: str = ""
     validation_url: str = ""
@@ -326,6 +333,15 @@ class TwtApiConfigInput(BaseModel):
     max_results: int = Field(default=20, ge=1, le=100)
     timeout_seconds: int = Field(default=20, ge=3, le=60)
     lang: str = Field(default="zh", max_length=10)
+    clear_credentials: bool = False
+
+
+class ZsxqMcpConfigInput(BaseModel):
+    mcp_url: str = Field(default="", repr=False, max_length=2_000)
+    timeout_seconds: int = Field(default=20, ge=3, le=120)
+    page_limit: int = Field(default=20, ge=1, le=30)
+    max_pages: int = Field(default=10, ge=1, le=100)
+    include_comments: bool = False
     clear_credentials: bool = False
 
 
@@ -553,6 +569,14 @@ def x_twtapi_channel_config() -> dict:
 
 def x_twtapi_channel_config_public() -> dict:
     return public_twtapi_config(x_twtapi_channel_config())
+
+
+def zsxq_mcp_channel_config() -> dict:
+    return normalize_zsxq_mcp_config(channel_request_config("zsxq"))
+
+
+def zsxq_mcp_channel_config_public() -> dict:
+    return public_zsxq_mcp_config(zsxq_mcp_channel_config())
 
 
 def even_source_weights(channel_ids: list[str]) -> dict[str, float]:
@@ -990,10 +1014,52 @@ def init_db() -> None:
                 """,
                 [
                     {"id": "akshare", "name": "AkShare", "type": "结构化行情", "url": "", "collection_mode": "akshare", "status": "online", "notes": "本地模块待首次调用", "parsing_strategy": "fixed", "normalization_quality_threshold": 60, "max_scrolls": 1, "research_enabled": 1, "builtin": 1, "updated_at": now()},
-                    {"id": "zsxq", "name": "知识星球", "type": "登录态信息差", "url": "https://wx.zsxq.com", "collection_mode": "playwright", "status": "pending", "notes": "等待浏览器登录配置", "parsing_strategy": "hybrid", "normalization_quality_threshold": 60, "max_scrolls": 12, "research_enabled": 0, "builtin": 0, "updated_at": now()},
+                    {"id": "zsxq", "name": "知识星球", "type": "MCP 社群主题", "url": "mcp://zsxq", "collection_mode": "zsxq_mcp", "status": "pending", "notes": "通过知识星球 MCP 读取长期星球主题；MCP URL 仅本机加密保存", "parsing_strategy": "fixed", "normalization_quality_threshold": 90, "max_scrolls": 1, "research_enabled": 0, "builtin": 0, "updated_at": now()},
                     {"id": "web-rumors", "name": "网页小作文渠道", "type": "浏览器采集", "url": "", "collection_mode": "playwright", "status": "pending", "notes": "等待渠道规则配置", "parsing_strategy": "hybrid", "normalization_quality_threshold": 60, "max_scrolls": 8, "research_enabled": 0, "builtin": 0, "updated_at": now()},
                 ],
             )
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO channels(
+              id,name,type,url,collection_mode,status,notes,parsing_strategy,
+              normalization_quality_threshold,max_scrolls,research_enabled,builtin,group_ids,updated_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "zsxq",
+                "知识星球",
+                "MCP 社群主题",
+                "mcp://zsxq",
+                "zsxq_mcp",
+                "pending",
+                "通过知识星球 MCP 读取长期星球主题；MCP URL 仅本机加密保存",
+                "fixed",
+                90,
+                1,
+                0,
+                0,
+                json.dumps([DEFAULT_ZSXQ_GROUP_ID], ensure_ascii=False),
+                now(),
+            ),
+        )
+        conn.execute(
+            """
+            UPDATE channels
+            SET name='知识星球',
+                type='MCP 社群主题',
+                url='mcp://zsxq',
+                collection_mode='zsxq_mcp',
+                status='pending',
+                notes='通过知识星球 MCP 读取长期星球主题；MCP URL 仅本机加密保存',
+                group_ids=?,
+                parsing_strategy='fixed',
+                normalization_quality_threshold=90,
+                max_scrolls=1,
+                updated_at=?
+            WHERE id='zsxq'
+            """,
+            (json.dumps([DEFAULT_ZSXQ_GROUP_ID], ensure_ascii=False), now()),
+        )
         conn.execute(
             """
             INSERT OR IGNORE INTO channels(
@@ -1877,7 +1943,69 @@ def fixed_normalized_items(snapshot: sqlite3.Row, mode: str = "fixed") -> tuple[
                 "normalization_mode": mode,
             }
         ], ""
-    if isinstance(payload, dict) and payload.get("platform") in {"zsxq", "web"}:
+    if isinstance(payload, dict) and payload.get("platform") == "zsxq_mcp":
+        topic = payload.get("topic") if isinstance(payload.get("topic"), dict) else {}
+        owner = payload.get("owner") if isinstance(payload.get("owner"), dict) else {}
+        if not owner:
+            owner = topic.get("owner") if isinstance(topic.get("owner"), dict) else {}
+        group = payload.get("group") if isinstance(payload.get("group"), dict) else {}
+        if not group:
+            group = topic.get("group") if isinstance(topic.get("group"), dict) else {}
+        title = str(topic.get("title") or "").strip()
+        item_content = str(topic.get("content") or payload.get("content") or title).strip()
+        if not item_content:
+            return [], "ZSXQ MCP topic content is empty"
+        topic_id = str(topic.get("topic_id") or "").strip()
+        item_source_url = source_url
+        item_occurred_at = normalized_occurred_at(topic.get("create_time"), occurred_at)
+        attachments = [
+            str(item).strip()
+            for item in (payload.get("attachments") if isinstance(payload.get("attachments"), list) else [])
+            if str(item).strip()
+        ]
+        if not attachments:
+            for key in ("images", "files"):
+                for item in topic.get(key) or []:
+                    if isinstance(item, str) and item.strip():
+                        attachments.append(item.strip())
+                    elif isinstance(item, dict):
+                        ref = item.get("url") or item.get("download_url") or item.get("name") or item.get("file_id")
+                        if ref:
+                            attachments.append(str(ref).strip())
+        return [
+            {
+                "item_key": f"zsxq:{topic_id}"[:255] if topic_id else stable_item_key(snapshot["channel_id"], item_source_url, item_occurred_at, title, item_content),
+                "occurred_at": item_occurred_at,
+                "author": str(owner.get("name") or owner.get("alias") or "")[:255],
+                "title": (title or item_content.splitlines()[0])[:500],
+                "content": item_content,
+                "source_url": item_source_url,
+                "attachments": attachments,
+                "metadata": {
+                    "platform": payload["platform"],
+                    "adapter": payload.get("adapter", ""),
+                    "topic_id": topic_id,
+                    "topic_type": topic.get("type", ""),
+                    "digested": bool(topic.get("digested", False)),
+                    "group": {
+                        "group_id": str(group.get("group_id") or DEFAULT_ZSXQ_GROUP_ID),
+                        "name": str(group.get("name") or ""),
+                    },
+                    "owner": {
+                        "user_id": str(owner.get("user_id") or ""),
+                        "name": str(owner.get("name") or ""),
+                    },
+                    "counts": topic.get("counts") if isinstance(topic.get("counts"), dict) else {},
+                    "modify_time": topic.get("modify_time"),
+                    "query": payload.get("query", ""),
+                    "collection_window": payload.get("collection_window", {}),
+                    "comment_count": len(payload.get("comments") or []) if isinstance(payload.get("comments"), list) else 0,
+                },
+                "quality_score": 94,
+                "normalization_mode": mode,
+            }
+        ], ""
+    if isinstance(payload, dict) and payload.get("platform") == "web":
         item_content = str(payload.get("visible_text") or "").strip()
         if item_content:
             return [
@@ -2290,6 +2418,8 @@ def dashboard() -> dict:
             channel["itick_config"] = itick_channel_config_public()
         if channel["id"] == "x-twtapi":
             channel["x_twtapi_config"] = x_twtapi_channel_config_public()
+        if channel["id"] == "zsxq":
+            channel["zsxq_mcp_config"] = zsxq_mcp_channel_config_public()
     skills = [
         {"name": item.name, "path": str(item.relative_to(ROOT)), "status": "loaded"}
         for item in SKILLS_DIR.iterdir()
@@ -2731,6 +2861,60 @@ def update_x_twtapi_config(payload: TwtApiConfigInput) -> dict:
     return {"status": "saved", "config": x_twtapi_channel_config_public()}
 
 
+@app.put("/api/channels/zsxq/config")
+def update_zsxq_mcp_config(payload: ZsxqMcpConfigInput) -> dict:
+    existing = zsxq_mcp_channel_config()
+    supplied_mcp_url = payload.mcp_url.strip()
+    if payload.clear_credentials:
+        mcp_url = ""
+    elif supplied_mcp_url and MASKED_SECRET not in supplied_mcp_url:
+        mcp_url = supplied_mcp_url
+    else:
+        mcp_url = str(existing.get("mcp_url") or "")
+    try:
+        config = normalize_zsxq_mcp_config(
+            {
+                "adapter": "zsxq_mcp",
+                "mcp_url": mcp_url,
+                "timeout_seconds": payload.timeout_seconds,
+                "page_limit": payload.page_limit,
+                "max_pages": payload.max_pages,
+                "include_comments": payload.include_comments,
+                "comment_limit": existing.get("comment_limit", 20),
+            }
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    save_channel_request_config("zsxq", config)
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE channels
+            SET url='mcp://zsxq',
+                collection_mode='zsxq_mcp',
+                group_ids=?,
+                parsing_strategy='fixed',
+                normalization_quality_threshold=90,
+                max_scrolls=1,
+                status='pending',
+                updated_at=?
+            WHERE id='zsxq'
+            """,
+            (json.dumps([DEFAULT_ZSXQ_GROUP_ID], ensure_ascii=False), now()),
+        )
+    log_event(
+        logger,
+        "INFO",
+        "channel.zsxq_mcp.config.saved",
+        channel_id="zsxq",
+        mcp_url_configured=bool(config["mcp_url"]),
+        page_limit=config["page_limit"],
+        max_pages=config["max_pages"],
+        include_comments=config["include_comments"],
+    )
+    return {"status": "saved", "config": zsxq_mcp_channel_config_public()}
+
+
 @app.get("/api/channels/wechat-mp-rss/component-status")
 def wechat_rss_component_status() -> dict:
     return persist_wechat_rss_status(managed_werss_status(wechat_rss_config()))
@@ -3039,6 +3223,17 @@ def create_channel(payload: ChannelInput) -> dict:
 @app.put("/api/channels/{channel_id}")
 def update_channel(channel_id: str, payload: ChannelInput) -> dict:
     channel = {"id": channel_id, **payload.model_dump(), "updated_at": now()}
+    if channel_id == "zsxq":
+        channel.update(
+            {
+                "url": "mcp://zsxq",
+                "collection_mode": "zsxq_mcp",
+                "group_ids": [DEFAULT_ZSXQ_GROUP_ID],
+                "parsing_strategy": "fixed",
+                "normalization_quality_threshold": 90,
+                "max_scrolls": 1,
+            }
+        )
     channel["group_ids"] = json.dumps(channel["group_ids"], ensure_ascii=False)
     with db() as conn:
         existing = conn.execute("SELECT builtin FROM channels WHERE id=?", (channel_id,)).fetchone()
@@ -3117,15 +3312,6 @@ def channel_validation_url(channel: sqlite3.Row | dict) -> str:
     validation_url = str(channel["validation_url"] or "").strip()
     if validation_url:
         return validation_url
-    if channel["id"] == "zsxq":
-        try:
-            group_ids = json.loads(channel["group_ids"] or "[]")
-        except json.JSONDecodeError:
-            group_ids = []
-        for value in group_ids:
-            group_id = str(value).strip()
-            if re.fullmatch(r"\d+", group_id):
-                return f"https://wx.zsxq.com/group/{group_id}"
     return str(channel["url"] or "").strip()
 
 
@@ -3175,7 +3361,7 @@ def launch_channel_login(channel_id: str) -> dict:
         raise HTTPException(409, "请先填写渠道入口 URL")
     profile = browser_profile(channel_id)
     profile.mkdir(parents=True, exist_ok=True)
-    login_url = channel_validation_url(channel) if channel_id == "zsxq" else channel["url"]
+    login_url = str(channel["url"] or "").strip()
     try:
         with CHANNEL_LOGIN_PROCESSES_LOCK:
             process = CHANNEL_LOGIN_PROCESSES.get(channel_id)
@@ -3249,6 +3435,19 @@ def check_channel(channel_id: str) -> dict:
             )
         log_event(logger, "INFO" if result["status"] == "online" else "WARNING", "channel.check.completed", channel_id=channel_id, status=result["status"], message=result["message"])
         return result
+    if channel_id == "zsxq" and channel:
+        try:
+            group_ids = json.loads(channel["group_ids"] or "[]")
+        except json.JSONDecodeError:
+            group_ids = []
+        result = zsxq_mcp_status(zsxq_mcp_channel_config(), normalize_zsxq_group_ids(group_ids))
+        with db() as conn:
+            conn.execute(
+                "UPDATE channels SET status=?,last_check=?,updated_at=? WHERE id=?",
+                (result["status"], result["checked_at"], result["checked_at"], channel_id),
+            )
+        log_event(logger, "INFO" if result["status"] == "online" else "WARNING", "channel.check.completed", channel_id=channel_id, status=result["status"], message=result["message"])
+        return result
     if channel:
         request_config = channel_request_config(channel_id)
         if request_config.get("adapter") == "mx_authorized_request_replay":
@@ -3302,11 +3501,11 @@ def refresh_browser_channel_states() -> None:
         channels = [
             dict(row)
             for row in conn.execute(
-                "SELECT id FROM channels WHERE collection_mode='playwright' OR id IN ('web-rumors','akshare','industry-news','wechat-mp-rss','ima-knowledge','itick','x-twtapi')"
+                "SELECT id FROM channels WHERE collection_mode='playwright' OR id IN ('web-rumors','akshare','industry-news','wechat-mp-rss','ima-knowledge','itick','x-twtapi','zsxq')"
             )
         ]
     for channel in channels:
-        if channel["id"] in ("web-rumors", "akshare", "industry-news", "wechat-mp-rss", "ima-knowledge", "itick", "x-twtapi") or browser_profile(channel["id"]).exists():
+        if channel["id"] in ("web-rumors", "akshare", "industry-news", "wechat-mp-rss", "ima-knowledge", "itick", "x-twtapi", "zsxq") or browser_profile(channel["id"]).exists():
             try:
                 check_channel(channel["id"])
             except Exception as exc:
@@ -4218,7 +4417,7 @@ def channel_ids_for_layer(layer: str) -> list[str]:
     layer = normalize_evidence_layer(layer)
     modes = {
         "market_data": ("akshare", "itick_market_data"),
-        "http_requests": ("requests", "industry_news", "wechat_rss", "ima_knowledge_base", "x_twtapi"),
+        "http_requests": ("requests", "industry_news", "wechat_rss", "ima_knowledge_base", "x_twtapi", "zsxq_mcp"),
         "playwright": ("playwright",),
     }.get(layer)
     if not modes:
