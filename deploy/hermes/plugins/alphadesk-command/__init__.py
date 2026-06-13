@@ -9,10 +9,19 @@ TRIGGER = "采集近30天数据并生成报告"
 COMMAND = "alphadesk-report"
 SUPPORTED_PLATFORMS = {"weixin", "lightclawbot"}
 REPORT_SCRIPT = Path.home() / ".hermes" / "skills" / "alphadesk-cloud-report" / "scripts" / "collect_report.py"
+REPORT_REQUEST_RE = re.compile(r"采集近?(?P<days>\d{1,2})天(?:的)?数据.*生成(?:分析)?报告")
 
 
 def _compact_text(value: str) -> str:
     return re.sub(r"\s+", "", str(value or "")).strip()
+
+
+def _match_report_request(value: str) -> int | None:
+    compact = _compact_text(value)
+    match = REPORT_REQUEST_RE.search(compact)
+    if not match:
+        return None
+    return max(1, min(30, int(match.group("days"))))
 
 
 def _extract_days(raw_args: str) -> int:
@@ -48,12 +57,13 @@ def _pre_gateway_dispatch(event, **_kwargs):
     if platform not in SUPPORTED_PLATFORMS:
         return None
 
-    if _compact_text(getattr(event, "text", "")) != TRIGGER:
+    days = _match_report_request(getattr(event, "text", ""))
+    if days is None:
         return None
 
     return {
         "action": "rewrite",
-        "text": f"/{COMMAND} --days 30 --original {TRIGGER}",
+        "text": f"/{COMMAND} --days {days} --original {getattr(event, 'text', '')}",
     }
 
 
