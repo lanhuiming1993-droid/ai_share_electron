@@ -133,6 +133,35 @@ class WorkerBehaviorTests(unittest.TestCase):
             runs = dict(conn.execute("SELECT channel_id,status FROM source_collection_runs"))
             self.assertEqual(runs, {"good": "completed", "bad": "failed"})
 
+    def test_collect_report_uses_cached_window_snapshots_when_live_source_fails(self) -> None:
+        self.insert_channels("cached")
+        window = {"channel_id": "cached", "window_start": timestamp(-30), "window_end": timestamp()}
+        job = self.insert_job("cached-report", [window], action="collect_report")
+        job["report_title"] = "cached report"
+        with database(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO source_snapshots(id,channel_id,occurred_at,collected_at,source_url,content,scope_type,scope_key)
+                VALUES('cached-snapshot','cached',?,?, 'cached://1','{}','general','')
+                """,
+                (timestamp(-5), timestamp(-4)),
+            )
+
+        with patch("backend.worker.collect_channel", side_effect=RuntimeError("quota exhausted")):
+            self.worker.execute(job)
+
+        with database(self.db_path) as conn:
+            status = conn.execute("SELECT status FROM source_collection_jobs WHERE id='cached-report'").fetchone()[0]
+            run = conn.execute(
+                "SELECT status,duplicate_count,error FROM source_collection_runs WHERE job_id='cached-report' AND channel_id='cached'"
+            ).fetchone()
+            linked = conn.execute("SELECT COUNT(*) FROM source_job_snapshots WHERE job_id='cached-report'").fetchone()[0]
+        self.assertEqual(status, "review")
+        self.assertEqual(run[0], "cached_after_error")
+        self.assertEqual(run[1], 1)
+        self.assertIn("quota exhausted", run[2])
+        self.assertEqual(linked, 1)
+
     def test_worker_can_restart_after_clean_stop(self) -> None:
         self.worker.start()
         self.assertTrue(self.worker.thread and self.worker.thread.is_alive())

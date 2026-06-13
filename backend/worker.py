@@ -262,6 +262,27 @@ class CollectionWorker:
         )
         return inserted, duplicates, inserted_snapshot_ids, refreshed_snapshot_ids
 
+    def attach_cached_snapshots_for_window(self, job: dict, window: dict) -> int:
+        general_refresh = job.get("evidence_layer") == "local_source_snapshots" and not canonical_scope_key(job.get("query", ""))
+        scope_type = "general" if general_refresh or not (job.get("parent_task_id") or job.get("query") or job.get("evidence_layer")) else "research"
+        scope_key = canonical_scope_key(job.get("query", "")) if scope_type == "research" else ""
+        with self.connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id FROM source_snapshots
+                WHERE channel_id=? AND occurred_at BETWEEN ? AND ?
+                  AND scope_type=? AND scope_key=?
+                ORDER BY occurred_at DESC
+                """,
+                (window["channel_id"], window["window_start"], window["window_end"], scope_type, scope_key),
+            ).fetchall()
+            for row in rows:
+                conn.execute(
+                    "INSERT OR IGNORE INTO source_job_snapshots(job_id,snapshot_id) VALUES(?,?)",
+                    (job["id"], row["id"]),
+                )
+        return len(rows)
+
     def execute(self, job: dict) -> None:
         successful_channels: set[str] = set()
         errors: dict[str, str] = {}
@@ -360,6 +381,33 @@ class CollectionWorker:
                                     snapshot_id=snapshot_id,
                                 )
                 except Exception as exc:
+                    if job["action"] == "collect_report":
+                        cached_count = self.attach_cached_snapshots_for_window(job, window)
+                    else:
+                        cached_count = 0
+                    if cached_count:
+                        error = f"Live collection failed; used {cached_count} cached snapshots: {exc}"[:1200]
+                        errors[channel["id"]] = error
+                        successful_channels.add(channel["id"])
+                        self.record_run(
+                            job["id"],
+                            channel["id"],
+                            "cached_after_error",
+                            started_at=started_at,
+                            snapshot_count=0,
+                            duplicate_count=cached_count,
+                            error=error,
+                        )
+                        log_exception(
+                            logger,
+                            "worker.channel.cached_after_error",
+                            exc,
+                            job_id=job["id"],
+                            channel_id=channel["id"],
+                            collection_mode=channel.get("collection_mode", ""),
+                            cached_snapshots=cached_count,
+                        )
+                        continue
                     errors[channel["id"]] = str(exc)[:1200]
                     self.record_run(job["id"], channel["id"], "failed", started_at=started_at, error=str(exc))
                     log_exception(

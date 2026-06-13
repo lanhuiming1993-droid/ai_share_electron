@@ -450,7 +450,7 @@ def verify_once(args: argparse.Namespace) -> tuple[bool, dict[str, Any]]:
         command
         and job
         and job.get("report_ready")
-        and job.get("status") in {"review", "partial_review"}
+        and job.get("status") == "review"
         and required_run_ids.issubset(actual_run_ids)
     )
     summary = {
