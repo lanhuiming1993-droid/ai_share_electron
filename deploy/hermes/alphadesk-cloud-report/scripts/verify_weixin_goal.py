@@ -19,6 +19,7 @@ DEFAULT_COMMAND = "采集近30天数据并生成报告"
 DEFAULT_BASE_URL = "http://127.0.0.1:18080"
 DEFAULT_ENV_FILE = Path("/opt/alphadesk/deploy/cloud.env")
 DEFAULT_HERMES_HOME = Path.home() / ".hermes"
+DEFAULT_SOURCE_STATUS_CACHE = Path(os.environ.get("ALPHADESK_SOURCE_STATUS_CACHE", "/tmp/alphadesk-source-status-cache.json"))
 AGENT_CHANNEL_IDS = ("wechat-mp-rss", "ima-knowledge", "zsxq")
 GATEWAY_LOG_PATTERNS = {
     "weixin_adapter_inbound": re.compile(r"\[Weixin\] inbound"),
@@ -340,6 +341,48 @@ def collect_source_status(base_url: str) -> dict[str, dict[str, Any]]:
     return statuses
 
 
+def collect_source_status_cached(
+    base_url: str,
+    *,
+    cache_path: Path,
+    ttl_seconds: int,
+    force: bool = False,
+) -> dict[str, Any]:
+    now_ts = time.time()
+    if not force and ttl_seconds > 0 and cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            checked_at = float(cached.get("checked_at_epoch") or 0)
+            if cached.get("base_url") == base_url and now_ts - checked_at <= ttl_seconds:
+                statuses = cached.get("source_status") if isinstance(cached.get("source_status"), dict) else {}
+                return {
+                    **statuses,
+                    "_cache": {
+                        "hit": True,
+                        "age_seconds": max(0, int(now_ts - checked_at)),
+                        "ttl_seconds": ttl_seconds,
+                    },
+                }
+        except Exception:
+            pass
+
+    statuses = collect_source_status(base_url)
+    payload = {"base_url": base_url, "checked_at_epoch": now_ts, "source_status": statuses}
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+    return {
+        **statuses,
+        "_cache": {
+            "hit": False,
+            "age_seconds": 0,
+            "ttl_seconds": ttl_seconds,
+        },
+    }
+
+
 def find_report_job(workbench_db: Path, command_seen_at: float) -> dict[str, Any] | None:
     conn = sqlite3.connect(str(workbench_db))
     conn.row_factory = sqlite3.Row
@@ -388,7 +431,16 @@ def verify_once(args: argparse.Namespace) -> tuple[bool, dict[str, Any]]:
         args.since_message_id,
         parse_iso(args.since_iso) if args.since_iso else 0.0,
     )
-    source_status = collect_source_status(args.base_url) if args.check_sources else {}
+    source_status = (
+        collect_source_status_cached(
+            args.base_url,
+            cache_path=args.source_status_cache,
+            ttl_seconds=max(args.source_check_ttl, 0),
+            force=args.force_source_check,
+        )
+        if args.check_sources
+        else {}
+    )
     job = None
     if command and workbench_db:
         job = find_report_job(workbench_db, float(command["timestamp"]))
@@ -430,6 +482,9 @@ def main() -> int:
     parser.add_argument("--watch-seconds", type=int, default=0)
     parser.add_argument("--interval", type=int, default=15)
     parser.add_argument("--check-sources", action="store_true")
+    parser.add_argument("--source-status-cache", type=Path, default=DEFAULT_SOURCE_STATUS_CACHE)
+    parser.add_argument("--source-check-ttl", type=int, default=900, help="seconds to cache expensive source checks")
+    parser.add_argument("--force-source-check", action="store_true", help="ignore the source status cache")
     args = parser.parse_args()
 
     deadline = time.time() + max(args.watch_seconds, 0)

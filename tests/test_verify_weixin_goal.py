@@ -6,6 +6,7 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 
 
 def load_verify_module():
@@ -88,6 +89,52 @@ class VerifyWeixinGoalDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(result["name"], "alphadesk-command")
         self.assertEqual(result["version"], "0.1.1")
+
+    def test_source_status_cache_prevents_repeated_expensive_checks(self) -> None:
+        cache_path = self.hermes_home / "source-status-cache.json"
+        fresh = {"ima-knowledge": {"status": "online"}}
+
+        with patch.object(self.verify, "collect_source_status", return_value=fresh) as collect:
+            first = self.verify.collect_source_status_cached(
+                "http://127.0.0.1:18080",
+                cache_path=cache_path,
+                ttl_seconds=900,
+            )
+            second = self.verify.collect_source_status_cached(
+                "http://127.0.0.1:18080",
+                cache_path=cache_path,
+                ttl_seconds=900,
+            )
+
+        self.assertEqual(collect.call_count, 1)
+        self.assertFalse(first["_cache"]["hit"])
+        self.assertTrue(second["_cache"]["hit"])
+        self.assertEqual(second["ima-knowledge"]["status"], "online")
+
+    def test_source_status_cache_can_be_forced(self) -> None:
+        cache_path = self.hermes_home / "source-status-cache.json"
+        cache_path.write_text(
+            json.dumps(
+                {
+                    "base_url": "http://127.0.0.1:18080",
+                    "checked_at_epoch": time.time(),
+                    "source_status": {"ima-knowledge": {"status": "offline"}},
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(self.verify, "collect_source_status", return_value={"ima-knowledge": {"status": "online"}}) as collect:
+            result = self.verify.collect_source_status_cached(
+                "http://127.0.0.1:18080",
+                cache_path=cache_path,
+                ttl_seconds=900,
+                force=True,
+            )
+
+        self.assertEqual(collect.call_count, 1)
+        self.assertFalse(result["_cache"]["hit"])
+        self.assertEqual(result["ima-knowledge"]["status"], "online")
 
 
 if __name__ == "__main__":
