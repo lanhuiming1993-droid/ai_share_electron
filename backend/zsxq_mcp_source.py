@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from datetime import datetime
@@ -28,17 +29,31 @@ def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
 
 def normalize_zsxq_mcp_config(config: dict | None) -> dict[str, Any]:
     raw = config or {}
-    mcp_url = str(raw.get("mcp_url") or "").strip()
+    env_mcp_url = (
+        os.environ.get("ALPHADESK_ZSXQ_MCP_URL", "").strip()
+        or os.environ.get("ZSXQ_MCP_URL", "").strip()
+    )
+    mcp_url = str(raw.get("mcp_url") or env_mcp_url or "").strip()
     if mcp_url and not mcp_url.startswith(("http://", "https://")):
         raise ValueError("ZSXQ MCP URL must start with http:// or https://")
     return {
         "adapter": "zsxq_mcp",
         "mcp_url": mcp_url,
-        "timeout_seconds": _bounded_int(raw.get("timeout_seconds"), 20, 3, 120),
-        "page_limit": _bounded_int(raw.get("page_limit"), 10, 1, 30),
-        "max_pages": _bounded_int(raw.get("max_pages"), 10, 1, 100),
+        "timeout_seconds": _bounded_int(
+            raw.get("timeout_seconds") or os.environ.get("ALPHADESK_ZSXQ_TIMEOUT_SECONDS"),
+            20,
+            3,
+            120,
+        ),
+        "page_limit": _bounded_int(raw.get("page_limit") or os.environ.get("ALPHADESK_ZSXQ_PAGE_LIMIT"), 10, 1, 30),
+        "max_pages": _bounded_int(raw.get("max_pages") or os.environ.get("ALPHADESK_ZSXQ_MAX_PAGES"), 10, 1, 100),
         "include_comments": bool(raw.get("include_comments", False)),
-        "comment_limit": _bounded_int(raw.get("comment_limit"), 20, 1, 30),
+        "comment_limit": _bounded_int(
+            raw.get("comment_limit") or os.environ.get("ALPHADESK_ZSXQ_COMMENT_LIMIT"),
+            20,
+            1,
+            30,
+        ),
     }
 
 

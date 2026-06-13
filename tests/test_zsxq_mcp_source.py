@@ -4,7 +4,13 @@ import json
 import unittest
 from unittest.mock import patch
 
-from backend.zsxq_mcp_source import _parse_event_stream, _tool_result_payload, collect_zsxq_mcp, normalize_zsxq_group_ids
+from backend.zsxq_mcp_source import (
+    _parse_event_stream,
+    _tool_result_payload,
+    collect_zsxq_mcp,
+    normalize_zsxq_group_ids,
+    normalize_zsxq_mcp_config,
+)
 
 
 class FakeResponse:
@@ -38,6 +44,11 @@ class ZsxqMcpSourceTests(unittest.TestCase):
     def test_group_ids_are_limited_to_long_term_source(self) -> None:
         self.assertEqual(normalize_zsxq_group_ids(["88882281482852", "28888222124181"]), ["28888222124181"])
         self.assertEqual(normalize_zsxq_group_ids(["88882281482852"]), ["28888222124181"])
+
+    def test_config_can_fallback_to_environment_mcp_url(self) -> None:
+        with patch.dict("os.environ", {"ALPHADESK_ZSXQ_MCP_URL": "https://mcp.example.test/topic/mcp?api_key=secret"}):
+            config = normalize_zsxq_mcp_config({})
+        self.assertEqual(config["mcp_url"], "https://mcp.example.test/topic/mcp?api_key=secret")
 
     def test_collect_pages_until_window_boundary(self) -> None:
         page_one = {

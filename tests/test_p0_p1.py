@@ -297,6 +297,99 @@ class MainBehaviorTests(unittest.TestCase):
         self.assertEqual(stored["status"], "generating_report")
         self.assertIsNone(stored["report"])
 
+    def test_agent_collect_report_requires_token_and_uses_three_cloud_sources(self) -> None:
+        request = Mock(headers={})
+        payload = self.main.AgentCollectReportInput(lookback_days=30)
+        with patch.dict("os.environ", {"ALPHADESK_AGENT_TOKEN": "agent-secret"}):
+            with self.assertRaises(self.main.HTTPException) as raised:
+                self.main.agent_collect_report(payload, request)
+            self.assertEqual(raised.exception.status_code, 401)
+
+            result = self.main.agent_collect_report(
+                payload,
+                Mock(headers={"authorization": "Bearer agent-secret"}),
+            )
+
+        self.assertEqual(result["status"], "queued")
+        self.assertEqual(result["lookback_days"], 30)
+        self.assertEqual(tuple(result["channel_ids"]), self.main.AGENT_DEFAULT_CHANNEL_IDS)
+        with self.main.db() as conn:
+            job = conn.execute("SELECT action,channel_ids,lookback_days,report_title FROM source_collection_jobs WHERE id=?", (result["job_id"],)).fetchone()
+        self.assertEqual(job["action"], "collect_report")
+        self.assertEqual(json.loads(job["channel_ids"]), list(self.main.AGENT_DEFAULT_CHANNEL_IDS))
+        self.assertEqual(job["lookback_days"], 30)
+        self.assertIn("三信源", job["report_title"])
+
+    def test_agent_report_status_and_latest_report_are_token_protected(self) -> None:
+        now = timestamp()
+        with self.main.db() as conn:
+            conn.execute(
+                """
+                INSERT INTO source_collection_jobs(
+                  id,action,channel_ids,windows,lookback_days,skill_name,report_title,status,
+                  created_at,completed_at,report,report_anchor
+                ) VALUES('agent-report','collect_report',?, '[]',30,'skill','agent report','review',?,?,?,?)
+                """,
+                (
+                    json.dumps(list(self.main.AGENT_DEFAULT_CHANNEL_IDS)),
+                    now,
+                    now,
+                    "<html><head></head><body>ok</body></html>",
+                    now,
+                ),
+            )
+            conn.execute(
+                """
+                INSERT INTO source_collection_runs(job_id,channel_id,status,completed_at,snapshot_count)
+                VALUES('agent-report','zsxq','completed',?,1)
+                """,
+                (now,),
+            )
+
+        with patch.dict("os.environ", {"ALPHADESK_AGENT_TOKEN": "agent-secret"}):
+            status = self.main.agent_job_status("agent-report", Mock(headers={"x-agent-token": "agent-secret"}))
+            latest = self.main.agent_latest_report(Mock(headers={"authorization": "Bearer agent-secret"}))
+
+        self.assertTrue(status["report_ready"])
+        self.assertIsNone(status["report"])
+        self.assertEqual(status["runs"][0]["channel_id"], "zsxq")
+        self.assertEqual(latest["id"], "agent-report")
+        self.assertIn("<html>", latest["report"])
+
+    def test_env_model_provider_is_seeded_for_cloud_bootstrap(self) -> None:
+        with self.main.db() as conn:
+            conn.execute("DELETE FROM model_providers")
+        with patch.dict(
+            "os.environ",
+            {
+                "ALPHADESK_MODEL_API_KEY": "env-model-secret",
+                "ALPHADESK_MODEL_BASE_URL": "https://gateway.example/v1",
+                "ALPHADESK_MODEL_NAME": "env-chat",
+                "ALPHADESK_MODEL_PROTOCOL": "openai_chat_completions",
+            },
+        ):
+            self.main.init_db()
+
+        provider = self.main.provider_row()
+        self.assertIsNotNone(provider)
+        self.assertEqual(provider["id"], "env-default")
+        self.assertEqual(provider["base_url"], "https://gateway.example/v1")
+        self.assertEqual(provider["model"], "env-chat")
+        self.assertTrue(provider["encrypted_api_key"])
+
+    def test_env_model_provider_infers_api_key_family_defaults(self) -> None:
+        with patch.dict("os.environ", {"OPENAI_API_KEY": "openai-secret"}, clear=True):
+            openai_config = self.main.env_model_provider_config()
+        self.assertEqual(openai_config["protocol"], "openai_chat_completions")
+        self.assertEqual(openai_config["base_url"], "https://api.openai.com/v1")
+        self.assertEqual(openai_config["model"], "gpt-4o-mini")
+
+        with patch.dict("os.environ", {"ANTHROPIC_API_KEY": "anthropic-secret"}, clear=True):
+            anthropic_config = self.main.env_model_provider_config()
+        self.assertEqual(anthropic_config["protocol"], "anthropic_messages")
+        self.assertEqual(anthropic_config["base_url"], "https://api.anthropic.com")
+        self.assertEqual(anthropic_config["model"], "claude-3-5-sonnet-latest")
+
     def test_snapshot_view_uses_bounded_preview_and_preserves_full_download(self) -> None:
         now = timestamp()
         large_content = "A" * 250_000

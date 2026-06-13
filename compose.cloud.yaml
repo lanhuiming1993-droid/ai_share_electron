@@ -1,0 +1,84 @@
+name: ${COMPOSE_PROJECT_NAME:-alphadesk-cloud}
+
+services:
+  web:
+    image: ${ALPHADESK_WEB_IMAGE:-alphadesk-cloud-web:${ALPHADESK_VERSION:-local}}
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    ports:
+      - "${ALPHADESK_HTTP_BIND:-127.0.0.1}:${ALPHADESK_PORT:-18080}:80"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1/health"]
+      interval: 20s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+
+  api:
+    image: ${ALPHADESK_API_IMAGE:-alphadesk-cloud-api:${ALPHADESK_VERSION:-local}}
+    build:
+      context: .
+      dockerfile: docker/backend-cloud.Dockerfile
+    environment:
+      ALPHADESK_DATA_DIR: /app/data
+      ALPHADESK_STARTUP_CHANNEL_CHECK: "0"
+      ALPHADESK_WERSS_MODE: compose
+      ALPHADESK_WERSS_BASE_URL: http://werss:8001
+      ALPHADESK_WERSS_USERNAME: ${WERSS_USERNAME:?Set WERSS_USERNAME in deploy/cloud.env}
+      ALPHADESK_WERSS_PASSWORD: ${WERSS_PASSWORD:?Set WERSS_PASSWORD in deploy/cloud.env}
+      ALPHADESK_AGENT_TOKEN: ${ALPHADESK_AGENT_TOKEN:?Set ALPHADESK_AGENT_TOKEN in deploy/cloud.env}
+      ALPHADESK_MODEL_PROVIDER_NAME: ${ALPHADESK_MODEL_PROVIDER_NAME:-Cloud Model}
+      ALPHADESK_MODEL_BASE_URL: ${ALPHADESK_MODEL_BASE_URL:-https://api.deepseek.com}
+      ALPHADESK_MODEL_NAME: ${ALPHADESK_MODEL_NAME:-deepseek-chat}
+      ALPHADESK_MODEL_PROTOCOL: ${ALPHADESK_MODEL_PROTOCOL:-openai_chat_completions}
+      ALPHADESK_MODEL_API_KEY: ${ALPHADESK_MODEL_API_KEY:?Set ALPHADESK_MODEL_API_KEY in deploy/cloud.env}
+      ALPHADESK_MODEL_EXTRA_BODY: ${ALPHADESK_MODEL_EXTRA_BODY:-{}}
+      ALPHADESK_ZSXQ_MCP_URL: ${ALPHADESK_ZSXQ_MCP_URL:?Set ALPHADESK_ZSXQ_MCP_URL in deploy/cloud.env}
+      ALPHADESK_ZSXQ_PAGE_LIMIT: ${ALPHADESK_ZSXQ_PAGE_LIMIT:-10}
+      ALPHADESK_ZSXQ_MAX_PAGES: ${ALPHADESK_ZSXQ_MAX_PAGES:-10}
+      ALPHADESK_IMA_CLIENT_ID: ${ALPHADESK_IMA_CLIENT_ID:?Set ALPHADESK_IMA_CLIENT_ID in deploy/cloud.env}
+      ALPHADESK_IMA_API_KEY: ${ALPHADESK_IMA_API_KEY:?Set ALPHADESK_IMA_API_KEY in deploy/cloud.env}
+      ALPHADESK_IMA_KNOWLEDGE_BASE_IDS: ${ALPHADESK_IMA_KNOWLEDGE_BASE_IDS:-}
+    expose:
+      - "8765"
+    volumes:
+      - ${ALPHADESK_DATA_ROOT:-./data}/alphadesk:/app/data
+    depends_on:
+      werss:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/health/ready', timeout=3)"]
+      interval: 20s
+      timeout: 5s
+      retries: 9
+      start_period: 20s
+    restart: unless-stopped
+
+  werss:
+    image: ${ALPHADESK_WERSS_IMAGE:-alphadesk-cloud-werss:${ALPHADESK_VERSION:-local}}
+    build:
+      context: .
+      dockerfile: docker/werss.Dockerfile
+    environment:
+      USERNAME: ${WERSS_USERNAME:?Set WERSS_USERNAME in deploy/cloud.env}
+      PASSWORD: ${WERSS_PASSWORD:?Set WERSS_PASSWORD in deploy/cloud.env}
+      SECRET_KEY: ${WERSS_SECRET_KEY:?Set WERSS_SECRET_KEY in deploy/cloud.env}
+      GATHER.CONTENT: "True"
+      GATHER.CONTENT_AUTO_CHECK: "True"
+      GATHER.CONTENT_AUTO_INTERVAL: "15"
+      RSS_FULL_CONTEXT: "True"
+    expose:
+      - "8001"
+    volumes:
+      - ${ALPHADESK_DATA_ROOT:-./data}/werss:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "-", "http://127.0.0.1:8001/feed/all.rss"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 20s
+    restart: unless-stopped

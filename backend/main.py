@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import hmac
 import importlib.util
 import os
 import re
@@ -109,6 +110,7 @@ MIN_COLLECTION_INTERVAL = timedelta(minutes=15)
 REPORT_DEDUP_INTERVAL = timedelta(minutes=2)
 MASKED_SECRET = "****************"
 BROWSER_WORKSPACE_PUBLIC_URL = os.environ.get("ALPHADESK_BROWSER_PUBLIC_URL", "").strip()
+STARTUP_CHANNEL_CHECK_ENABLED = os.environ.get("ALPHADESK_STARTUP_CHANNEL_CHECK", "1").strip().lower() not in {"0", "false", "no"}
 CHANNEL_LOGIN_PROCESSES: dict[str, subprocess.Popen] = {}
 CHANNEL_LOGIN_PROCESSES_LOCK = threading.Lock()
 MAX_MX_HAR_BYTES = 32 * 1024 * 1024
@@ -127,6 +129,7 @@ MARKET_DATA_DEFAULT_CONFIG = {
 }
 SOURCE_WEIGHT_SETTING_KEY = "source_weights"
 SOURCE_CONTEXT_BUDGET_CHARS = 120_000
+AGENT_DEFAULT_CHANNEL_IDS = ("wechat-mp-rss", "ima-knowledge", "zsxq")
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 logger = get_logger("api")
 frontend_logger = get_logger("frontend")
@@ -135,8 +138,11 @@ frontend_logger = get_logger("frontend")
 async def lifespan(_app: FastAPI):
     log_event(logger, "INFO", "application.startup.worker")
     collection_worker.start()
-    log_event(logger, "INFO", "application.startup.channel_check_scheduled")
-    threading.Thread(target=refresh_browser_channel_states, daemon=True, name="channel-state-refresh").start()
+    if STARTUP_CHANNEL_CHECK_ENABLED:
+        log_event(logger, "INFO", "application.startup.channel_check_scheduled")
+        threading.Thread(target=refresh_browser_channel_states, daemon=True, name="channel-state-refresh").start()
+    else:
+        log_event(logger, "INFO", "application.startup.channel_check_skipped")
     try:
         yield
     finally:
@@ -242,6 +248,13 @@ class SourceJobInput(BaseModel):
     parent_task_id: str = ""
     query: str = ""
     evidence_layer: str = ""
+
+
+class AgentCollectReportInput(BaseModel):
+    lookback_days: int = Field(default=30, ge=1, le=30)
+    report_title: str = Field(default="", max_length=255)
+    query: str = Field(default="", max_length=255)
+    channel_ids: list[str] = Field(default_factory=list, max_length=3)
 
 
 class SourceWeightItemInput(BaseModel):
@@ -756,6 +769,85 @@ def select_chunks_by_source_weight(
     return selected
 
 
+def env_model_provider_config() -> dict | None:
+    api_key = ""
+    key_source = ""
+    for env_name, source in (
+        ("ALPHADESK_MODEL_API_KEY", "alphadesk"),
+        ("OPENAI_API_KEY", "openai"),
+        ("DEEPSEEK_API_KEY", "deepseek"),
+        ("ANTHROPIC_API_KEY", "anthropic"),
+    ):
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            api_key = value
+            key_source = source
+            break
+    if not api_key:
+        return None
+    protocol = os.environ.get("ALPHADESK_MODEL_PROTOCOL", "").strip()
+    if not protocol:
+        protocol = "anthropic_messages" if key_source == "anthropic" else "openai_chat_completions"
+    if protocol not in {"openai_chat_completions", "openai_responses", "anthropic_messages"}:
+        protocol = "openai_chat_completions"
+    if protocol == "anthropic_messages":
+        default_base_url = "https://api.anthropic.com"
+        default_model = os.environ.get("ANTHROPIC_MODEL", "").strip() or "claude-3-5-sonnet-latest"
+    elif key_source == "openai":
+        default_base_url = "https://api.openai.com/v1"
+        default_model = os.environ.get("OPENAI_MODEL", "").strip() or "gpt-4o-mini"
+    else:
+        default_base_url = "https://api.deepseek.com"
+        default_model = os.environ.get("DEEPSEEK_MODEL", "").strip() or "deepseek-chat"
+    extra_body_text = os.environ.get("ALPHADESK_MODEL_EXTRA_BODY", "").strip()
+    try:
+        extra_body = json.loads(extra_body_text) if extra_body_text else {}
+    except json.JSONDecodeError:
+        extra_body = {}
+    return {
+        "id": "env-default",
+        "name": os.environ.get("ALPHADESK_MODEL_PROVIDER_NAME", "Cloud Model").strip() or "Cloud Model",
+        "base_url": (
+            os.environ.get("ALPHADESK_MODEL_BASE_URL", "").strip()
+            or os.environ.get("OPENAI_BASE_URL", "").strip()
+            or os.environ.get("DEEPSEEK_BASE_URL", "").strip()
+            or os.environ.get("ANTHROPIC_BASE_URL", "").strip()
+            or default_base_url
+        ).rstrip("/"),
+        "model": (
+            os.environ.get("ALPHADESK_MODEL_NAME", "").strip()
+            or os.environ.get("OPENAI_MODEL", "").strip()
+            or os.environ.get("DEEPSEEK_MODEL", "").strip()
+            or os.environ.get("ANTHROPIC_MODEL", "").strip()
+            or default_model
+        ),
+        "protocol": protocol,
+        "encrypted_api_key": cipher().encrypt(api_key.encode()).decode(),
+        "extra_body": json.dumps(extra_body, ensure_ascii=False),
+        "enabled": 1,
+        "is_default": 1,
+        "status": "untested",
+        "created_at": now(),
+        "updated_at": now(),
+    }
+
+
+def seed_env_model_provider(conn: sqlite3.Connection) -> bool:
+    config = env_model_provider_config()
+    if not config:
+        return False
+    conn.execute(
+        """
+        INSERT INTO model_providers(
+          id,name,base_url,model,protocol,encrypted_api_key,extra_body,enabled,is_default,status,created_at,updated_at
+        ) VALUES(:id,:name,:base_url,:model,:protocol,:encrypted_api_key,:extra_body,:enabled,:is_default,:status,:created_at,:updated_at)
+        ON CONFLICT(id) DO NOTHING
+        """,
+        config,
+    )
+    return True
+
+
 def init_db() -> None:
     with db() as conn:
         conn.executescript(
@@ -1236,7 +1328,8 @@ def init_db() -> None:
         )
         provider_count = conn.execute("SELECT COUNT(*) AS count FROM model_providers").fetchone()["count"]
         legacy_provider = conn.execute("SELECT value FROM settings WHERE key='provider'").fetchone()
-        if not provider_count and legacy_provider:
+        seeded_env_provider = False if provider_count else seed_env_model_provider(conn)
+        if not provider_count and not seeded_env_provider and legacy_provider:
             legacy = json.loads(legacy_provider["value"])
             conn.execute(
                 """
@@ -4059,6 +4152,112 @@ def source_job_report(job_id: str) -> dict:
     if not job["report"]:
         raise HTTPException(409, "该任务尚未生成 HTML 报告")
     return dict(job)
+
+
+def configured_agent_token() -> str:
+    return os.environ.get("ALPHADESK_AGENT_TOKEN", "").strip() or os.environ.get("HERMES_AGENT_TOKEN", "").strip()
+
+
+def require_agent_access(request: Request) -> None:
+    expected = configured_agent_token()
+    if not expected:
+        raise HTTPException(409, "Agent API token is not configured")
+    authorization = request.headers.get("authorization", "")
+    supplied = ""
+    if authorization.lower().startswith("bearer "):
+        supplied = authorization[7:].strip()
+    if not supplied:
+        supplied = request.headers.get("x-agent-token", "").strip()
+    if not supplied or not hmac.compare_digest(supplied, expected):
+        raise HTTPException(401, "Invalid agent API token")
+
+
+def agent_channel_ids(requested: list[str] | None = None) -> list[str]:
+    allowed = set(AGENT_DEFAULT_CHANNEL_IDS)
+    values = requested or list(AGENT_DEFAULT_CHANNEL_IDS)
+    channel_ids = [str(value).strip() for value in values if str(value).strip()]
+    if not channel_ids:
+        channel_ids = list(AGENT_DEFAULT_CHANNEL_IDS)
+    unexpected = sorted(set(channel_ids) - allowed)
+    if unexpected:
+        raise HTTPException(400, f"Agent API only supports channels: {', '.join(AGENT_DEFAULT_CHANNEL_IDS)}")
+    return list(dict.fromkeys(channel_ids))
+
+
+def source_job_with_runs(job_id: str) -> dict:
+    with db() as conn:
+        job = conn.execute("SELECT * FROM source_collection_jobs WHERE id=?", (job_id,)).fetchone()
+        if not job:
+            raise HTTPException(404, "Source job not found")
+        runs = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM source_collection_runs WHERE job_id=? ORDER BY started_at,channel_id",
+                (job_id,),
+            )
+        ]
+    response = source_job_response(dict(job))
+    response["runs"] = runs
+    response["report_ready"] = bool(response.get("report"))
+    response["report"] = None
+    if response["report_ready"]:
+        response["report_url"] = f"/api/agent/jobs/{job_id}/report"
+    return response
+
+
+@app.post("/api/agent/collect-report")
+def agent_collect_report(payload: AgentCollectReportInput, request: Request) -> dict:
+    require_agent_access(request)
+    channel_ids = agent_channel_ids(payload.channel_ids)
+    report_title = payload.report_title.strip() or f"近 {payload.lookback_days} 天三信源聚合报告"
+    job = create_source_job(
+        SourceJobInput(
+            action="collect_report",
+            channel_ids=channel_ids,
+            lookback_days=payload.lookback_days,
+            report_title=report_title,
+            skill_name="a-share-growth-hunter",
+            query=payload.query,
+        )
+    )
+    return {
+        "status": job["status"],
+        "job_id": job["id"],
+        "lookback_days": payload.lookback_days,
+        "channel_ids": channel_ids,
+        "poll_url": f"/api/agent/jobs/{job['id']}",
+        "report_url": f"/api/agent/jobs/{job['id']}/report",
+        "deduplicated": bool(job.get("deduplicated")),
+    }
+
+
+@app.get("/api/agent/jobs/{job_id}")
+def agent_job_status(job_id: str, request: Request) -> dict:
+    require_agent_access(request)
+    return source_job_with_runs(job_id)
+
+
+@app.get("/api/agent/jobs/{job_id}/report")
+def agent_job_report(job_id: str, request: Request) -> dict:
+    require_agent_access(request)
+    return source_job_report(job_id)
+
+
+@app.get("/api/agent/reports/latest")
+def agent_latest_report(request: Request) -> dict:
+    require_agent_access(request)
+    with db() as conn:
+        row = conn.execute(
+            """
+            SELECT id FROM source_collection_jobs
+            WHERE action IN ('collect_report','report') AND report IS NOT NULL
+            ORDER BY completed_at DESC,created_at DESC
+            LIMIT 1
+            """
+        ).fetchone()
+    if not row:
+        raise HTTPException(404, "No report has been generated yet")
+    return source_job_report(row["id"])
 
 
 @app.get("/api/source-jobs/{job_id}/snapshots")
