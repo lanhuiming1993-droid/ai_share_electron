@@ -1,0 +1,6 @@
+name: alphadesk-command
+version: "0.1.0"
+description: Direct gateway command for AlphaDesk cloud source reports.
+author: AlphaDesk
+provides_hooks:
+  - pre_gateway_dispatch

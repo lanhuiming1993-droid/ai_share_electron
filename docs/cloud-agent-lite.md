@@ -125,6 +125,20 @@ chmod +x ~/.hermes/skills/alphadesk-cloud-report/scripts/collect_report.py
 python3 ~/.hermes/skills/alphadesk-cloud-report/scripts/collect_report.py --check
 ```
 
+For the fixed phone command, install the optional gateway plugin too:
+
+```bash
+rm -rf ~/.hermes/plugins/alphadesk-command
+mkdir -p ~/.hermes/plugins
+cp -r deploy/hermes/plugins/alphadesk-command ~/.hermes/plugins/
+```
+
+Enable `alphadesk-command` in `~/.hermes/config.yaml` under `plugins.enabled`,
+then restart the Hermes gateway. The plugin rewrites the exact Weixin or
+Lightclawbot message `采集近30天数据并生成报告` into
+`/alphadesk-report --days 30`, which calls the same local report script before
+the normal LLM path.
+
 ## Weixin End-to-End Verification
 
 After the user sends the Weixin command:
