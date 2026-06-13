@@ -108,6 +108,23 @@ When the user says "采集近30天数据并生成报告":
 If the job status is `failed` or `report_failed`, return the job `error` and
 ask the user to check source credentials or WeRSS login state.
 
+## Hermes Skill
+
+This repository also includes a Hermes skill template:
+
+```text
+deploy/hermes/alphadesk-cloud-report
+```
+
+Install it on the Hermes host with:
+
+```bash
+rm -rf ~/.hermes/skills/alphadesk-cloud-report
+cp -r deploy/hermes/alphadesk-cloud-report ~/.hermes/skills/
+chmod +x ~/.hermes/skills/alphadesk-cloud-report/scripts/collect_report.py
+python3 ~/.hermes/skills/alphadesk-cloud-report/scripts/collect_report.py --check
+```
+
 ## WeRSS Login
 
 WeRSS still needs WeChat authorization. Use the existing web UI through a local
