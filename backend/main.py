@@ -248,6 +248,7 @@ class SourceJobInput(BaseModel):
     parent_task_id: str = ""
     query: str = ""
     evidence_layer: str = ""
+    force_refresh: bool = False
 
 
 class AgentCollectReportInput(BaseModel):
@@ -255,6 +256,7 @@ class AgentCollectReportInput(BaseModel):
     report_title: str = Field(default="", max_length=255)
     query: str = Field(default="", max_length=255)
     channel_ids: list[str] = Field(default_factory=list, max_length=3)
+    force_refresh: bool = True
 
 
 class SourceWeightItemInput(BaseModel):
@@ -3955,7 +3957,7 @@ def create_source_job(payload: SourceJobInput) -> dict:
                 channel = channels.get(channel_id)
                 if not channel:
                     raise HTTPException(404, f"信源不存在: {channel_id}")
-                bypass_watermark = should_bypass_collection_watermark(channel["collection_mode"], scope_key)
+                bypass_watermark = payload.force_refresh or should_bypass_collection_watermark(channel["collection_mode"], scope_key)
                 reserved = None if bypass_watermark else latest_reserved_at(conn, channel_id, scope_key)
                 if not bypass_watermark and reserved and current - reserved < MIN_COLLECTION_INTERVAL:
                     continue
@@ -4218,6 +4220,7 @@ def agent_collect_report(payload: AgentCollectReportInput, request: Request) -> 
             report_title=report_title,
             skill_name="a-share-growth-hunter",
             query=payload.query,
+            force_refresh=payload.force_refresh,
         )
     )
     return {

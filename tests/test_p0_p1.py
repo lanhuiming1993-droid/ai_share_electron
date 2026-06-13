@@ -300,6 +300,12 @@ class MainBehaviorTests(unittest.TestCase):
     def test_agent_collect_report_requires_token_and_uses_three_cloud_sources(self) -> None:
         request = Mock(headers={})
         payload = self.main.AgentCollectReportInput(lookback_days=30)
+        with self.main.db() as conn:
+            for channel_id in self.main.AGENT_DEFAULT_CHANNEL_IDS:
+                conn.execute(
+                    "INSERT OR REPLACE INTO source_collection_watermarks_v2(channel_id,scope_key,last_success_at) VALUES(?,?,?)",
+                    (channel_id, "", timestamp()),
+                )
         with patch.dict("os.environ", {"ALPHADESK_AGENT_TOKEN": "agent-secret"}):
             with self.assertRaises(self.main.HTTPException) as raised:
                 self.main.agent_collect_report(payload, request)
@@ -314,10 +320,11 @@ class MainBehaviorTests(unittest.TestCase):
         self.assertEqual(result["lookback_days"], 30)
         self.assertEqual(tuple(result["channel_ids"]), self.main.AGENT_DEFAULT_CHANNEL_IDS)
         with self.main.db() as conn:
-            job = conn.execute("SELECT action,channel_ids,lookback_days,report_title FROM source_collection_jobs WHERE id=?", (result["job_id"],)).fetchone()
+            job = conn.execute("SELECT action,channel_ids,windows,lookback_days,report_title FROM source_collection_jobs WHERE id=?", (result["job_id"],)).fetchone()
         self.assertEqual(job["action"], "collect_report")
         self.assertEqual(json.loads(job["channel_ids"]), list(self.main.AGENT_DEFAULT_CHANNEL_IDS))
         self.assertEqual(job["lookback_days"], 30)
+        self.assertEqual(len(json.loads(job["windows"])), 3)
         self.assertIn("三信源", job["report_title"])
 
     def test_agent_report_status_and_latest_report_are_token_protected(self) -> None:

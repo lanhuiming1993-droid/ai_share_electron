@@ -71,7 +71,7 @@ def main() -> int:
         print(json.dumps({"ready": ready.get("status"), "service": ready.get("service"), "version": ready.get("version")}, ensure_ascii=False))
         return 0
 
-    job = request_json("POST", args.base_url, "/api/agent/collect-report", token, {"lookback_days": args.days})
+    job = request_json("POST", args.base_url, "/api/agent/collect-report", token, {"lookback_days": args.days, "force_refresh": True})
     job_id = job["job_id"]
     print(json.dumps({"event": "queued", "job_id": job_id, "channel_ids": job.get("channel_ids")}, ensure_ascii=False))
 
