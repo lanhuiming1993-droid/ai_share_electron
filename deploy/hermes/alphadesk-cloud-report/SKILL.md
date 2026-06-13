@@ -3,7 +3,7 @@ name: alphadesk-cloud-report
 description: "AlphaDesk 三信源聚合报告生成器。Triggers: 采集近30天数据并生成报告, 生成信源报告, 三信源聚合报告, WeRSS 知识星球 IMA 报告。"
 user-invocable: true
 argument-hint: "[近N天，1-30，默认30]"
-metadata: {"clawdbot":{"requires":{"bins":["python3"]},"os":["linux"],"files":["scripts/collect_report.py"]}}
+metadata: {"clawdbot":{"requires":{"bins":["python3"]},"os":["linux"],"files":["scripts/collect_report.py","scripts/verify_weixin_goal.py"]}}
 ---
 
 # AlphaDesk Cloud Report

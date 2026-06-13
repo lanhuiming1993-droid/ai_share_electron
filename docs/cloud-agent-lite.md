@@ -125,6 +125,32 @@ chmod +x ~/.hermes/skills/alphadesk-cloud-report/scripts/collect_report.py
 python3 ~/.hermes/skills/alphadesk-cloud-report/scripts/collect_report.py --check
 ```
 
+## Weixin End-to-End Verification
+
+After the user sends the Weixin command:
+
+```text
+采集近30天数据并生成报告
+```
+
+run the verifier on the Hermes host:
+
+```bash
+python3 ~/.hermes/skills/alphadesk-cloud-report/scripts/verify_weixin_goal.py \
+  --check-sources \
+  --watch-seconds 900 \
+  --interval 15
+```
+
+The verifier exits `0` only when all of these are true:
+
+- Hermes gateway has a `weixin` platform state.
+- Hermes `state.db` contains a Weixin user message matching the command.
+- AlphaDesk has a newer `collect_report` job for the 30-day window.
+- The matched job has a ready report and run records for WeRSS, IMA, and ZSXQ.
+
+It does not print API keys, bot tokens, or secret values.
+
 ## WeRSS Login
 
 WeRSS still needs WeChat authorization. Use the existing web UI through a local
