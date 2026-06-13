@@ -147,8 +147,18 @@ def read_weixin_directory(hermes_home: Path) -> dict[str, Any]:
     }
 
 
-def find_weixin_command(
+def parse_sources(value: str) -> list[str]:
+    sources = [item.strip() for item in value.split(",") if item.strip()]
+    return sources or ["weixin"]
+
+
+def sql_placeholders(values: list[str]) -> str:
+    return ",".join("?" for _ in values)
+
+
+def find_platform_command(
     hermes_home: Path,
+    sources: list[str],
     command: str,
     min_message_id: int,
     min_timestamp: float,
@@ -159,12 +169,13 @@ def find_weixin_command(
     conn = sqlite3.connect(str(state_db))
     conn.row_factory = sqlite3.Row
     try:
+        source_marks = sql_placeholders(sources)
         row = conn.execute(
-            """
+            f"""
             SELECT m.id,m.session_id,s.source,m.role,m.content,m.timestamp
             FROM messages m
             LEFT JOIN sessions s ON s.id=m.session_id
-            WHERE s.source='weixin'
+            WHERE s.source IN ({source_marks})
               AND m.role='user'
               AND m.id>?
               AND m.timestamp>=?
@@ -172,13 +183,14 @@ def find_weixin_command(
             ORDER BY m.id DESC
             LIMIT 1
             """,
-            (min_message_id, min_timestamp, f"%{command}%"),
+            (*sources, min_message_id, min_timestamp, f"%{command}%"),
         ).fetchone()
         if not row:
             return None
         return {
             "id": row["id"],
             "session_id": row["session_id"],
+            "source": row["source"],
             "timestamp": row["timestamp"],
             "timestamp_iso": iso_from_epoch(row["timestamp"]),
             "content_preview": str(row["content"] or "")[:80],
@@ -187,28 +199,30 @@ def find_weixin_command(
         conn.close()
 
 
-def latest_weixin_messages(hermes_home: Path, limit: int = 5) -> list[dict[str, Any]]:
+def latest_platform_messages(hermes_home: Path, sources: list[str], limit: int = 5) -> list[dict[str, Any]]:
     state_db = hermes_home / "state.db"
     if not state_db.exists():
         return []
     conn = sqlite3.connect(str(state_db))
     conn.row_factory = sqlite3.Row
     try:
+        source_marks = sql_placeholders(sources)
         rows = conn.execute(
-            """
+            f"""
             SELECT m.id,m.session_id,s.source,m.role,substr(m.content,1,120) AS content,m.timestamp
             FROM messages m
             LEFT JOIN sessions s ON s.id=m.session_id
-            WHERE s.source='weixin'
+            WHERE s.source IN ({source_marks})
             ORDER BY m.id DESC
             LIMIT ?
             """,
-            (limit,),
+            (*sources, limit),
         ).fetchall()
         return [
             {
                 "id": row["id"],
                 "session_id": row["session_id"],
+                "source": row["source"],
                 "role": row["role"],
                 "content_preview": row["content"],
                 "timestamp_iso": iso_from_epoch(row["timestamp"]),
@@ -271,8 +285,10 @@ def find_report_job(workbench_db: Path, command_seen_at: float) -> dict[str, Any
 def verify_once(args: argparse.Namespace) -> tuple[bool, dict[str, Any]]:
     env = parse_env(args.env_file)
     workbench_db = resolve_workbench_db(env, args.workbench_db)
-    command = find_weixin_command(
+    sources = parse_sources(args.sources)
+    command = find_platform_command(
         args.hermes_home,
+        sources,
         args.command,
         args.since_message_id,
         parse_iso(args.since_iso) if args.since_iso else 0.0,
@@ -295,8 +311,9 @@ def verify_once(args: argparse.Namespace) -> tuple[bool, dict[str, Any]]:
         "command": args.command,
         "gateway": read_gateway_state(args.hermes_home),
         "weixin_directory": read_weixin_directory(args.hermes_home),
-        "matched_weixin_command": command,
-        "latest_weixin_messages": latest_weixin_messages(args.hermes_home),
+        "sources": sources,
+        "matched_platform_command": command,
+        "latest_platform_messages": latest_platform_messages(args.hermes_home, sources),
         "source_status": source_status,
         "workbench_db": str(workbench_db) if workbench_db else "",
         "matched_report_job": job,
@@ -311,6 +328,7 @@ def main() -> int:
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
     parser.add_argument("--hermes-home", type=Path, default=DEFAULT_HERMES_HOME)
     parser.add_argument("--workbench-db", type=Path)
+    parser.add_argument("--sources", default="weixin", help="comma-separated Hermes session sources to inspect")
     parser.add_argument("--since-message-id", type=int, default=0)
     parser.add_argument("--since-iso", default="")
     parser.add_argument("--watch-seconds", type=int, default=0)

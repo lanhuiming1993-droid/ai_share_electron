@@ -142,10 +142,22 @@ python3 ~/.hermes/skills/alphadesk-cloud-report/scripts/verify_weixin_goal.py \
   --interval 15
 ```
 
+If the phone-side Hermes entrypoint may be Tencent LightAI / Lightclaw rather
+than the native Weixin adapter, include both Hermes session sources:
+
+```bash
+python3 ~/.hermes/skills/alphadesk-cloud-report/scripts/verify_weixin_goal.py \
+  --sources weixin,lightclawbot \
+  --check-sources \
+  --watch-seconds 900 \
+  --interval 15
+```
+
 The verifier exits `0` only when all of these are true:
 
 - Hermes gateway has a `weixin` platform state.
-- Hermes `state.db` contains a Weixin user message matching the command.
+- Hermes `state.db` contains a user message matching the command from the
+  configured source list.
 - AlphaDesk has a newer `collect_report` job for the 30-day window.
 - The matched job has a ready report and run records for WeRSS, IMA, and ZSXQ.
 
