@@ -44,7 +44,7 @@ TEXT_MEDIA_TYPES = {"7", "13"}
 
 def read_user_config(name: str) -> str:
     try:
-        return (Path.home() / ".config" / "ima" / name).read_text(encoding="utf-8").strip()
+        return (Path.home() / ".config" / "ima" / name).read_text(encoding="utf-8-sig").strip().lstrip("\ufeff")
     except OSError:
         return ""
 

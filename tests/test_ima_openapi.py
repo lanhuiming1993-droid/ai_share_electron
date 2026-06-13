@@ -1,15 +1,25 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import unittest
 import zipfile
 from io import BytesIO
+from pathlib import Path
 from unittest.mock import patch
 
 from backend import ima_openapi
 
 
 class ImaOpenApiTests(unittest.TestCase):
+    def test_user_config_reader_strips_utf8_bom_for_header_safe_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_dir = Path(temp_dir) / ".config" / "ima"
+            config_dir.mkdir(parents=True)
+            (config_dir / "client_id").write_bytes(b"\xef\xbb\xbfcid-from-skill\n")
+            with patch.object(Path, "home", return_value=Path(temp_dir)):
+                self.assertEqual(ima_openapi.read_user_config("client_id"), "cid-from-skill")
+
     def test_browse_ima_knowledge_list_recurses_media_type_99_folders(self) -> None:
         def fake_request(api_path: str, body: dict, timeout: int | None = None, config: dict | None = None) -> dict:
             self.assertEqual(api_path, "openapi/wiki/v1/get_knowledge_list")
