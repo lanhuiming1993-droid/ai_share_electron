@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -19,6 +20,16 @@ DEFAULT_BASE_URL = "http://127.0.0.1:18080"
 DEFAULT_ENV_FILE = Path("/opt/alphadesk/deploy/cloud.env")
 DEFAULT_HERMES_HOME = Path.home() / ".hermes"
 AGENT_CHANNEL_IDS = ("wechat-mp-rss", "ima-knowledge", "zsxq")
+GATEWAY_LOG_PATTERNS = {
+    "weixin_adapter_inbound": re.compile(r"\[Weixin\] inbound"),
+    "weixin_message": re.compile(r"inbound message: platform=weixin"),
+    "lightclawbot_message": re.compile(r"inbound message: platform=lightclawbot"),
+    "weixin_rate_limited": re.compile(r"\[Weixin\].*rate limited"),
+    "weixin_session_expired": re.compile(r"\[Weixin\].*Session expired"),
+    "weixin_getupdates_failed": re.compile(r"\[Weixin\].*getUpdates failed"),
+    "weixin_poll_error": re.compile(r"\[Weixin\].*poll error"),
+}
+LOG_TS_RE = re.compile(r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3})\s+(?P<level>[A-Z]+)\s+(?P<message>.*)$")
 
 
 def parse_env(path: Path) -> dict[str, str]:
@@ -53,6 +64,13 @@ def iso_from_epoch(value: float | int | None) -> str:
     if value is None:
         return ""
     return datetime.fromtimestamp(float(value), timezone.utc).isoformat()
+
+
+def path_mtime_iso(path: Path) -> str:
+    try:
+        return iso_from_epoch(path.stat().st_mtime)
+    except OSError:
+        return ""
 
 
 def parse_iso(value: str) -> float:
@@ -144,6 +162,83 @@ def read_weixin_directory(hermes_home: Path) -> dict[str, Any]:
             }
             for item in weixin
         ],
+    }
+
+
+def read_weixin_sync_diagnostics(hermes_home: Path, now: float | None = None) -> dict[str, Any]:
+    account_dir = hermes_home / "weixin" / "accounts"
+    if not account_dir.exists():
+        return {"exists": False, "sync_files": []}
+    now_ts = time.time() if now is None else now
+    sync_files: list[dict[str, Any]] = []
+    for path in sorted(account_dir.glob("*.sync.json")):
+        stat = path.stat()
+        sync_buf = ""
+        parse_error = ""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            sync_buf = str(data.get("get_updates_buf") or "")
+        except Exception as exc:  # noqa: BLE001 - verifier should report parse issues.
+            parse_error = str(exc)
+        item = {
+            "account_hash": sha_preview(path.name.removesuffix(".sync.json")),
+            "updated_at": iso_from_epoch(stat.st_mtime),
+            "age_seconds": max(0, int(now_ts - stat.st_mtime)),
+            "size": stat.st_size,
+            "sync_buffer_length": len(sync_buf),
+        }
+        if parse_error:
+            item["parse_error"] = parse_error[:160]
+        sync_files.append(item)
+    return {"exists": True, "sync_files": sync_files}
+
+
+def read_gateway_log_diagnostics(hermes_home: Path, max_lines: int = 2000) -> dict[str, Any]:
+    path = hermes_home / "logs" / "gateway.log"
+    if not path.exists():
+        return {"exists": False}
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    latest: dict[str, dict[str, Any]] = {}
+    for line in lines[-max_lines:]:
+        for key, pattern in GATEWAY_LOG_PATTERNS.items():
+            if not pattern.search(line):
+                continue
+            parsed = LOG_TS_RE.match(line)
+            if parsed:
+                event = {
+                    "timestamp": parsed.group("timestamp"),
+                    "level": parsed.group("level"),
+                    "message_preview": parsed.group("message")[:240],
+                }
+            else:
+                event = {"timestamp": "", "level": "", "message_preview": line[:240]}
+            latest[key] = event
+    return {
+        "exists": True,
+        "updated_at": path_mtime_iso(path),
+        "latest": latest,
+    }
+
+
+def read_alphadesk_plugin_diagnostics(hermes_home: Path) -> dict[str, Any]:
+    path = hermes_home / "plugins" / "alphadesk-command" / "plugin.yaml"
+    if not path.exists():
+        return {"exists": False}
+    details: dict[str, Any] = {"exists": True, "updated_at": path_mtime_iso(path)}
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if line.startswith("version:"):
+            details["version"] = line.split(":", 1)[1].strip().strip("\"'")
+        elif line.startswith("name:"):
+            details["name"] = line.split(":", 1)[1].strip().strip("\"'")
+    return details
+
+
+def read_ingress_diagnostics(hermes_home: Path) -> dict[str, Any]:
+    return {
+        "weixin_sync": read_weixin_sync_diagnostics(hermes_home),
+        "gateway_log": read_gateway_log_diagnostics(hermes_home),
+        "alphadesk_command_plugin": read_alphadesk_plugin_diagnostics(hermes_home),
     }
 
 
@@ -314,6 +409,7 @@ def verify_once(args: argparse.Namespace) -> tuple[bool, dict[str, Any]]:
         "sources": sources,
         "matched_platform_command": command,
         "latest_platform_messages": latest_platform_messages(args.hermes_home, sources),
+        "ingress_diagnostics": read_ingress_diagnostics(args.hermes_home),
         "source_status": source_status,
         "workbench_db": str(workbench_db) if workbench_db else "",
         "matched_report_job": job,
