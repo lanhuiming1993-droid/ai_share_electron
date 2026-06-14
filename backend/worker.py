@@ -381,7 +381,7 @@ class CollectionWorker:
                                     snapshot_id=snapshot_id,
                                 )
                 except Exception as exc:
-                    if job["action"] == "collect_report":
+                    if job["action"] in ("collect", "collect_report"):
                         cached_count = self.attach_cached_snapshots_for_window(job, window)
                     else:
                         cached_count = 0
