@@ -116,10 +116,7 @@ def _pre_gateway_dispatch(event, **_kwargs):
         return None
 
     _record_report_request(event, days=days)
-    return {
-        "action": "rewrite",
-        "text": f"/{COMMAND} --days {days} --original {getattr(event, 'text', '')}",
-    }
+    return None
 
 
 def register(ctx):

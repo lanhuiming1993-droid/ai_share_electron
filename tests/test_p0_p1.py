@@ -348,13 +348,69 @@ class MainBehaviorTests(unittest.TestCase):
         self.assertEqual(result["status"], "queued")
         self.assertEqual(result["lookback_days"], 30)
         self.assertEqual(tuple(result["channel_ids"]), self.main.AGENT_DEFAULT_CHANNEL_IDS)
+        self.assertIn("/evidence", result["evidence_url"])
         with self.main.db() as conn:
             job = conn.execute("SELECT action,channel_ids,windows,lookback_days,report_title FROM source_collection_jobs WHERE id=?", (result["job_id"],)).fetchone()
-        self.assertEqual(job["action"], "collect_report")
+        self.assertEqual(job["action"], "collect")
         self.assertEqual(json.loads(job["channel_ids"]), list(self.main.AGENT_DEFAULT_CHANNEL_IDS))
         self.assertEqual(job["lookback_days"], 30)
         self.assertEqual(len(json.loads(job["windows"])), 3)
         self.assertIn("三信源", job["report_title"])
+
+    def test_agent_evidence_endpoint_returns_collected_source_context(self) -> None:
+        now = timestamp()
+        with self.main.db() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO channels(id,name,type,url,collection_mode,status,updated_at) VALUES('wechat-mp-rss','微信公众号','rss','','wechat_rss','online',?)",
+                (now,),
+            )
+            conn.execute(
+                """
+                INSERT INTO source_collection_jobs(
+                  id,action,channel_ids,windows,lookback_days,skill_name,report_title,status,created_at,started_at,completed_at
+                ) VALUES('agent-evidence','collect','["wechat-mp-rss"]','[]',30,'skill','evidence','completed',?,?,?)
+                """,
+                (now, now, now),
+            )
+            conn.execute(
+                """
+                INSERT INTO source_collection_runs(job_id,channel_id,status,completed_at,snapshot_count)
+                VALUES('agent-evidence','wechat-mp-rss','completed',?,1)
+                """,
+                (now,),
+            )
+            conn.execute(
+                """
+                INSERT INTO source_snapshots(id,channel_id,occurred_at,collected_at,source_url,content,normalized_item_count)
+                VALUES('snap-agent','wechat-mp-rss',?,?,?,'raw content',1)
+                """,
+                (now, now, "https://mp.weixin.qq.com/s/demo"),
+            )
+            conn.execute("INSERT INTO source_job_snapshots(job_id,snapshot_id) VALUES('agent-evidence','snap-agent')")
+            conn.execute(
+                """
+                INSERT INTO normalized_source_items(
+                  id,snapshot_id,channel_id,item_key,occurred_at,author,title,content,source_url,
+                  metadata,quality_score,normalization_mode,created_at
+                ) VALUES('item-agent','snap-agent','wechat-mp-rss','item',?,'调研纪要','AI 算力','光模块与材料涨价','https://mp.weixin.qq.com/s/demo',
+                  '{"source_account":{"name":"调研纪要"}}',88,'fixed',?)
+                """,
+                (now, now),
+            )
+
+        with patch.dict("os.environ", {"ALPHADESK_AGENT_TOKEN": "agent-secret"}):
+            evidence = self.main.agent_job_evidence(
+                "agent-evidence",
+                Mock(headers={"authorization": "Bearer agent-secret"}),
+                limit_per_channel=3,
+                preview_chars=500,
+            )
+
+        self.assertEqual(evidence["job"]["action"], "collect")
+        self.assertEqual(evidence["attached_snapshot_counts"], [{"channel_id": "wechat-mp-rss", "count": 1}])
+        self.assertEqual(evidence["selected_items"][0]["kind"], "normalized")
+        self.assertEqual(evidence["selected_items"][0]["source_label"], "微信公众号：调研纪要")
+        self.assertIn("光模块", evidence["selected_items"][0]["content_preview"])
 
     def test_agent_report_status_and_latest_report_are_token_protected(self) -> None:
         now = timestamp()

@@ -130,6 +130,10 @@ MARKET_DATA_DEFAULT_CONFIG = {
 SOURCE_WEIGHT_SETTING_KEY = "source_weights"
 SOURCE_CONTEXT_BUDGET_CHARS = 120_000
 AGENT_DEFAULT_CHANNEL_IDS = ("wechat-mp-rss", "ima-knowledge", "zsxq")
+AGENT_EVIDENCE_DEFAULT_LIMIT_PER_CHANNEL = 12
+AGENT_EVIDENCE_MAX_LIMIT_PER_CHANNEL = 30
+AGENT_EVIDENCE_DEFAULT_PREVIEW_CHARS = 1_200
+AGENT_EVIDENCE_MAX_PREVIEW_CHARS = 4_000
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 logger = get_logger("api")
 frontend_logger = get_logger("frontend")
@@ -4207,6 +4211,137 @@ def source_job_with_runs(job_id: str) -> dict:
     return response
 
 
+def agent_job_evidence_response(
+    job_id: str,
+    *,
+    limit_per_channel: int = AGENT_EVIDENCE_DEFAULT_LIMIT_PER_CHANNEL,
+    preview_chars: int = AGENT_EVIDENCE_DEFAULT_PREVIEW_CHARS,
+) -> dict:
+    limit_per_channel = max(1, min(AGENT_EVIDENCE_MAX_LIMIT_PER_CHANNEL, limit_per_channel))
+    preview_chars = max(200, min(AGENT_EVIDENCE_MAX_PREVIEW_CHARS, preview_chars))
+    with db() as conn:
+        job = conn.execute("SELECT * FROM source_collection_jobs WHERE id=?", (job_id,)).fetchone()
+        if not job:
+            raise HTTPException(404, "Source job not found")
+        channel_ids = json.loads(job["channel_ids"])
+        runs = [
+            dict(row)
+            for row in conn.execute(
+                "SELECT * FROM source_collection_runs WHERE job_id=? ORDER BY started_at,channel_id",
+                (job_id,),
+            )
+        ]
+        attached_counts = {
+            row["channel_id"]: row["count"]
+            for row in conn.execute(
+                """
+                SELECT s.channel_id,COUNT(*) AS count
+                FROM source_job_snapshots js
+                JOIN source_snapshots s ON s.id=js.snapshot_id
+                WHERE js.job_id=?
+                GROUP BY s.channel_id
+                """,
+                (job_id,),
+            )
+        }
+        normalized_rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT n.id,n.snapshot_id,n.channel_id,c.name AS channel_name,n.occurred_at,n.author,n.title,
+                       substr(n.content,1,?) AS content_preview,length(n.content) AS content_length,
+                       n.source_url,n.quality_score,n.normalization_mode,n.metadata
+                FROM source_job_snapshots js
+                JOIN normalized_source_items n ON n.snapshot_id=js.snapshot_id
+                LEFT JOIN channels c ON c.id=n.channel_id
+                WHERE js.job_id=?
+                ORDER BY n.occurred_at DESC,n.created_at DESC
+                LIMIT 1000
+                """,
+                (preview_chars, job_id),
+            )
+        ]
+        snapshot_rows = [
+            dict(row)
+            for row in conn.execute(
+                """
+                SELECT s.id AS snapshot_id,s.channel_id,c.name AS channel_name,s.occurred_at,
+                       substr(s.content,1,?) AS content_preview,length(s.content) AS content_length,
+                       s.source_url,s.normalization_status,s.normalized_item_count
+                FROM source_job_snapshots js
+                JOIN source_snapshots s ON s.id=js.snapshot_id
+                LEFT JOIN channels c ON c.id=s.channel_id
+                WHERE js.job_id=?
+                ORDER BY s.occurred_at DESC,s.collected_at DESC
+                LIMIT 1000
+                """,
+                (preview_chars, job_id),
+            )
+        ]
+    selected: list[dict] = []
+    seen_by_channel = {channel_id: 0 for channel_id in channel_ids}
+    for row in normalized_rows:
+        channel_id = row["channel_id"]
+        if seen_by_channel.get(channel_id, 0) >= limit_per_channel:
+            continue
+        metadata = row.get("metadata") or "{}"
+        try:
+            metadata = json.loads(metadata) if isinstance(metadata, str) else metadata
+        except json.JSONDecodeError:
+            metadata = {}
+        selected.append(
+            {
+                "kind": "normalized",
+                "channel_id": channel_id,
+                "channel_name": row.get("channel_name") or channel_id,
+                "occurred_at": row["occurred_at"],
+                "author": row.get("author") or "",
+                "title": row.get("title") or "",
+                "content_preview": row.get("content_preview") or "",
+                "content_length": row.get("content_length") or 0,
+                "content_truncated": (row.get("content_length") or 0) > len(row.get("content_preview") or ""),
+                "source_url": row.get("source_url") or "",
+                "quality_score": row.get("quality_score") or 0,
+                "normalization_mode": row.get("normalization_mode") or "",
+                "source_label": normalized_source_label({**row, "metadata": metadata}),
+            }
+        )
+        seen_by_channel[channel_id] = seen_by_channel.get(channel_id, 0) + 1
+    for row in snapshot_rows:
+        channel_id = row["channel_id"]
+        if seen_by_channel.get(channel_id, 0) >= limit_per_channel:
+            continue
+        selected.append(
+            {
+                "kind": "snapshot",
+                "channel_id": channel_id,
+                "channel_name": row.get("channel_name") or channel_id,
+                "occurred_at": row["occurred_at"],
+                "author": "",
+                "title": "",
+                "content_preview": row.get("content_preview") or "",
+                "content_length": row.get("content_length") or 0,
+                "content_truncated": (row.get("content_length") or 0) > len(row.get("content_preview") or ""),
+                "source_url": row.get("source_url") or "",
+                "quality_score": 0,
+                "normalization_mode": row.get("normalization_status") or "",
+                "source_label": row.get("channel_name") or channel_id,
+            }
+        )
+        seen_by_channel[channel_id] = seen_by_channel.get(channel_id, 0) + 1
+    return {
+        "job": source_job_response(dict(job)),
+        "runs": runs,
+        "attached_snapshot_counts": [
+            {"channel_id": channel_id, "count": int(attached_counts.get(channel_id, 0))}
+            for channel_id in channel_ids
+        ],
+        "limit_per_channel": limit_per_channel,
+        "preview_chars": preview_chars,
+        "selected_items": selected,
+    }
+
+
 @app.post("/api/agent/collect-report")
 def agent_collect_report(payload: AgentCollectReportInput, request: Request) -> dict:
     require_agent_access(request)
@@ -4214,7 +4349,7 @@ def agent_collect_report(payload: AgentCollectReportInput, request: Request) -> 
     report_title = payload.report_title.strip() or f"近 {payload.lookback_days} 天三信源聚合报告"
     job = create_source_job(
         SourceJobInput(
-            action="collect_report",
+            action="collect",
             channel_ids=channel_ids,
             lookback_days=payload.lookback_days,
             report_title=report_title,
@@ -4229,7 +4364,7 @@ def agent_collect_report(payload: AgentCollectReportInput, request: Request) -> 
         "lookback_days": payload.lookback_days,
         "channel_ids": channel_ids,
         "poll_url": f"/api/agent/jobs/{job['id']}",
-        "report_url": f"/api/agent/jobs/{job['id']}/report",
+        "evidence_url": f"/api/agent/jobs/{job['id']}/evidence",
         "deduplicated": bool(job.get("deduplicated")),
     }
 
@@ -4244,6 +4379,17 @@ def agent_job_status(job_id: str, request: Request) -> dict:
 def agent_job_report(job_id: str, request: Request) -> dict:
     require_agent_access(request)
     return source_job_report(job_id)
+
+
+@app.get("/api/agent/jobs/{job_id}/evidence")
+def agent_job_evidence(
+    job_id: str,
+    request: Request,
+    limit_per_channel: int = AGENT_EVIDENCE_DEFAULT_LIMIT_PER_CHANNEL,
+    preview_chars: int = AGENT_EVIDENCE_DEFAULT_PREVIEW_CHARS,
+) -> dict:
+    require_agent_access(request)
+    return agent_job_evidence_response(job_id, limit_per_channel=limit_per_channel, preview_chars=preview_chars)
 
 
 @app.get("/api/agent/reports/latest")

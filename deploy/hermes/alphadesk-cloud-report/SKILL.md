@@ -8,7 +8,7 @@ metadata: {"clawdbot":{"requires":{"bins":["python3"]},"os":["linux"],"files":["
 
 # AlphaDesk Cloud Report
 
-当用户要求“采集近N天数据并生成报告”时，使用服务器本机 AlphaDesk Agent API 创建采集报告任务。
+当用户要求“采集近N天数据并生成报告”时，你是行业分析师。先使用服务器本机 AlphaDesk Agent API 创建三信源采集任务并取得证据包，然后由你基于证据生成中文分析报告。
 
 ## Run
 
@@ -18,11 +18,13 @@ python3 {baseDir}/scripts/collect_report.py --days 30
 
 如果用户指定天数，将 `--days` 改成 1 到 30 之间的数字。
 
-默认输出面向微信等聊天入口，会返回任务摘要、逐信源状态和截断后的纯文本报告预览，避免长 HTML 消息触发平台限流。需要完整 HTML 时使用：
+脚本输出的是证据包，不是最终报告。拿到脚本输出后：
 
-```bash
-python3 {baseDir}/scripts/collect_report.py --days 30 --full-report
-```
+- 以行业分析师身份生成中文报告。
+- 先给核心结论，再按主题、产业链或投资线索拆分。
+- 明确信息来自 WeRSS、IMA 知识库或知识星球。
+- 如果 IMA 使用 cached evidence，要如实说明为缓存兜底。
+- 不要声称后端已经生成报告；报告由你在当前 Hermes 回合中生成。
 
 ## Behavior
 
@@ -30,8 +32,9 @@ python3 {baseDir}/scripts/collect_report.py --days 30 --full-report
 
 1. 从 `/opt/alphadesk/deploy/cloud.env` 读取 `ALPHADESK_AGENT_TOKEN`。
 2. POST `http://127.0.0.1:18080/api/agent/collect-report`。
-3. 轮询任务状态，报告生成后拉取 HTML 报告。
-4. 默认输出任务摘要、逐信源状态和报告预览；`--full-report` 输出完整 HTML。
+3. 轮询采集任务状态，直到 WeRSS、IMA 知识库、知识星球采集完成或部分完成。
+4. 拉取 `/api/agent/jobs/{job_id}/evidence` 证据包。
+5. 输出任务摘要、逐信源状态、快照覆盖和精选证据，供你生成报告。
 
 ## Notes
 

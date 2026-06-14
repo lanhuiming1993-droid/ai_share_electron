@@ -138,7 +138,7 @@ class VerifyWeixinGoalDiagnosticsTests(unittest.TestCase):
         self.assertFalse(result["_cache"]["hit"])
         self.assertEqual(result["ima-knowledge"]["status"], "online")
 
-    def test_audited_gateway_command_can_complete_goal_without_state_message(self) -> None:
+    def test_audited_gateway_command_can_complete_goal_with_collect_job_and_response(self) -> None:
         command_ts = self.verify.parse_iso("2026-06-14T05:00:04+00:00")
         audit_path = self.hermes_home / self.verify.ALPHADESK_COMMAND_AUDIT_FILE
         audit_path.write_text(
@@ -174,12 +174,18 @@ class VerifyWeixinGoalDiagnosticsTests(unittest.TestCase):
                   started_at TEXT NOT NULL DEFAULT '', completed_at TEXT NOT NULL DEFAULT '',
                   error TEXT NOT NULL DEFAULT ''
                 );
+                CREATE TABLE source_snapshots (
+                  id TEXT PRIMARY KEY, channel_id TEXT NOT NULL
+                );
+                CREATE TABLE source_job_snapshots (
+                  job_id TEXT NOT NULL, snapshot_id TEXT NOT NULL
+                );
                 """
             )
             conn.execute(
                 """
                 INSERT INTO source_collection_jobs(id,action,status,lookback_days,created_at,report)
-                VALUES('job','collect_report','review',30,'2026-06-14T05:00:05+00:00','<html></html>')
+                VALUES('job','collect','partial_completed',30,'2026-06-14T05:00:05+00:00',NULL)
                 """
             )
             conn.executemany(
@@ -190,9 +196,38 @@ class VerifyWeixinGoalDiagnosticsTests(unittest.TestCase):
                     ("zsxq", "deduplicated"),
                 ],
             )
+            conn.executemany(
+                "INSERT INTO source_snapshots(id,channel_id) VALUES(?,?)",
+                [
+                    ("snap-werss", "wechat-mp-rss"),
+                    ("snap-ima", "ima-knowledge"),
+                    ("snap-zsxq", "zsxq"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO source_job_snapshots(job_id,snapshot_id) VALUES('job',?)",
+                [("snap-werss",), ("snap-ima",), ("snap-zsxq",)],
+            )
             conn.commit()
         finally:
             conn.close()
+        state_db = self.hermes_home / "state.db"
+        state = sqlite3.connect(state_db)
+        try:
+            state.executescript(
+                """
+                CREATE TABLE sessions(id TEXT PRIMARY KEY, source TEXT NOT NULL);
+                CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, timestamp REAL);
+                """
+            )
+            state.execute("INSERT INTO sessions(id,source) VALUES('s','weixin')")
+            state.execute(
+                "INSERT INTO messages(id,session_id,role,content,timestamp) VALUES(1,'s','assistant',?,?)",
+                ("近30天三信源报告：AI 算力、材料涨价与知识星球线索已经完成综合分析。" * 2, command_ts + 60),
+            )
+            state.commit()
+        finally:
+            state.close()
         args = SimpleNamespace(
             env_file=self.hermes_home / "cloud.env",
             workbench_db=workbench_db,
@@ -213,6 +248,8 @@ class VerifyWeixinGoalDiagnosticsTests(unittest.TestCase):
         self.assertTrue(complete)
         self.assertEqual(summary["matched_platform_command"]["evidence"], "alphadesk_command_audit")
         self.assertEqual(summary["matched_report_job"]["id"], "job")
+        self.assertEqual(summary["matched_report_job"]["action"], "collect")
+        self.assertIsNotNone(summary["matched_platform_response"])
         audit_diagnostics = summary["ingress_diagnostics"]["alphadesk_command_audit"]
         self.assertTrue(audit_diagnostics["exists"])
         self.assertNotIn("chat-secret", json.dumps(audit_diagnostics, ensure_ascii=False))

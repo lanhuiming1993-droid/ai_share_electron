@@ -22,6 +22,8 @@ DEFAULT_HERMES_HOME = Path.home() / ".hermes"
 DEFAULT_SOURCE_STATUS_CACHE = Path(os.environ.get("ALPHADESK_SOURCE_STATUS_CACHE", "/tmp/alphadesk-source-status-cache.json"))
 AGENT_CHANNEL_IDS = ("wechat-mp-rss", "ima-knowledge", "zsxq")
 ALPHADESK_COMMAND_AUDIT_FILE = "alphadesk-command.audit.jsonl"
+AGENT_COLLECTION_READY_STATUSES = {"completed", "deduplicated", "partial_completed"}
+LEGACY_REPORT_READY_STATUSES = {"review", "partial_review"}
 GATEWAY_LOG_PATTERNS = {
     "weixin_adapter_inbound": re.compile(r"\[Weixin\] inbound"),
     "weixin_message": re.compile(r"inbound message: platform=weixin"),
@@ -417,6 +419,51 @@ def latest_platform_messages(hermes_home: Path, sources: list[str], limit: int =
         conn.close()
 
 
+def find_platform_response(
+    hermes_home: Path,
+    sources: list[str],
+    command: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not command:
+        return None
+    state_db = hermes_home / "state.db"
+    if not state_db.exists():
+        return None
+    since_ts = float(command.get("timestamp") or 0)
+    conn = sqlite3.connect(str(state_db))
+    conn.row_factory = sqlite3.Row
+    try:
+        source_marks = sql_placeholders(sources)
+        rows = conn.execute(
+            f"""
+            SELECT m.id,m.session_id,s.source,m.role,m.content,m.timestamp
+            FROM messages m
+            LEFT JOIN sessions s ON s.id=m.session_id
+            WHERE s.source IN ({source_marks})
+              AND m.role='assistant'
+              AND m.timestamp>=?
+              AND length(trim(coalesce(m.content,'')))>=40
+            ORDER BY m.id DESC
+            LIMIT 5
+            """,
+            (*sources, since_ts),
+        ).fetchall()
+        for row in rows:
+            content = str(row["content"] or "")
+            return {
+                "id": row["id"],
+                "session_id": row["session_id"],
+                "source": row["source"],
+                "timestamp": row["timestamp"],
+                "timestamp_iso": iso_from_epoch(row["timestamp"]),
+                "content_chars": len(content),
+                "content_preview": content[:160],
+            }
+        return None
+    finally:
+        conn.close()
+
+
 def collect_source_status(base_url: str) -> dict[str, dict[str, Any]]:
     statuses: dict[str, dict[str, Any]] = {}
     for channel_id in AGENT_CHANNEL_IDS:
@@ -480,7 +527,7 @@ def find_report_job(workbench_db: Path, command_seen_at: float) -> dict[str, Any
             SELECT id,action,status,lookback_days,snapshot_count,created_at,started_at,completed_at,
                    report IS NOT NULL AS report_ready
             FROM source_collection_jobs
-            WHERE action='collect_report' AND lookback_days=30
+            WHERE action IN ('collect','collect_report') AND lookback_days=30
             ORDER BY created_at DESC
             LIMIT 10
             """
@@ -502,7 +549,24 @@ def find_report_job(workbench_db: Path, command_seen_at: float) -> dict[str, Any
                     (row["id"],),
                 ).fetchall()
             ]
-            return {**dict(row), "runs": runs}
+            try:
+                attached_snapshot_counts = [
+                    dict(count)
+                    for count in conn.execute(
+                        """
+                        SELECT s.channel_id,COUNT(*) AS count
+                        FROM source_job_snapshots js
+                        JOIN source_snapshots s ON s.id=js.snapshot_id
+                        WHERE js.job_id=?
+                        GROUP BY s.channel_id
+                        ORDER BY s.channel_id
+                        """,
+                        (row["id"],),
+                    ).fetchall()
+                ]
+            except sqlite3.OperationalError:
+                attached_snapshot_counts = []
+            return {**dict(row), "runs": runs, "attached_snapshot_counts": attached_snapshot_counts}
         return None
     finally:
         conn.close()
@@ -532,14 +596,27 @@ def verify_once(args: argparse.Namespace) -> tuple[bool, dict[str, Any]]:
     job = None
     if command and workbench_db:
         job = find_report_job(workbench_db, float(command["timestamp"]))
+    response = find_platform_response(args.hermes_home, sources, command)
     required_run_ids = set(AGENT_CHANNEL_IDS)
     actual_run_ids = {run.get("channel_id") for run in (job or {}).get("runs", [])}
+    attached_run_ids = {
+        count.get("channel_id")
+        for count in (job or {}).get("attached_snapshot_counts", [])
+        if int(count.get("count") or 0) > 0
+    }
+    job_ready = False
+    if job:
+        if job.get("action") == "collect":
+            job_ready = job.get("status") in AGENT_COLLECTION_READY_STATUSES
+        else:
+            job_ready = bool(job.get("report_ready")) and job.get("status") in LEGACY_REPORT_READY_STATUSES
     complete = bool(
         command
         and job
-        and job.get("report_ready")
-        and job.get("status") == "review"
+        and job_ready
         and required_run_ids.issubset(actual_run_ids)
+        and required_run_ids.issubset(attached_run_ids)
+        and response
     )
     summary = {
         "complete": complete,
@@ -553,6 +630,7 @@ def verify_once(args: argparse.Namespace) -> tuple[bool, dict[str, Any]]:
         "source_status": source_status,
         "workbench_db": str(workbench_db) if workbench_db else "",
         "matched_report_job": job,
+        "matched_platform_response": response,
     }
     return complete, summary
 

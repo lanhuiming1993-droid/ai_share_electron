@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-from html.parser import HTMLParser
 import json
 import re
 import time
@@ -12,35 +11,9 @@ from pathlib import Path
 
 DEFAULT_BASE_URL = "http://127.0.0.1:18080"
 DEFAULT_ENV_FILE = Path("/opt/alphadesk/deploy/cloud.env")
-DEFAULT_MAX_REPORT_CHARS = 3500
-TERMINAL_FAILURES = {"failed", "report_failed"}
-TERMINAL_PARTIAL = {"review", "partial_review"}
-
-
-class _HtmlTextExtractor(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.parts: list[str] = []
-        self._skip_depth = 0
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if tag in {"script", "style"}:
-            self._skip_depth += 1
-        elif tag in {"p", "div", "section", "article", "h1", "h2", "h3", "h4", "li", "br", "tr"}:
-            self.parts.append("\n")
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag in {"script", "style"} and self._skip_depth:
-            self._skip_depth -= 1
-        elif tag in {"p", "div", "section", "article", "h1", "h2", "h3", "h4", "li", "tr"}:
-            self.parts.append("\n")
-
-    def handle_data(self, data: str) -> None:
-        if not self._skip_depth:
-            self.parts.append(data)
-
-    def text(self) -> str:
-        return re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t\r\f\v]+", " ", "".join(self.parts))).strip()
+DEFAULT_MAX_EVIDENCE_CHARS = 18_000
+TERMINAL_FAILURES = {"failed", "cancelled", "report_failed"}
+COLLECTION_READY = {"completed", "deduplicated", "partial_completed", "review", "partial_review"}
 
 
 def parse_env(path: Path) -> dict[str, str]:
@@ -78,15 +51,6 @@ def request_json(method: str, base_url: str, path: str, token: str, payload: dic
         raise RuntimeError(f"HTTP {exc.code} {method} {path}: {detail}") from exc
 
 
-def report_to_chat_text(report_html: str) -> str:
-    value = report_html.strip()
-    if "<html" not in value.lower() and "<body" not in value.lower():
-        return value
-    parser = _HtmlTextExtractor()
-    parser.feed(value)
-    return parser.text()
-
-
 def format_runs_for_chat(latest_status: dict) -> list[str]:
     lines: list[str] = []
     for run in latest_status.get("runs") or []:
@@ -103,24 +67,59 @@ def format_runs_for_chat(latest_status: dict) -> list[str]:
     return lines
 
 
-def format_report_for_chat(latest_status: dict, report: dict, max_report_chars: int) -> str:
-    report_text = report_to_chat_text(str(report.get("report") or ""))
-    report_text = report_text or "(empty report)"
-    truncated = max_report_chars > 0 and len(report_text) > max_report_chars
-    preview = report_text[:max_report_chars].rstrip() if truncated else report_text
+def _clean_text(value: str) -> str:
+    return re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t\r\f\v]+", " ", str(value or ""))).strip()
 
+
+def format_evidence_for_hermes(latest_status: dict, evidence: dict, max_evidence_chars: int) -> str:
     lines = [
-        "AlphaDesk report ready.",
-        f"Job: {report.get('id') or latest_status.get('id') or latest_status.get('job_id')}",
-        f"Status: {report.get('status') or latest_status.get('status')}",
+        "AlphaDesk 三信源证据包已就绪。",
+        "请你作为行业分析师，基于下列证据生成面向用户的中文分析报告；不要声称后端已经生成报告，也不要补写证据中不存在的事实。",
+        f"Job: {latest_status.get('id') or latest_status.get('job_id')}",
+        f"Status: {latest_status.get('status')}",
         f"Lookback days: {latest_status.get('lookback_days')}",
-        "Sources:",
+        "Source runs:",
     ]
     run_lines = format_runs_for_chat(latest_status)
     lines.extend(run_lines or ["- no source run details returned"])
-    lines.extend(["", "Report preview:", preview])
-    if truncated:
-        lines.append(f"\n[Truncated for chat delivery: {len(report_text)} chars total, showing {max_report_chars}.]")
+
+    counts = evidence.get("attached_snapshot_counts") or []
+    if counts:
+        lines.append("")
+        lines.append("Snapshot coverage:")
+        for item in counts:
+            lines.append(f"- {item.get('channel_id')}: {item.get('count', 0)} snapshots attached")
+
+    lines.append("")
+    lines.append("Selected evidence:")
+    used_chars = 0
+    for index, item in enumerate(evidence.get("selected_items") or [], start=1):
+        title = _clean_text(item.get("title") or "")
+        author = _clean_text(item.get("author") or item.get("source_label") or item.get("channel_name") or item.get("channel_id") or "")
+        content = _clean_text(item.get("content_preview") or "")
+        source_url = _clean_text(item.get("source_url") or "")
+        header = f"[{index}] {item.get('channel_id')} | {item.get('occurred_at')} | {author}"
+        if title:
+            header += f" | {title}"
+        block = f"{header}\n{content}"
+        if source_url:
+            block += f"\nSource: {source_url}"
+        if max_evidence_chars > 0 and used_chars + len(block) > max_evidence_chars:
+            remaining = max_evidence_chars - used_chars
+            if remaining > 200:
+                lines.append(block[:remaining].rstrip())
+            lines.append(f"\n[Evidence truncated for Hermes context: showing {max_evidence_chars} chars.]")
+            break
+        lines.append(block)
+        lines.append("")
+        used_chars += len(block)
+
+    lines.append("")
+    lines.append("Report requirements:")
+    lines.append("- 输出中文，先给核心结论，再按主题/产业链拆分。")
+    lines.append("- 明确标注信息来自 WeRSS、IMA 知识库或知识星球；微信公众号内容尽量写出具体公众号/作者。")
+    lines.append("- 对 IMA live 403 这类缓存兜底要如实说明为 cached evidence，不要包装成实时采集成功。")
+    lines.append("- 给出待核验事项和风险提示。")
     return "\n".join(lines)
 
 
@@ -131,8 +130,9 @@ def main() -> int:
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
     parser.add_argument("--interval", type=int, default=20, help="poll interval seconds")
     parser.add_argument("--timeout", type=int, default=1800, help="overall wait timeout seconds")
-    parser.add_argument("--max-report-chars", type=int, default=DEFAULT_MAX_REPORT_CHARS, help="max plain-text report chars returned to chat")
-    parser.add_argument("--full-report", action="store_true", help="print the full report body instead of a chat-safe preview")
+    parser.add_argument("--max-evidence-chars", type=int, default=DEFAULT_MAX_EVIDENCE_CHARS, help="max selected evidence chars returned to Hermes")
+    parser.add_argument("--limit-per-channel", type=int, default=12, help="selected evidence items per source channel")
+    parser.add_argument("--preview-chars", type=int, default=1200, help="max chars per evidence item")
     parser.add_argument("--check", action="store_true", help="only check backend readiness")
     args = parser.parse_args()
 
@@ -157,32 +157,29 @@ def main() -> int:
     while time.time() < deadline:
         latest_status = request_json("GET", args.base_url, job["poll_url"], token)
         status = latest_status.get("status")
-        print(json.dumps({"event": "poll", "job_id": job_id, "status": status, "report_ready": latest_status.get("report_ready")}, ensure_ascii=False))
-        if latest_status.get("report_ready") or status in TERMINAL_FAILURES or status in TERMINAL_PARTIAL:
+        print(json.dumps({"event": "poll", "job_id": job_id, "status": status, "collection_ready": status in COLLECTION_READY}, ensure_ascii=False))
+        if status in COLLECTION_READY or status in TERMINAL_FAILURES:
             break
         time.sleep(args.interval)
 
     status = latest_status.get("status")
-    if latest_status.get("report_ready"):
-        report = request_json("GET", args.base_url, latest_status.get("report_url") or job["report_url"], token)
-        report_body = str(report.get("report", ""))
+    if status in COLLECTION_READY:
+        evidence_path = latest_status.get("evidence_url") or job.get("evidence_url") or f"/api/agent/jobs/{job_id}/evidence"
+        evidence_path = f"{evidence_path}?limit_per_channel={args.limit_per_channel}&preview_chars={args.preview_chars}"
+        evidence = request_json("GET", args.base_url, evidence_path, token)
         print(
             json.dumps(
                 {
-                    "event": "report",
+                    "event": "evidence",
                     "job_id": job_id,
-                    "status": report.get("status"),
-                    "snapshot_count": report.get("snapshot_count"),
-                    "report_chars": len(report_body),
-                    "chat_preview": not args.full_report,
+                    "status": status,
+                    "selected_items": len(evidence.get("selected_items") or []),
+                    "attached_snapshot_counts": evidence.get("attached_snapshot_counts") or [],
                 },
                 ensure_ascii=False,
             )
         )
-        if args.full_report:
-            print(report_body)
-        else:
-            print(format_report_for_chat(latest_status, report, args.max_report_chars))
+        print(format_evidence_for_hermes(latest_status, evidence, args.max_evidence_chars))
         return 0
     if status in TERMINAL_FAILURES:
         print(json.dumps({"event": "failed", "job_id": job_id, "status": status, "error": latest_status.get("error")}, ensure_ascii=False))
