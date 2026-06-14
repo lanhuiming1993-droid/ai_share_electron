@@ -23,6 +23,9 @@ services:
     build:
       context: .
       dockerfile: docker/backend-cloud.Dockerfile
+      args:
+        PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+        PIP_TRUSTED_HOST: ${PIP_TRUSTED_HOST:-}
     environment:
       ALPHADESK_DATA_DIR: /app/data
       ALPHADESK_STARTUP_CHANNEL_CHECK: "0"
