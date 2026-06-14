@@ -37,6 +37,13 @@ class ImaOpenApiTests(unittest.TestCase):
                     config={"client_id": "cid", "api_key": "secret"},
                 )
 
+    def test_status_includes_ima_business_error_message(self) -> None:
+        with patch.object(ima_openapi, "list_ima_knowledge_bases", side_effect=RuntimeError("IMA OpenAPI 200005: 请求超量，请明日再试")):
+            status = ima_openapi.ima_status({"client_id": "cid", "api_key": "secret"})
+
+        self.assertEqual(status["status"], "offline")
+        self.assertIn("请求超量，请明日再试", status["message"])
+
     def test_browse_ima_knowledge_list_recurses_media_type_99_folders(self) -> None:
         def fake_request(api_path: str, body: dict, timeout: int | None = None, config: dict | None = None) -> dict:
             self.assertEqual(api_path, "openapi/wiki/v1/get_knowledge_list")

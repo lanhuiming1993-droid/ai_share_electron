@@ -569,7 +569,7 @@ def ima_status(config: dict[str, Any] | None = None) -> dict[str, Any]:
     except Exception as exc:
         return {
             "status": "offline",
-            "message": f"IMA 知识库不可用：{type(exc).__name__}",
+            "message": f"IMA 知识库不可用：{safe_error(exc)}",
             "checked_at": checked_at,
             "knowledge_bases": [],
         }
