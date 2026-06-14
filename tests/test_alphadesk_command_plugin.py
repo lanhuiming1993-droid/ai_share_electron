@@ -190,6 +190,25 @@ class AlphaDeskCommandPluginTests(unittest.TestCase):
 
         self.assertEqual(text, "/alphadesk-report --days 7 --query '长光 华芯'")
 
+    def test_subprocess_env_loads_hermes_dotenv_for_external_skills(self) -> None:
+        env_path = Path(self.tmp.name) / ".env"
+        env_path.write_text(
+            "\n".join(
+                [
+                    "IWENCAI_BASE_URL=https://openapi.iwencai.com",
+                    "IWENCAI_API_KEY='test-key'",
+                    "IGNORED_LINE",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        with patch.object(self.plugin, "HERMES_ENV_PATH", env_path):
+            env = self.plugin._subprocess_env()
+
+        self.assertEqual(env["IWENCAI_BASE_URL"], "https://openapi.iwencai.com")
+        self.assertEqual(env["IWENCAI_API_KEY"], "test-key")
+
     def test_pre_llm_call_records_alphadesk_session_and_injects_pdf_context(self) -> None:
         result = self.plugin._pre_llm_call(
             platform="lightclawbot",
@@ -297,6 +316,28 @@ Report requirements:
         self.assertNotIn("默认交付 PDF", prompt)
         self.assertNotIn("MEDIA:/absolute/path", prompt)
 
+    def test_analysis_prompt_keeps_cross_validation_after_embedded_requirements(self) -> None:
+        evidence = """AlphaDesk 三信源证据包已就绪。
+Selected evidence:
+
+Report requirements:
+- 不应进入最终分析提示。
+
+# Hermes Cross-Validation Evidence
+## announcement-search
+query=卓胜微 最新公告
+exit=0
+result_status=ok_with_output
+output=卓胜微：第三届董事会第十八次会议决议公告
+"""
+
+        prompt = self.plugin._analysis_prompt(evidence, days=1, query="卓胜微")
+
+        self.assertIn("# Hermes Cross-Validation Evidence", prompt)
+        self.assertIn("result_status=ok_with_output", prompt)
+        self.assertIn("第三届董事会第十八次会议决议公告", prompt)
+        self.assertNotIn("不应进入最终分析提示", prompt)
+
     def test_run_report_collects_analyzes_and_returns_pdf_media(self) -> None:
         async def fake_collect(days: int, query: str):
             self.assertEqual(days, 7)
@@ -304,15 +345,21 @@ Report requirements:
             return 0, "evidence"
 
         async def fake_generate(evidence: str, *, days: int, query: str):
-            self.assertEqual(evidence, "evidence")
+            self.assertIn("evidence", evidence)
+            self.assertIn("# Hermes Cross-Validation Evidence", evidence)
             return 0, "<div class='container'><div class='card'><span class='source-tag'>AlphaDesk</span><ul><li><span class='fact'>事实</span> ok</li></ul></div></div>"
 
         async def fake_render(text: str, *, days: int, query: str, is_html: bool):
             self.assertTrue(is_html)
             return "已生成 PDF 版报告，便于阅读和保存。\nMEDIA:/tmp/report.pdf"
 
+        async def fake_cross_validation(query: str):
+            self.assertEqual(query, "卓胜微")
+            return "# Hermes Cross-Validation Evidence\n## announcement-search\nresult_status=ok_with_output"
+
         with (
             patch.object(self.plugin, "_collect_evidence", side_effect=fake_collect),
+            patch.object(self.plugin, "_collect_cross_validation_evidence", side_effect=fake_cross_validation),
             patch.object(self.plugin, "_generate_html_with_hermes", side_effect=fake_generate),
             patch.object(self.plugin, "_render_text_to_pdf", side_effect=fake_render),
         ):
@@ -357,8 +404,13 @@ Selected evidence:
             self.assertNotIn("尚未完成 HTML 文件保存", text)
             return "已生成 PDF 版报告，便于阅读和保存。\nMEDIA:/tmp/fallback.pdf"
 
+        async def fake_cross_validation(query: str):
+            self.assertEqual(query, "卓胜微")
+            return "# Hermes Cross-Validation Evidence\n## announcement-search\nresult_status=ok_with_output"
+
         with (
             patch.object(self.plugin, "_collect_evidence", side_effect=fake_collect),
+            patch.object(self.plugin, "_collect_cross_validation_evidence", side_effect=fake_cross_validation),
             patch.object(self.plugin, "_generate_html_with_hermes", side_effect=fake_generate),
             patch.object(self.plugin, "_render_text_to_pdf", side_effect=fake_render),
         ):

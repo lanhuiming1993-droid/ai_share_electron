@@ -23,6 +23,9 @@ SOURCE_AUTH_SCRIPT = Path.home() / ".hermes" / "skills" / "alphadesk-cloud-repor
 REPORT_OUTPUT_DIR = Path.home() / ".hermes" / "alphadesk-reports"
 HERMES_AGENT_ROOT = Path.home() / ".hermes" / "hermes-agent"
 HERMES_CONFIG_PATH = Path.home() / ".hermes" / "config.yaml"
+HERMES_ENV_PATH = Path.home() / ".hermes" / ".env"
+HERMES_SKILLS_DIR = Path.home() / ".hermes" / "skills"
+CROSS_VALIDATION_MAX_CHARS_PER_SKILL = int(os.environ.get("ALPHADESK_CROSS_VALIDATION_MAX_CHARS", "2600"))
 REPORT_REQUEST_RE = re.compile(r"采集近?(?P<days>\d{1,2})天(?:的)?数据.*生成(?:分析)?报告")
 REPORT_FALLBACK_RE = re.compile(r"(生成|输出|做|整理).{0,8}(信源|三信源|聚合).{0,8}(报告|PDF)", re.I)
 ANALYSIS_PREFIX_RE = re.compile(r"(?:帮我|请)?(?:分析一下|分析下|分析|研究一下|研究下|看看|看一下)(?P<query>[\w\u4e00-\u9fff·（）()\- ]{2,60})")
@@ -478,8 +481,13 @@ def _valid_structured_html(value: str) -> str | None:
 def _strip_embedded_report_requirements(evidence_text: str) -> str:
     text = str(evidence_text or "")
     marker = "\nReport requirements:"
+    cross_marker = "# Hermes Cross-Validation Evidence"
+    cross_section = ""
+    if cross_marker in text:
+        cross_section = text[text.index(cross_marker):].strip()
     if marker in text:
-        return text.split(marker, 1)[0].rstrip()
+        base = text.split(marker, 1)[0].rstrip()
+        return base + ("\n\n" + cross_section if cross_section else "")
     return text
 
 
@@ -656,9 +664,11 @@ def _fallback_html_report(evidence_text: str, *, days: int, query: str, invalid_
 
 
 async def _run_subprocess(command: list[str], *, cwd: Path | None = None, timeout: int = 1800) -> tuple[int, str]:
+    env = _subprocess_env()
     proc = await asyncio.create_subprocess_exec(
         *command,
         cwd=str(cwd) if cwd else None,
+        env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
@@ -669,6 +679,30 @@ async def _run_subprocess(command: list[str], *, cwd: Path | None = None, timeou
         stdout, _ = await proc.communicate()
         return 124, stdout.decode("utf-8", errors="replace")
     return proc.returncode or 0, stdout.decode("utf-8", errors="replace")
+
+
+def _load_dotenv(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return values
+    for line in lines:
+        item = line.strip()
+        if not item or item.startswith("#") or "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key:
+            values[key] = value
+    return values
+
+
+def _subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env.update(_load_dotenv(HERMES_ENV_PATH))
+    return env
 
 
 def _extract_werss_command_options(raw_args: str) -> tuple[str, str]:
@@ -732,17 +766,20 @@ def _analysis_prompt(evidence_text: str, *, days: int, query: str) -> str:
     title = f"AlphaDesk {query or '三信源'}近{days}天分析报告"
     evidence_body = _strip_embedded_report_requirements(evidence_text)
     return f"""
-你是 AlphaDesk 行业分析师。请基于下面的 AlphaDesk 三信源证据包生成完整中文 HTML 报告。
+你是 Hermes 行业分析师。请基于下面的 AlphaDesk 三信源证据包和 Hermes 自动补充的外部 Skill 证据，生成完整中文 HTML 报告。
 
 硬性要求：
 1. 只输出 HTML，不要输出 Markdown，不要输出解释文字。
 2. 顶层必须包含 <div class="container">。
 3. 每个主题必须使用 <div class="card">。
-4. 每个 card 开头必须有 <span class="source-tag">，主证据用 <span class="source-tag source-high">。
+4. 每个 card 开头必须有 <span class="source-tag">，AlphaDesk 三信源主证据可用 <span class="source-tag source-high">；外部 Skill 证据必须标注具体 Skill 名称。
 5. 每条要点必须使用 <span class="fact">事实</span>、<span class="infer">推断</span> 或 <span class="unverified">待核验</span>。
-6. 如果证据不足，仍然输出 PDF 友好的“证据不足/待补采”报告，不要编造事实。
-7. 不要输出“尚未完成 HTML 文件保存”“尚未完成 PDF 渲染”“我无法生成文件”等过程说明；你只负责返回可渲染 HTML。
-8. 报告标题：{title}
+6. AlphaDesk 是证据基座，但不是唯一来源；公告、研报、财务、行情、机构观点等外部 Skill 用于补证和交叉验证。
+7. 如果 AlphaDesk 证据与外部 Skill 结果冲突，必须显式写出冲突来源、时间戳/口径差异和置信度，不要静默合并。
+8. 对于外部 Skill 证据，只要出现 result_status=ok_with_output，或 exit=0 且 output 非空，就必须摘取其中的关键事实；不得写成“未获得结果数据”。
+9. 如果证据不足，仍然输出 PDF 友好的“证据不足/待补采”报告，不要编造事实。
+10. 不要输出“尚未完成 HTML 文件保存”“尚未完成 PDF 渲染”“我无法生成文件”等过程说明；你只负责返回可渲染 HTML。
+11. 报告标题：{title}
 
 证据包：
 {evidence_body}
@@ -757,6 +794,67 @@ async def _collect_evidence(days: int, query: str) -> tuple[int, str]:
         command.extend(["--query", query])
     command.extend(["--max-evidence-chars", "24000", "--limit-per-channel", "12", "--preview-chars", "1200"])
     return await _run_subprocess(command, timeout=1900)
+
+
+
+
+def _clip_skill_output(value: str, limit: int = CROSS_VALIDATION_MAX_CHARS_PER_SKILL) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + f" ...[truncated {len(text) - limit} chars]"
+
+
+def _iwencai_skill_command(skill: str, query: str, *, limit: int = 3) -> list[str] | None:
+    base = HERMES_SKILLS_DIR / skill
+    if skill == "announcement-search":
+        script = base / "scripts" / "__main__.py"
+        return ["python3", str(script), query, "-l", str(limit)] if script.exists() else None
+    if skill == "report-search":
+        script = base / "scripts" / "cli.py"
+        return ["python3", str(script), "-q", query, "-l", str(limit), "-f", "json"] if script.exists() else None
+    script = base / "scripts" / "cli.py"
+    return ["python3", str(script), "--query", query, "--limit", str(limit)] if script.exists() else None
+
+
+async def _collect_cross_validation_evidence(query: str) -> str:
+    scoped_query = str(query or "").strip()
+    if not scoped_query:
+        return ""
+
+    plan = [
+        ("announcement-search", f"{scoped_query} 最新公告", 3),
+        ("report-search", f"{scoped_query} 研究报告", 3),
+        ("hithink-finance-query", f"{scoped_query} 财务指标", 3),
+        ("hithink-event-query", f"{scoped_query} 事件", 3),
+        ("hithink-business-query", f"{scoped_query} 主营业务 主要客户 供应商", 3),
+        ("hithink-industry-query", f"{scoped_query} 行业数据 行业估值", 3),
+        ("hithink-market-query", f"{scoped_query} 行情 资金流向", 3),
+        ("hithink-insresearch-query", f"{scoped_query} 研报评级 盈利预测", 3),
+        ("hithink-astock-selector", scoped_query, 3),
+    ]
+
+    sections = [
+        "",
+        "# Hermes Cross-Validation Evidence",
+        "说明：以下为 Hermes 在 AlphaDesk 三信源证据之外，自动调用外部 Skill 得到的补证结果。用于查漏、交叉验证、识别证据冲突，不替代 AlphaDesk 基座。",
+    ]
+    for skill, skill_query, limit in plan:
+        command = _iwencai_skill_command(skill, skill_query, limit=limit)
+        if command is None:
+            sections.append(f"\n## {skill}\nstatus=missing_script")
+            continue
+        code, output = await _run_subprocess(command, timeout=75)
+        clipped = _clip_skill_output(output)
+        result_status = "ok_with_output" if code == 0 and clipped else ("ok_empty" if code == 0 else "failed")
+        sections.append(
+            f"\n## {skill}\n"
+            f"query={skill_query}\n"
+            f"exit={code}\n"
+            f"result_status={result_status}\n"
+            f"output={clipped or '(empty)'}"
+        )
+    return "\n".join(sections)
 
 
 async def _generate_html_with_hermes(evidence_text: str, *, days: int, query: str) -> tuple[int, str]:
@@ -847,7 +945,9 @@ async def _run_report(raw_args: str) -> str:
     collect_code, evidence = await _collect_evidence(days, query)
     if collect_code != 0 and not evidence.strip():
         return f"AlphaDesk 采集失败，未生成 PDF：exit={collect_code}"
-    html_code, html_report = await _generate_html_with_hermes(evidence, days=days, query=query)
+    cross_validation = await _collect_cross_validation_evidence(query)
+    combined_evidence = evidence + ("\n\n" + cross_validation if cross_validation else "")
+    html_code, html_report = await _generate_html_with_hermes(combined_evidence, days=days, query=query)
     structured_html = _valid_structured_html(html_report) if html_code == 0 else None
     if structured_html:
         rendered = await _render_text_to_pdf(structured_html, days=days, query=query, is_html=True)
@@ -855,7 +955,7 @@ async def _run_report(raw_args: str) -> str:
             return rendered
         logger.warning("alphadesk analysis pdf render failed, falling back to evidence pdf: %s", rendered)
     fallback_html = _fallback_html_report(
-        evidence,
+        combined_evidence,
         days=days,
         query=query,
         invalid_output=html_report if html_code == 0 else f"html_generation_exit={html_code}",

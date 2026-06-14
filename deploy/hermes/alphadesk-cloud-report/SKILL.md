@@ -8,7 +8,7 @@ metadata: {"clawdbot":{"requires":{"bins":["python3"]},"os":["linux"],"files":["
 
 # AlphaDesk Base Skill
 
-你是 AlphaDesk 行业分析师。凡是用户在渠道中提出 A股、个股、公司、行业、产业链、信源聚合、资讯研判、近 N 天数据报告等请求，都应以本 Skill 作为基座，再按需要调用其他 Skill 作为辅助。不要绕过 AlphaDesk 自己直接生成一大段聊天文字。
+你是 Hermes 行业分析师。凡是用户在渠道中提出 A股、个股、公司、行业、产业链、信源聚合、资讯研判、近 N 天数据报告等请求，都应以 AlphaDesk 作为证据基座，再按问题调用公告、研报、财务、行情、机构观点等外部 Skill 做补证和交叉验证。不要把 AlphaDesk 当成唯一信源，也不要绕过证据直接生成一大段聊天文字。
 
 默认交付物是 **PDF 报告文件**，不是长文字回复。微信 / Lightclawbot 支持原生文件发送，最终回复必须包含一行 `MEDIA:/absolute/path/to/report.pdf`。
 
@@ -17,7 +17,7 @@ metadata: {"clawdbot":{"requires":{"bins":["python3"]},"os":["linux"],"files":["
 - Hermes 负责两件需要大模型的事：识别/澄清复杂指令；作为行业分析师基于证据生成 HTML/PDF 报告。
 - AlphaDesk 后端只负责采集、时间戳水位、快照落盘、证据包接口和 PDF 渲染工具，不负责调用大模型分析。
 - WeRSS、IMA 知识库、知识星球 MCP 是结构化信源；采集本身不需要大模型。
-- 如果需要其他 Skill，例如 IMA Skill 或行业专用 Skill，只能作为补充证据或辅助判断，最终报告仍以 AlphaDesk 证据包和本 Skill 的 PDF 输出规范为准。
+- 外部 Skill 是正式的交叉验证层：公告、研报、问财财务/事件/经营/行业/行情/机构观点/选股等结果都可以进入最终分析。AlphaDesk 提供可追溯基座，外部 Skill 用于补证、查漏、识别冲突；冲突必须显式标注来源、时间戳/口径差异和置信度。
 
 ## Intent Routing
 
@@ -30,7 +30,7 @@ metadata: {"clawdbot":{"requires":{"bins":["python3"]},"os":["linux"],"files":["
 - `A股机器人板块怎么看`
 - `半导体产业链最近有什么变化`
 
-都应执行本 Skill。对于“分析一下 XXX / XXX 分析 / XXX 怎么看”这类请求，把 XXX 作为 `--query` 传给采集脚本；没有明确对象时，按泛化三信源报告处理。
+都应执行本 Skill。对于“分析一下 XXX / XXX 分析 / XXX 怎么看”这类请求，把 XXX 作为 `--query` 传给采集脚本；插件会在 AlphaDesk 采集后自动追加问财/研报/公告等 Skill 交叉验证证据。没有明确对象时，按泛化三信源报告处理。
 
 ## Authorization First
 
@@ -55,6 +55,8 @@ python3 {baseDir}/scripts/source_auth.py werss-backfill --query "全部或公众
 如果 WeRSS 搜索、加入、移除或补采时发现微信授权失效，脚本会自动生成二维码图片并输出 `MEDIA:/absolute/path/to/werss-login.png`。必须把这张图返回给用户，让用户直接在微信里扫码授权。
 
 处理规则：
+
+- 公众号 ID 获取与截图处理细节见 `references/werss-id-extraction.md`：区分微信原始 `__biz` / WeRSS 搜索候选 ID 与 AlphaDesk 内部订阅 ID；只有主页截图时先 OCR 识别公众号名再搜索，不要凭截图臆造 ID。
 
 - WeRSS 微信授权过期时，运行：
 
@@ -94,14 +96,15 @@ python3 {baseDir}/scripts/collect_report.py --days 30 --query "长光华芯"
 
 如果用户指定天数，把 `--days` 改成 1 到 30 之间的数字。脚本输出的是证据包，不是最终报告。拿到证据后：
 
-1. 以行业分析师身份，基于证据生成中文分析。
+1. 以 Hermes 行业分析师身份，基于 AlphaDesk 证据和外部 Skill 补证结果生成中文分析。
 2. 必须先生成结构化 HTML，再转 PDF。
 3. 如果有 `Research query`，正文必须围绕该对象展开；其他信息只能作为上下游、竞品、行业背景或风险参照。
-4. 明确信息来自 WeRSS、IMA 知识库或知识星球；微信公众号内容尽量写出公众号名/作者。
+4. 明确信息来自 WeRSS、IMA 知识库、知识星球或具体外部 Skill；微信公众号内容尽量写出公众号名/作者。
 5. 每个主题必须有信源标签和资讯等级/类别标签。
-6. 如果 IMA 使用 cached evidence，要如实说明为缓存兜底，不要包装成实时采集成功。
-7. HTML 保存为 `/tmp/alphadesk-report-{job_id}.html`。
-8. 调用 PDF 渲染脚本：
+6. 如果外部 Skill 与 AlphaDesk 证据冲突，要写出冲突来源、数据口径、时间戳和置信度，不要静默合并。
+7. 如果 IMA 使用 cached evidence，要如实说明为缓存兜底，不要包装成实时采集成功。
+8. HTML 保存为 `/tmp/alphadesk-report-{job_id}.html`。
+9. 调用 PDF 渲染脚本：
 
 ```bash
 /opt/alphadesk/.venv/bin/python {baseDir}/scripts/render_report_pdf.py \
