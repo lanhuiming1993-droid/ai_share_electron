@@ -45,7 +45,7 @@ META_OR_RUNTIME_QUESTION_RE = re.compile(
 )
 WERSS_MANAGEMENT_RE = re.compile(
     r"^(?:请|帮我|麻烦)?\s*"
-    r"(?P<action>公众号订阅状态|搜索公众号订阅|新增公众号订阅|添加公众号订阅|加入公众号订阅|移除公众号订阅|删除公众号订阅|补采公众号订阅|补采公众号|公众号授权|微信公众号授权|重新授权公众号|登录公众号)"
+    r"(?P<action>公众号订阅状态|查看现有订阅公众号|查看订阅公众号|查看公众号订阅|现有订阅公众号|已订阅公众号|搜索公众号订阅|新增公众号订阅|添加公众号订阅|加入公众号订阅|移除公众号订阅|删除公众号订阅|补采公众号订阅|补采公众号|公众号授权|微信公众号授权|重新授权公众号|登录公众号)"
     r"\s*(?P<target>.*)$",
     re.I,
 )
@@ -119,7 +119,7 @@ def _classify_werss_management_request(value: str) -> dict | None:
         return None
     action_text = match.group("action")
     target = _clean_werss_target(match.group("target"))
-    if action_text == "公众号订阅状态":
+    if action_text in {"公众号订阅状态", "查看现有订阅公众号", "查看订阅公众号", "查看公众号订阅", "现有订阅公众号", "已订阅公众号"}:
         return {"action": "status", "target": ""}
     if action_text == "搜索公众号订阅":
         return {"action": "search", "target": target}

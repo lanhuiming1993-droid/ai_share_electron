@@ -50,7 +50,7 @@ python3 {baseDir}/scripts/source_auth.py werss-remove --query "公众号名或 i
 python3 {baseDir}/scripts/source_auth.py werss-backfill --query "全部或公众号名" --start-page 0 --end-page 1
 ```
 
-对应自然语言包括：`公众号订阅状态`、`搜索公众号订阅 <关键词>`、`新增公众号订阅 <公众号名或候选ID>`、`移除公众号订阅 <名称>`、`补采公众号 <名称|全部>`。
+对应自然语言包括：`公众号订阅状态`、`查看现有订阅公众号`、`搜索公众号订阅 <关键词>`、`新增公众号订阅 <公众号名或候选ID>`、`移除公众号订阅 <名称>`、`补采公众号 <名称|全部>`。
 
 如果 WeRSS 搜索、加入、移除或补采时发现微信授权失效，脚本会自动生成二维码图片并输出 `MEDIA:/absolute/path/to/werss-login.png`。必须把这张图返回给用户，让用户直接在微信里扫码授权。
 

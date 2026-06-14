@@ -136,6 +136,8 @@ class AlphaDeskCommandPluginTests(unittest.TestCase):
     def test_rewrites_werss_management_requests_before_alphadesk_analysis(self) -> None:
         cases = [
             ("公众号订阅状态", "/alphadesk-werss status"),
+            ("查看现有订阅公众号", "/alphadesk-werss status"),
+            ("查看订阅公众号", "/alphadesk-werss status"),
             ("搜索公众号订阅 半导体", "/alphadesk-werss search '半导体'"),
             ("新增公众号订阅 2", "/alphadesk-werss add 2"),
             ("移除公众号订阅 半导体观察", "/alphadesk-werss remove '半导体观察'"),
