@@ -138,6 +138,26 @@ class VerifyWeixinGoalDiagnosticsTests(unittest.TestCase):
         self.assertFalse(result["_cache"]["hit"])
         self.assertEqual(result["ima-knowledge"]["status"], "online")
 
+    def test_command_text_matches_suffixed_report_command(self) -> None:
+        self.assertTrue(
+            self.verify.command_text_matches(
+                "采集近30天数据并生成报告 1557",
+                "采集近30天数据并生成报告",
+            )
+        )
+        self.assertTrue(
+            self.verify.command_text_matches(
+                "请帮我采集近 30 天的数据，并生成分析报告。",
+                "采集近30天数据并生成报告",
+            )
+        )
+        self.assertFalse(
+            self.verify.command_text_matches(
+                "采集近7天数据并生成报告",
+                "采集近30天数据并生成报告",
+            )
+        )
+
     def test_audited_gateway_command_can_complete_goal_with_collect_job_and_response(self) -> None:
         command_ts = self.verify.parse_iso("2026-06-14T05:00:04+00:00")
         audit_path = self.hermes_home / self.verify.ALPHADESK_COMMAND_AUDIT_FILE

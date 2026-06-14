@@ -294,6 +294,16 @@ def command_window_days(value: str) -> int | None:
     return max(1, min(30, int(match.group(1))))
 
 
+def command_text_matches(value: str, command: str) -> bool:
+    target_days = command_window_days(command)
+    compact = compact_command_text(value)
+    if target_days is None:
+        return compact_command_text(command) in compact
+    if command_window_days(value) != target_days:
+        return False
+    return all(token in compact for token in ("采集", "数据", "生成", "报告"))
+
+
 def sql_placeholders(values: list[str]) -> str:
     return ",".join("?" for _ in values)
 
@@ -356,7 +366,7 @@ def find_platform_command(
         conn.row_factory = sqlite3.Row
         try:
             source_marks = sql_placeholders(sources)
-            row = conn.execute(
+            rows = conn.execute(
                 f"""
                 SELECT m.id,m.session_id,s.source,m.role,m.content,m.timestamp
                 FROM messages m
@@ -365,13 +375,14 @@ def find_platform_command(
                   AND m.role='user'
                   AND m.id>?
                   AND m.timestamp>=?
-                  AND m.content LIKE ?
                 ORDER BY m.id DESC
-                LIMIT 1
+                LIMIT 100
                 """,
-                (*sources, min_message_id, min_timestamp, f"%{command}%"),
-            ).fetchone()
-            if row:
+                (*sources, min_message_id, min_timestamp),
+            ).fetchall()
+            for row in rows:
+                if not command_text_matches(str(row["content"] or ""), command):
+                    continue
                 candidate = {
                     "id": row["id"],
                     "session_id": row["session_id"],
