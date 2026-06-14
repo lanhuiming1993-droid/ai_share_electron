@@ -14,3 +14,15 @@
 - Shell commands remain appropriate for environment inspection, dependency installation, running tests, starting local services, invoking build tools, git operations, and file-system operations.
 - When using Python for live data, keep the script small, show the relevant data sources or package APIs used, and avoid hiding important assumptions in one-off parsing code.
 
+## Cloud Agent Lite Context
+
+- This workspace is the `codex/cloud-agent-lite` branch. Treat it as the cloud Hermes + AlphaDesk agent project, not the old desktop/Electron working context.
+- The cloud profile keeps only three core AlphaDesk sources: WeRSS official-account RSS, ZSXQ MCP topics, and IMA OpenAPI knowledge base. Other market-data and desktop-browser workflows are not part of the cloud agent baseline unless explicitly reintroduced.
+- Hermes owns all LLM usage: command understanding and industry-analysis/PDF generation. AlphaDesk backend and collectors only collect structured evidence, maintain watermarks, persist snapshots, expose evidence/report APIs, and provide PDF rendering helpers.
+- Current Hermes-side assets live under `deploy/hermes/`:
+  - `alphadesk-cloud-report/`: main Hermes skill for three-source collection, source auth, report rendering, and verification scripts.
+  - `plugins/alphadesk-command/`: gateway plugin that rewrites WeChat/Lightclaw intents into AlphaDesk commands, invokes evidence collection, adds cross-validation evidence, and returns `MEDIA:/...pdf`.
+  - `a-share-growth-hunter/`: company-level A-share growth-stock analysis framework. It is an analysis frame, not a source, and is injected only for stock/company/growth/Davis-double-play style queries.
+- Cross-validation skills currently expected on the Hermes host include announcement search, report search, finance, event, business, industry, market, institutional research, and A-stock selector. They are supplemental evidence layers on top of AlphaDesk.
+- Do not put API keys, MCP URLs containing keys, bot tokens, WeRSS passwords, cookies, or private paid content into committed files. Use env files or local-only notes.
+- For server-specific operational notes, prefer a local untracked `LOCAL_CLOUD_AGENT_CONTEXT.md` when present.
