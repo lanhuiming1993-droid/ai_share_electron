@@ -121,7 +121,7 @@ def format_evidence_for_hermes(latest_status: dict, evidence: dict, max_evidence
     lines.append("- 对 IMA live 403 这类缓存兜底要如实说明为 cached evidence，不要包装成实时采集成功。")
     lines.append("- 给出待核验事项和风险提示。")
     lines.append("- 默认交付 PDF：先把完整报告写成 HTML/Markdown 文件，再调用 render_report_pdf.py 生成 PDF。")
-    lines.append("- 最终聊天回复只发送一句简短说明和 MEDIA:/absolute/path/to/report.pdf，不要贴完整文字版报告。")
+    lines.append("- 最终聊天回复必须先发送一句非空简短说明，再另起一行发送 MEDIA:/absolute/path/to/report.pdf；不要只回复 MEDIA，也不要贴完整文字版报告。")
     return "\n".join(lines)
 
 

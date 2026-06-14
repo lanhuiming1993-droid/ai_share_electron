@@ -42,14 +42,14 @@ python3 {baseDir}/scripts/collect_report.py --days 30
 
 ## Final Reply
 
-最终回复保持很短，只包含一句说明和 PDF 文件：
+最终回复保持很短，必须先有一句非空说明，再另起一行放 PDF 文件：
 
 ```text
 已生成 PDF 版报告，便于阅读和保存。
 MEDIA:/home/ubuntu/.hermes/alphadesk-reports/AlphaDesk-三信源近30日聚合报告-YYYYMMDD-HHMMSS.pdf
 ```
 
-不要把完整报告正文贴到聊天窗口。只有在用户明确要求“文字版/摘要版”时，才额外发送简短摘要。
+不要只回复 `MEDIA:/...pdf`，也不要把完整报告正文贴到聊天窗口。只有在用户明确要求“文字版/摘要版”时，才额外发送简短摘要。
 
 ## Behavior
 

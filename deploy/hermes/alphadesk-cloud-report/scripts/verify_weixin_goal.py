@@ -349,6 +349,7 @@ def find_platform_command(
     min_message_id: int,
     min_timestamp: float,
 ) -> dict[str, Any] | None:
+    audited = find_audited_platform_command(hermes_home, sources, command, min_timestamp)
     state_db = hermes_home / "state.db"
     if state_db.exists():
         conn = sqlite3.connect(str(state_db))
@@ -371,7 +372,7 @@ def find_platform_command(
                 (*sources, min_message_id, min_timestamp, f"%{command}%"),
             ).fetchone()
             if row:
-                return {
+                candidate = {
                     "id": row["id"],
                     "session_id": row["session_id"],
                     "source": row["source"],
@@ -380,9 +381,19 @@ def find_platform_command(
                     "content_preview": str(row["content"] or "")[:80],
                     "evidence": "messages",
                 }
+                if audited and float(audited["timestamp"]) <= float(candidate["timestamp"]):
+                    return {
+                        **audited,
+                        "id": candidate["id"],
+                        "session_id": candidate["session_id"],
+                        "transcript_timestamp": candidate["timestamp"],
+                        "transcript_timestamp_iso": candidate["timestamp_iso"],
+                        "evidence": "audit+messages",
+                    }
+                return candidate
         finally:
             conn.close()
-    return find_audited_platform_command(hermes_home, sources, command, min_timestamp)
+    return audited
 
 
 def latest_platform_messages(hermes_home: Path, sources: list[str], limit: int = 5) -> list[dict[str, Any]]:
@@ -430,23 +441,26 @@ def find_platform_response(
     if not state_db.exists():
         return None
     since_ts = float(command.get("timestamp") or 0)
+    session_id = str(command.get("session_id") or "")
     conn = sqlite3.connect(str(state_db))
     conn.row_factory = sqlite3.Row
     try:
         source_marks = sql_placeholders(sources)
+        session_filter = "OR m.session_id=?" if session_id else ""
+        session_params = (session_id,) if session_id else ()
         rows = conn.execute(
             f"""
             SELECT m.id,m.session_id,s.source,m.role,m.content,m.timestamp
             FROM messages m
             LEFT JOIN sessions s ON s.id=m.session_id
-            WHERE s.source IN ({source_marks})
+            WHERE (s.source IN ({source_marks}) {session_filter})
               AND m.role='assistant'
               AND m.timestamp>=?
               AND length(trim(coalesce(m.content,'')))>=40
             ORDER BY m.id DESC
             LIMIT 5
             """,
-            (*sources, since_ts),
+            (*sources, *session_params, since_ts),
         ).fetchall()
         for row in rows:
             content = str(row["content"] or "")

@@ -254,6 +254,126 @@ class VerifyWeixinGoalDiagnosticsTests(unittest.TestCase):
         self.assertTrue(audit_diagnostics["exists"])
         self.assertNotIn("chat-secret", json.dumps(audit_diagnostics, ensure_ascii=False))
 
+    def test_audit_time_is_used_when_transcript_user_message_is_persisted_late(self) -> None:
+        command_ts = self.verify.parse_iso("2026-06-14T07:06:28+00:00")
+        late_ts = self.verify.parse_iso("2026-06-14T07:09:50+00:00")
+        audit_path = self.hermes_home / self.verify.ALPHADESK_COMMAND_AUDIT_FILE
+        audit_path.write_text(
+            json.dumps(
+                {
+                    "timestamp": command_ts,
+                    "timestamp_iso": "2026-06-14T07:06:28+00:00",
+                    "platform": "weixin",
+                    "days": 30,
+                    "chat_id": "chat-secret",
+                    "user_id": "user-secret",
+                    "content_preview": "采集近30天数据并生成报告",
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        workbench_db = self.hermes_home / "workbench.db"
+        conn = sqlite3.connect(workbench_db)
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE source_collection_jobs (
+                  id TEXT PRIMARY KEY, action TEXT NOT NULL, status TEXT NOT NULL,
+                  lookback_days INTEGER NOT NULL, snapshot_count INTEGER NOT NULL DEFAULT 0,
+                  created_at TEXT NOT NULL, started_at TEXT NOT NULL DEFAULT '',
+                  completed_at TEXT NOT NULL DEFAULT '', report TEXT
+                );
+                CREATE TABLE source_collection_runs (
+                  job_id TEXT NOT NULL, channel_id TEXT NOT NULL, status TEXT NOT NULL,
+                  snapshot_count INTEGER NOT NULL DEFAULT 0, duplicate_count INTEGER NOT NULL DEFAULT 0,
+                  started_at TEXT NOT NULL DEFAULT '', completed_at TEXT NOT NULL DEFAULT '',
+                  error TEXT NOT NULL DEFAULT ''
+                );
+                CREATE TABLE source_snapshots (
+                  id TEXT PRIMARY KEY, channel_id TEXT NOT NULL
+                );
+                CREATE TABLE source_job_snapshots (
+                  job_id TEXT NOT NULL, snapshot_id TEXT NOT NULL
+                );
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO source_collection_jobs(id,action,status,lookback_days,created_at,report)
+                VALUES('job','collect','partial_completed',30,'2026-06-14T07:06:36+00:00',NULL)
+                """
+            )
+            conn.executemany(
+                "INSERT INTO source_collection_runs(job_id,channel_id,status) VALUES('job',?,?)",
+                [
+                    ("wechat-mp-rss", "deduplicated"),
+                    ("ima-knowledge", "cached_after_error"),
+                    ("zsxq", "completed"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO source_snapshots(id,channel_id) VALUES(?,?)",
+                [
+                    ("snap-werss", "wechat-mp-rss"),
+                    ("snap-ima", "ima-knowledge"),
+                    ("snap-zsxq", "zsxq"),
+                ],
+            )
+            conn.executemany(
+                "INSERT INTO source_job_snapshots(job_id,snapshot_id) VALUES('job',?)",
+                [("snap-werss",), ("snap-ima",), ("snap-zsxq",)],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        state_db = self.hermes_home / "state.db"
+        state = sqlite3.connect(state_db)
+        try:
+            state.executescript(
+                """
+                CREATE TABLE sessions(id TEXT PRIMARY KEY, source TEXT NOT NULL);
+                CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, timestamp REAL);
+                """
+            )
+            state.execute("INSERT INTO sessions(id,source) VALUES('s','weixin')")
+            state.execute(
+                "INSERT INTO messages(id,session_id,role,content,timestamp) VALUES(10,'s','user',?,?)",
+                ("采集近30天数据并生成报告", late_ts),
+            )
+            state.execute(
+                "INSERT INTO messages(id,session_id,role,content,timestamp) VALUES(11,'s','assistant',?,?)",
+                ("已生成 PDF 版报告，便于阅读和保存。\nMEDIA:/tmp/report.pdf", late_ts + 1),
+            )
+            state.commit()
+        finally:
+            state.close()
+
+        args = SimpleNamespace(
+            env_file=self.hermes_home / "cloud.env",
+            workbench_db=workbench_db,
+            sources="weixin",
+            command="采集近30天数据并生成报告",
+            since_message_id=0,
+            since_iso="2026-06-14T07:05:00+00:00",
+            check_sources=False,
+            base_url="http://127.0.0.1:18080",
+            source_status_cache=self.hermes_home / "source-cache.json",
+            source_check_ttl=900,
+            force_source_check=False,
+            hermes_home=self.hermes_home,
+            require_pdf_media=True,
+        )
+
+        complete, summary = self.verify.verify_once(args)
+
+        self.assertTrue(complete)
+        self.assertEqual(summary["matched_platform_command"]["timestamp"], command_ts)
+        self.assertEqual(summary["matched_platform_command"]["transcript_timestamp"], late_ts)
+        self.assertEqual(summary["matched_report_job"]["id"], "job")
+        self.assertEqual(summary["response_pdf_media"], ["/tmp/report.pdf"])
+
     def test_pdf_media_can_be_required_for_goal_completion(self) -> None:
         job = {
             "id": "job",
