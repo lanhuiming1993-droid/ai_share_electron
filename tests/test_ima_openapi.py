@@ -20,6 +20,23 @@ class ImaOpenApiTests(unittest.TestCase):
             with patch.object(Path, "home", return_value=Path(temp_dir)):
                 self.assertEqual(ima_openapi.read_user_config("client_id"), "cid-from-skill")
 
+    def test_http_error_surfaces_ima_business_message(self) -> None:
+        class FakeResponse:
+            status_code = 403
+            text = '{"code":200005,"msg":"请求超量，请明日再试","data":{}}'
+            reason = "Forbidden"
+
+            def json(self):
+                return {"code": 200005, "msg": "请求超量，请明日再试", "data": {}}
+
+        with patch.object(ima_openapi.requests, "post", return_value=FakeResponse()):
+            with self.assertRaisesRegex(RuntimeError, "IMA OpenAPI 200005: 请求超量，请明日再试"):
+                ima_openapi.ima_openapi_request(
+                    "openapi/wiki/v1/search_knowledge_base",
+                    {"query": "", "limit": 1},
+                    config={"client_id": "cid", "api_key": "secret"},
+                )
+
     def test_browse_ima_knowledge_list_recurses_media_type_99_folders(self) -> None:
         def fake_request(api_path: str, body: dict, timeout: int | None = None, config: dict | None = None) -> dict:
             self.assertEqual(api_path, "openapi/wiki/v1/get_knowledge_list")

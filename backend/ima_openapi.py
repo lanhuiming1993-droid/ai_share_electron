@@ -150,8 +150,18 @@ def ima_openapi_request(
         json=body,
         timeout=timeout or normalized["timeout_seconds"],
     )
-    response.raise_for_status()
-    payload = response.json()
+    payload: dict[str, Any] = {}
+    try:
+        raw_payload = response.json()
+        if isinstance(raw_payload, dict):
+            payload = raw_payload
+    except ValueError:
+        payload = {}
+    if response.status_code >= 400:
+        message = str(payload.get("msg") or response.text or response.reason or "IMA OpenAPI request failed").strip()
+        code = payload.get("code")
+        detail = f"IMA OpenAPI {code}: {message}" if code is not None else message
+        raise RuntimeError(detail)
     if payload.get("code") != 0:
         raise RuntimeError(str(payload.get("msg") or "IMA OpenAPI request failed"))
     return payload.get("data") if isinstance(payload.get("data"), dict) else {}
