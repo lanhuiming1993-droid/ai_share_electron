@@ -15,9 +15,11 @@ from pathlib import Path
 
 TRIGGER = "采集近30天数据并生成报告"
 COMMAND = "alphadesk-report"
+WERSS_COMMAND = "alphadesk-werss"
 SUPPORTED_PLATFORMS = {"weixin", "lightclawbot"}
 REPORT_SCRIPT = Path.home() / ".hermes" / "skills" / "alphadesk-cloud-report" / "scripts" / "collect_report.py"
 RENDER_SCRIPT = Path.home() / ".hermes" / "skills" / "alphadesk-cloud-report" / "scripts" / "render_report_pdf.py"
+SOURCE_AUTH_SCRIPT = Path.home() / ".hermes" / "skills" / "alphadesk-cloud-report" / "scripts" / "source_auth.py"
 REPORT_OUTPUT_DIR = Path.home() / ".hermes" / "alphadesk-reports"
 HERMES_AGENT_ROOT = Path.home() / ".hermes" / "hermes-agent"
 HERMES_CONFIG_PATH = Path.home() / ".hermes" / "config.yaml"
@@ -39,6 +41,12 @@ META_OR_RUNTIME_QUESTION_RE = re.compile(
     r"(skill|插件|工具|mcp|配置|供应商|模型|provider|config\.ya?ml|deepseek|jojo|api\s*key).{0,30}"
     r"(吗|么|什么|哪些|哪个|为什么|怎么|如何|是否|是不是)"
     r")",
+    re.I,
+)
+WERSS_MANAGEMENT_RE = re.compile(
+    r"^(?:请|帮我|麻烦)?\s*"
+    r"(?P<action>公众号订阅状态|搜索公众号订阅|新增公众号订阅|添加公众号订阅|加入公众号订阅|移除公众号订阅|删除公众号订阅|补采公众号订阅|补采公众号|公众号授权|微信公众号授权|重新授权公众号|登录公众号)"
+    r"\s*(?P<target>.*)$",
     re.I,
 )
 DEFAULT_AUDIT_PATH = Path.home() / ".hermes" / "alphadesk-command.audit.jsonl"
@@ -98,6 +106,34 @@ def _classify_alphadesk_request(value: str) -> dict | None:
     return None
 
 
+def _clean_werss_target(value: str) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip(" \t\r\n，。！？；;:：,.!?")
+
+
+def _classify_werss_management_request(value: str) -> dict | None:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return None
+    match = WERSS_MANAGEMENT_RE.match(text)
+    if not match:
+        return None
+    action_text = match.group("action")
+    target = _clean_werss_target(match.group("target"))
+    if action_text == "公众号订阅状态":
+        return {"action": "status", "target": ""}
+    if action_text == "搜索公众号订阅":
+        return {"action": "search", "target": target}
+    if action_text in {"新增公众号订阅", "添加公众号订阅", "加入公众号订阅"}:
+        return {"action": "add", "target": target}
+    if action_text in {"移除公众号订阅", "删除公众号订阅"}:
+        return {"action": "remove", "target": target}
+    if action_text in {"补采公众号", "补采公众号订阅"}:
+        return {"action": "backfill", "target": target or "全部"}
+    if action_text in {"公众号授权", "微信公众号授权", "重新授权公众号", "登录公众号"}:
+        return {"action": "login", "target": ""}
+    return None
+
+
 def _extract_command_options(raw_args: str) -> tuple[int, str]:
     days = 30
     query = ""
@@ -138,6 +174,15 @@ def _command_text_for_classification(classification: dict) -> str:
     query = str(classification.get("query") or "").strip()
     if query:
         parts.extend(["--query", _quote_command_arg(query)])
+    return " ".join(parts)
+
+
+def _command_text_for_werss_management(classification: dict) -> str:
+    action = str(classification.get("action") or "status")
+    parts = [f"/{WERSS_COMMAND}", action]
+    target = str(classification.get("target") or "").strip()
+    if target:
+        parts.append(_quote_command_arg(target))
     return " ".join(parts)
 
 
@@ -626,6 +671,63 @@ async def _run_subprocess(command: list[str], *, cwd: Path | None = None, timeou
     return proc.returncode or 0, stdout.decode("utf-8", errors="replace")
 
 
+def _extract_werss_command_options(raw_args: str) -> tuple[str, str]:
+    tokens = shlex.split(raw_args or "")
+    if not tokens:
+        return "status", ""
+    action = tokens[0].strip().lower()
+    target = " ".join(tokens[1:]).strip()
+    aliases = {
+        "状态": "status",
+        "status": "status",
+        "search": "search",
+        "搜索": "search",
+        "add": "add",
+        "新增": "add",
+        "添加": "add",
+        "加入": "add",
+        "remove": "remove",
+        "delete": "remove",
+        "删除": "remove",
+        "移除": "remove",
+        "backfill": "backfill",
+        "补采": "backfill",
+        "login": "login",
+        "auth": "login",
+        "授权": "login",
+    }
+    return aliases.get(action, action), target
+
+
+async def _run_werss(raw_args: str) -> str:
+    if not SOURCE_AUTH_SCRIPT.exists():
+        return f"AlphaDesk source auth script is missing: {SOURCE_AUTH_SCRIPT}"
+    action, target = _extract_werss_command_options(raw_args)
+    action_map = {
+        "status": "werss-status",
+        "search": "werss-search",
+        "add": "werss-add",
+        "remove": "werss-remove",
+        "backfill": "werss-backfill",
+        "login": "werss-login",
+    }
+    script_action = action_map.get(action)
+    if not script_action:
+        return "不支持的 WeRSS 管理动作。可用：status/search/add/remove/backfill/login。"
+    if action in {"search", "add", "remove"} and not target:
+        return f"请提供公众号名称、关键词、编号或 id。示例：/{WERSS_COMMAND} {action} 半导体行业观察"
+    if action == "backfill" and not target:
+        target = "全部"
+    command = ["python3", str(SOURCE_AUTH_SCRIPT), script_action]
+    if target:
+        command.extend(["--query", target])
+    code, stdout = await _run_subprocess(command, timeout=240)
+    text = stdout.strip() or f"WeRSS command exited with code {code}."
+    if code != 0 and "MEDIA:" not in text:
+        return f"WeRSS 管理命令失败：exit={code}\n{text}"
+    return text
+
+
 def _analysis_prompt(evidence_text: str, *, days: int, query: str) -> str:
     title = f"AlphaDesk {query or '三信源'}近{days}天分析报告"
     evidence_body = _strip_embedded_report_requirements(evidence_text)
@@ -767,7 +869,12 @@ def _pre_gateway_dispatch(event, **_kwargs):
     if platform not in SUPPORTED_PLATFORMS:
         return None
 
-    classification = _classify_alphadesk_request(getattr(event, "text", ""))
+    text = getattr(event, "text", "")
+    werss_classification = _classify_werss_management_request(text)
+    if werss_classification is not None:
+        return {"action": "rewrite", "text": _command_text_for_werss_management(werss_classification)}
+
+    classification = _classify_alphadesk_request(text)
     if classification is None:
         return None
 
@@ -789,4 +896,10 @@ def register(ctx):
         _run_report,
         description="Generate an AlphaDesk three-source PDF report or scoped analysis evidence pack.",
         args_hint="[--days 1-30] [--query 股票/公司/行业]",
+    )
+    ctx.register_command(
+        WERSS_COMMAND,
+        _run_werss,
+        description="Manage AlphaDesk WeRSS official-account subscriptions and QR authorization.",
+        args_hint="status | search 关键词 | add 名称/编号/id | remove 名称/id | backfill 名称/全部 | login",
     )

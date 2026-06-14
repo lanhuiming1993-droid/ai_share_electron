@@ -40,6 +40,20 @@ metadata: {"clawdbot":{"requires":{"bins":["python3"]},"os":["linux"],"files":["
 python3 {baseDir}/scripts/source_auth.py status
 ```
 
+WeRSS 公众号订阅管理也由本 Skill 接管。用户在微信或其他渠道提出下面意图时，不要让用户去找原生 WeRSS 管理台，优先调用脚本完成：
+
+```bash
+python3 {baseDir}/scripts/source_auth.py werss-status
+python3 {baseDir}/scripts/source_auth.py werss-search --query "关键词或公众号名"
+python3 {baseDir}/scripts/source_auth.py werss-add --query "公众号名、候选编号或 id"
+python3 {baseDir}/scripts/source_auth.py werss-remove --query "公众号名或 id"
+python3 {baseDir}/scripts/source_auth.py werss-backfill --query "全部或公众号名" --start-page 0 --end-page 1
+```
+
+对应自然语言包括：`公众号订阅状态`、`搜索公众号订阅 <关键词>`、`新增公众号订阅 <公众号名或候选ID>`、`移除公众号订阅 <名称>`、`补采公众号 <名称|全部>`。
+
+如果 WeRSS 搜索、加入、移除或补采时发现微信授权失效，脚本会自动生成二维码图片并输出 `MEDIA:/absolute/path/to/werss-login.png`。必须把这张图返回给用户，让用户直接在微信里扫码授权。
+
 处理规则：
 
 - WeRSS 微信授权过期时，运行：

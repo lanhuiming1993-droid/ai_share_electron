@@ -133,6 +133,50 @@ class AlphaDeskCommandPluginTests(unittest.TestCase):
                 self.assertIsNone(self.plugin._classify_alphadesk_request(question))
                 self.assertIsNone(self.plugin._pre_gateway_dispatch(make_event(question, "weixin")))
 
+    def test_rewrites_werss_management_requests_before_alphadesk_analysis(self) -> None:
+        cases = [
+            ("公众号订阅状态", "/alphadesk-werss status"),
+            ("搜索公众号订阅 半导体", "/alphadesk-werss search '半导体'"),
+            ("新增公众号订阅 2", "/alphadesk-werss add 2"),
+            ("移除公众号订阅 半导体观察", "/alphadesk-werss remove '半导体观察'"),
+            ("补采公众号 全部", "/alphadesk-werss backfill '全部'"),
+            ("微信公众号授权", "/alphadesk-werss login"),
+        ]
+
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(self.plugin._pre_gateway_dispatch(make_event(message)), {"action": "rewrite", "text": expected})
+
+    def test_run_werss_calls_source_auth_script_and_returns_output(self) -> None:
+        async def fake_run(command: list[str], **kwargs):
+            self.assertEqual(command[-3:], ["werss-search", "--query", "半导体"])
+            return 0, "WeRSS 搜索“半导体”找到 1 个候选：\n1. 半导体观察 | id=mp-1\n"
+
+        script_path = Path(self.tmp.name) / "source_auth.py"
+        script_path.write_text("# test", encoding="utf-8")
+        with (
+            patch.object(self.plugin, "SOURCE_AUTH_SCRIPT", script_path),
+            patch.object(self.plugin, "_run_subprocess", side_effect=fake_run),
+        ):
+            result = __import__("asyncio").run(self.plugin._run_werss("search 半导体"))
+
+        self.assertIn("半导体观察", result)
+
+    def test_run_werss_keeps_qr_media_on_authorization_failure(self) -> None:
+        async def fake_run(command: list[str], **kwargs):
+            self.assertEqual(command[-1], "werss-status")
+            return 2, "WeRSS 微信授权不可用，已生成二维码。\nMEDIA:/home/ubuntu/.hermes/alphadesk-auth/werss-login.png\n"
+
+        script_path = Path(self.tmp.name) / "source_auth.py"
+        script_path.write_text("# test", encoding="utf-8")
+        with (
+            patch.object(self.plugin, "SOURCE_AUTH_SCRIPT", script_path),
+            patch.object(self.plugin, "_run_subprocess", side_effect=fake_run),
+        ):
+            result = __import__("asyncio").run(self.plugin._run_werss("status"))
+
+        self.assertIn("MEDIA:/home/ubuntu/.hermes/alphadesk-auth/werss-login.png", result)
+
     def test_extracts_command_options_with_query(self) -> None:
         days, query = self.plugin._extract_command_options('--days 7 --query "长光华芯"')
 

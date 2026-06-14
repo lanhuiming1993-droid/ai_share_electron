@@ -1,6 +1,6 @@
 name: alphadesk-command
-version: "0.1.7"
-description: Gateway audit classifier with runtime-meta bypass and structured PDF guardrail for AlphaDesk intents.
+version: "0.1.8"
+description: Gateway classifier for AlphaDesk PDF intents plus WeRSS subscription management commands.
 author: AlphaDesk
 provides_hooks:
   - pre_gateway_dispatch
