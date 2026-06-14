@@ -64,6 +64,11 @@ class AlphaDeskCollectReportScriptTests(unittest.TestCase):
         self.assertIn("光模块与材料涨价线索", output)
         self.assertIn("Snapshot coverage", output)
         self.assertIn("render_report_pdf.py", output)
+        self.assertIn("结构化 HTML", output)
+        self.assertIn("span.source-tag", output)
+        self.assertIn("span.fact", output)
+        self.assertIn("span.infer", output)
+        self.assertIn("span.unverified", output)
         self.assertIn("MEDIA:/absolute/path/to/report.pdf", output)
 
     def test_format_evidence_for_hermes_truncates_selected_evidence(self) -> None:

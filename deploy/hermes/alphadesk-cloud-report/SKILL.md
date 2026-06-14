@@ -25,11 +25,13 @@ python3 {baseDir}/scripts/collect_report.py --days 30
 脚本输出的是证据包，不是最终报告。拿到脚本输出后：
 
 1. 以行业分析师身份基于证据生成中文分析报告。
-2. 报告正文应先给核心结论，再按主题、产业链或投资线索拆分。
-3. 明确信息来自 WeRSS、IMA 知识库或知识星球。
-4. 如果 IMA 使用 cached evidence，要如实说明为缓存兜底，不要包装成实时采集成功。
-5. 生成适合 PDF 阅读的完整 HTML 或 Markdown 报告文件，推荐保存为 `/tmp/alphadesk-report-{job_id}.html`。
-6. 调用 PDF 渲染脚本：
+2. 不要输出纯长文或聊天式总结；必须先生成结构化 HTML，再转 PDF。
+3. 报告正文应先给核心结论，再按主题、产业链或投资线索拆分。
+4. 明确信息来自 WeRSS、IMA 知识库或知识星球；微信公众号内容尽量写出公众号名/作者。
+5. 每个主题必须有信源标签和资讯等级/类别标签，方便用户快速阅读和复核。
+6. 如果 IMA 使用 cached evidence，要如实说明为缓存兜底，不要包装成实时采集成功。
+7. 生成适合 PDF 阅读的完整 HTML 报告文件，保存为 `/tmp/alphadesk-report-{job_id}.html`。
+8. 调用 PDF 渲染脚本：
 
 ```bash
 /opt/alphadesk/.venv/bin/python {baseDir}/scripts/render_report_pdf.py \
@@ -39,6 +41,39 @@ python3 {baseDir}/scripts/collect_report.py --days 30
 ```
 
 如果 `/opt/alphadesk/.venv/bin/python` 不存在，则使用 `python3` 调用同一脚本。
+
+## HTML Structure
+
+HTML 必须使用下面的语义类名，PDF 渲染器会识别这些类名并保留卡片、信源标签和资讯等级样式：
+
+```html
+<div class="container">
+  <div class="header">
+    <h1>AlphaDesk 三信源近N日聚合报告</h1>
+    <div class="meta">
+      <span>数据锚点：...</span>
+      <span>窗口：...</span>
+      <span>主权重信源：知识星球 + WeRSS + IMA</span>
+    </div>
+  </div>
+
+  <h2>一、主题名称</h2>
+  <div class="card">
+    <p>
+      <span class="source-tag source-high">知识星球：作者或圈子</span>
+      <span class="source-tag">WeRSS：公众号名</span>
+      <span class="source-tag">IMA 知识库</span>
+    </p>
+    <ul>
+      <li><span class="fact">事实</span> 已由证据直接支持的信息。</li>
+      <li><span class="infer">推断</span> 基于多条证据归纳出的产业判断。</li>
+      <li><span class="unverified">待核验</span> 尚缺官方口径或二次验证的信息。</li>
+    </ul>
+  </div>
+</div>
+```
+
+样式可以参考旧版 AlphaDesk 报告：浅色背景、白色正文、卡片化主题、蓝色普通信源标签、金色高权重信源标签、绿色事实、橙色推断、红色待核验。即使 HTML 里写了 CSS，也不能只依赖 CSS；类名必须正确，因为 PDF 渲染器按类名保留结构。
 
 ## Final Reply
 
