@@ -425,7 +425,7 @@ def render_structured_pdf(report_text: str, output_path: Path, title: str = DEFA
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
     from reportlab.lib.units import mm
-    from reportlab.platypus import KeepTogether, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
     elements = structured_html_elements(report_text)
     font_name = register_font()
@@ -497,27 +497,27 @@ def render_structured_pdf(report_text: str, output_path: Path, title: str = DEFA
             card_flowables.append(Paragraph(text, bullet_style, bulletText="-"))
         background = "#fef2f2" if card.risk else "#f8fafc"
         border = "#fecaca" if card.risk else "#e2e8f0"
+        rows = [[flowable] for flowable in (card_flowables or [Paragraph(" ", base)])]
         story.append(
-            KeepTogether(
-                [
-                    Table(
-                        [[card_flowables or [Paragraph(" ", base)]]],
-                        colWidths=[content_width],
-                        style=TableStyle(
-                            [
-                                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(background)),
-                                ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor(border)),
-                                ("LEFTPADDING", (0, 0), (-1, -1), 10),
-                                ("RIGHTPADDING", (0, 0), (-1, -1), 10),
-                                ("TOPPADDING", (0, 0), (-1, -1), 8),
-                                ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
-                            ]
-                        ),
-                    ),
-                    Spacer(1, 4 * mm),
-                ]
+            Table(
+                rows,
+                colWidths=[content_width],
+                splitByRow=1,
+                style=TableStyle(
+                    [
+                        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor(background)),
+                        ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor(border)),
+                        ("LEFTPADDING", (0, 0), (-1, -1), 10),
+                        ("RIGHTPADDING", (0, 0), (-1, -1), 10),
+                        ("TOPPADDING", (0, 0), (-1, -1), 3),
+                        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+                        ("TOPPADDING", (0, 0), (-1, 0), 8),
+                        ("BOTTOMPADDING", (0, -1), (-1, -1), 8),
+                    ]
+                ),
             )
         )
+        story.append(Spacer(1, 4 * mm))
     flush_meta()
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

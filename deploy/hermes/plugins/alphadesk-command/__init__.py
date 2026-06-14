@@ -375,6 +375,225 @@ def _extract_final_response(stdout: str) -> str:
     return text.strip()
 
 
+def _strip_code_fence(value: str) -> str:
+    text = str(value or "").strip()
+    fence = re.search(r"```(?:html)?\s*(.*?)```", text, flags=re.I | re.S)
+    if fence:
+        return fence.group(1).strip()
+    return text
+
+
+def _valid_structured_html(value: str) -> str | None:
+    html_text = _strip_code_fence(value)
+    lower = html_text.lower()
+    if not lower.lstrip().startswith(("<!doctype", "<html", "<body", "<div", "<section", "<article")):
+        return None
+    invalid_phrases = (
+        "尚未完成 html",
+        "尚未完成 pdf",
+        "无法继续执行",
+        "工具调用次数已达上限",
+        "不能生成文件",
+        "无法生成文件",
+    )
+    if any(phrase in lower for phrase in invalid_phrases):
+        return None
+
+    def has_class(name: str) -> bool:
+        return bool(re.search(r"class\s*=\s*['\"][^'\"]*\b" + re.escape(name) + r"\b", lower))
+
+    if (
+        re.search(r"<div\b[^>]*class\s*=\s*['\"][^'\"]*\bcontainer\b", lower)
+        and has_class("card")
+        and has_class("source-tag")
+        and has_class("fact")
+        and has_class("infer")
+        and has_class("unverified")
+    ):
+        return html_text
+    return None
+
+
+def _strip_embedded_report_requirements(evidence_text: str) -> str:
+    text = str(evidence_text or "")
+    marker = "\nReport requirements:"
+    if marker in text:
+        return text.split(marker, 1)[0].rstrip()
+    return text
+
+
+def _evidence_line_value(evidence_text: str, prefix: str) -> str:
+    for line in str(evidence_text or "").splitlines():
+        if line.startswith(prefix):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def _evidence_list_after(evidence_text: str, heading: str, *, limit: int = 20) -> list[str]:
+    lines = str(evidence_text or "").splitlines()
+    result: list[str] = []
+    capture = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == heading:
+            capture = True
+            continue
+        if capture and stripped and not stripped.startswith("-") and stripped.endswith(":"):
+            break
+        if capture and stripped.startswith("-"):
+            result.append(stripped[1:].strip())
+            if len(result) >= limit:
+                break
+    return result
+
+
+def _selected_evidence_items(evidence_text: str, *, limit: int = 12) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    current: dict[str, str] | None = None
+    content_lines: list[str] = []
+    header_re = re.compile(r"^\[(\d+)\]\s+([^|]+)\|\s*([^|]+)\|\s*(.*)$")
+    for raw_line in str(evidence_text or "").splitlines():
+        line = raw_line.strip()
+        match = header_re.match(line)
+        if match:
+            if current:
+                current["content"] = " ".join(content_lines).strip()
+                items.append(current)
+                if len(items) >= limit:
+                    return items
+            current = {
+                "index": match.group(1).strip(),
+                "channel": match.group(2).strip(),
+                "time": match.group(3).strip(),
+                "title": match.group(4).strip(),
+            }
+            content_lines = []
+            continue
+        if current and line and not line.startswith("Source:"):
+            content_lines.append(line)
+    if current and len(items) < limit:
+        current["content"] = " ".join(content_lines).strip()
+        items.append(current)
+    return items
+
+
+def _html_list(items: list[str], label_class: str = "fact", label: str = "事实") -> str:
+    if not items:
+        return f"<li><span class=\"unverified\">待核验</span> 暂无可用条目。</li>"
+    return "\n".join(
+        f"<li><span class=\"{label_class}\">{html.escape(label)}</span> {html.escape(item)}</li>"
+        for item in items
+    )
+
+
+def _fallback_html_report(evidence_text: str, *, days: int, query: str, invalid_output: str = "") -> str:
+    title = f"AlphaDesk {query or '三信源'}近{days}天分析报告"
+    job = _evidence_line_value(evidence_text, "Job")
+    status = _evidence_line_value(evidence_text, "Status")
+    lookback = _evidence_line_value(evidence_text, "Lookback days") or str(days)
+    source_runs = _evidence_list_after(evidence_text, "Source runs:", limit=10)
+    coverage = _evidence_list_after(evidence_text, "Snapshot coverage:", limit=10)
+    selected = _selected_evidence_items(evidence_text, limit=12)
+    direct_items = [
+        item for item in selected
+        if query and query.lower() in (item.get("title", "") + item.get("content", "")).lower()
+    ]
+    evidence_scope = (
+        f"本轮采集任务状态为 {status or 'unknown'}。"
+        f"围绕 {query or '三信源'} 的直接证据为 {len(direct_items)} 条，"
+        f"精选证据总数为 {len(selected)} 条。"
+    )
+    selected_lines = []
+    for item in selected[:8]:
+        title_text = item.get("title") or item.get("channel") or "未命名证据"
+        content = item.get("content") or "无摘要"
+        selected_lines.append(f"{item.get('channel')} | {title_text}：{content[:420]}")
+    invalid_note = ""
+    if invalid_output:
+        invalid_note = (
+            "<li><span class=\"unverified\">待核验</span> Hermes 模型本轮未返回合格结构化 HTML，"
+            "系统已改用证据包生成兜底报告，避免把过程说明误当成研报。</li>"
+        )
+    return f"""<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{html.escape(title)}</title>
+</head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>{html.escape(title)}</h1>
+    <div class="meta">
+      <span>Job：{html.escape(job or '-')}</span>
+      <span>状态：{html.escape(status or '-')}</span>
+      <span>窗口：近 {html.escape(str(lookback))} 天</span>
+      <span>信源：WeRSS + IMA 知识库 + 知识星球 MCP</span>
+    </div>
+  </div>
+
+  <h2>一、结论先行</h2>
+  <div class="card">
+    <p>
+      <span class="source-tag source-high">AlphaDesk 证据包</span>
+      <span class="source-tag">Hermes 结构化兜底</span>
+    </p>
+    <ul>
+      <li><span class="fact">事实</span> {html.escape(evidence_scope)}</li>
+      <li><span class="infer">推断</span> 当前报告应定位为“证据覆盖与待补采报告”，不能强行给出高置信投资结论。</li>
+      <li><span class="unverified">待核验</span> 若需要公司级深度结论，应补采公告、财报、股价、券商研报、公众号与 IMA 知识库中的直接材料。</li>
+    </ul>
+  </div>
+
+  <h2>二、逐信源状态</h2>
+  <div class="card">
+    <p>
+      <span class="source-tag source-high">采集状态</span>
+      <span class="source-tag">水位检测</span>
+    </p>
+    <ul>
+      {_html_list(source_runs, "fact", "事实")}
+    </ul>
+  </div>
+
+  <h2>三、快照覆盖</h2>
+  <div class="card">
+    <p>
+      <span class="source-tag">快照统计</span>
+    </p>
+    <ul>
+      {_html_list(coverage, "fact", "事实")}
+      <li><span class="infer">推断</span> 有快照的信源可作为背景证据；没有快照或失败的信源不能支持确定性结论。</li>
+    </ul>
+  </div>
+
+  <h2>四、精选证据摘要</h2>
+  <div class="card">
+    <p>
+      <span class="source-tag source-high">知识星球 / WeRSS / IMA</span>
+    </p>
+    <ul>
+      {_html_list(selected_lines, "fact", "事实")}
+    </ul>
+  </div>
+
+  <h2>五、待核验与风险提示</h2>
+  <div class="card">
+    <p>
+      <span class="source-tag">AlphaDesk 风控</span>
+    </p>
+    <ul>
+      {invalid_note}
+      <li><span class="unverified">待核验</span> 本报告不得替代投资建议；证据不足处必须回到原始信源复核。</li>
+      <li><span class="unverified">待核验</span> IMA 超量、WeRSS 无快照或知识星球证据偏背景化时，结论置信度应下调。</li>
+      <li><span class="infer">推断</span> 下一步应按“公司公告/财报/产业链订单/客户与竞品/股价与估值”补齐直接证据。</li>
+    </ul>
+  </div>
+</div>
+</body>
+</html>"""
+
+
 async def _run_subprocess(command: list[str], *, cwd: Path | None = None, timeout: int = 1800) -> tuple[int, str]:
     proc = await asyncio.create_subprocess_exec(
         *command,
@@ -393,6 +612,7 @@ async def _run_subprocess(command: list[str], *, cwd: Path | None = None, timeou
 
 def _analysis_prompt(evidence_text: str, *, days: int, query: str) -> str:
     title = f"AlphaDesk {query or '三信源'}近{days}天分析报告"
+    evidence_body = _strip_embedded_report_requirements(evidence_text)
     return f"""
 你是 AlphaDesk 行业分析师。请基于下面的 AlphaDesk 三信源证据包生成完整中文 HTML 报告。
 
@@ -403,10 +623,11 @@ def _analysis_prompt(evidence_text: str, *, days: int, query: str) -> str:
 4. 每个 card 开头必须有 <span class="source-tag">，主证据用 <span class="source-tag source-high">。
 5. 每条要点必须使用 <span class="fact">事实</span>、<span class="infer">推断</span> 或 <span class="unverified">待核验</span>。
 6. 如果证据不足，仍然输出 PDF 友好的“证据不足/待补采”报告，不要编造事实。
-7. 报告标题：{title}
+7. 不要输出“尚未完成 HTML 文件保存”“尚未完成 PDF 渲染”“我无法生成文件”等过程说明；你只负责返回可渲染 HTML。
+8. 报告标题：{title}
 
 证据包：
-{evidence_text}
+{evidence_body}
 """.strip()
 
 
@@ -509,17 +730,19 @@ async def _run_report(raw_args: str) -> str:
     if collect_code != 0 and not evidence.strip():
         return f"AlphaDesk 采集失败，未生成 PDF：exit={collect_code}"
     html_code, html_report = await _generate_html_with_hermes(evidence, days=days, query=query)
-    if html_code == 0 and html_report.strip():
-        rendered = await _render_text_to_pdf(html_report, days=days, query=query, is_html=True)
+    structured_html = _valid_structured_html(html_report) if html_code == 0 else None
+    if structured_html:
+        rendered = await _render_text_to_pdf(structured_html, days=days, query=query, is_html=True)
         if "MEDIA:" in rendered:
             return rendered
         logger.warning("alphadesk analysis pdf render failed, falling back to evidence pdf: %s", rendered)
-    fallback = (
-        f"# AlphaDesk {query or '三信源'}近{days}天证据包\n\n"
-        "Hermes 模型分析未能生成可渲染 HTML，以下为采集证据与失败边界，供复核。\n\n"
-        f"```text\n{evidence[-20000:]}\n```"
+    fallback_html = _fallback_html_report(
+        evidence,
+        days=days,
+        query=query,
+        invalid_output=html_report if html_code == 0 else f"html_generation_exit={html_code}",
     )
-    return await _render_text_to_pdf(fallback, days=days, query=query, is_html=False)
+    return await _render_text_to_pdf(fallback_html, days=days, query=query, is_html=True)
 
 
 def _pre_gateway_dispatch(event, **_kwargs):

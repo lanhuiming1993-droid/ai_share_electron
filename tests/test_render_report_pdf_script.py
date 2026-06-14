@@ -126,6 +126,38 @@ class AlphaDeskRenderReportPdfTests(unittest.TestCase):
             self.assertGreater(output.stat().st_size, 500)
             self.assertEqual(output.read_bytes()[:4], b"%PDF")
 
+    def test_render_pdf_splits_tall_structured_cards(self) -> None:
+        try:
+            import reportlab  # noqa: F401
+        except Exception:
+            self.skipTest("reportlab is not installed")
+
+        items = "\n".join(
+            f"<li><span class='fact'>Fact</span> Evidence item {index}: "
+            f"{'long structured evidence text ' * 12}</li>"
+            for index in range(1, 45)
+        )
+        html = f"""
+        <html><body>
+          <div class="header">
+            <h1>AlphaDesk Long Structured Report</h1>
+            <div class="meta"><span>Window: 30 days</span></div>
+          </div>
+          <h2>Evidence Summary</h2>
+          <div class="card">
+            <p><span class="source-tag source-high">ZSXQ</span><span class="source-tag">WeRSS</span></p>
+            <ul>{items}</ul>
+          </div>
+        </body></html>
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "long-structured.pdf"
+            result = self.script.render_pdf(html, output, title="AlphaDesk Long Structured", input_format="html")
+
+            self.assertEqual(result, output)
+            self.assertGreater(output.stat().st_size, 500)
+            self.assertEqual(output.read_bytes()[:4], b"%PDF")
+
 
 if __name__ == "__main__":
     unittest.main()

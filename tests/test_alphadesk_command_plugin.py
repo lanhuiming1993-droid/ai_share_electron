@@ -191,6 +191,53 @@ class AlphaDeskCommandPluginTests(unittest.TestCase):
 
         self.assertEqual(self.plugin._extract_final_response(stdout), "<html>ok</html>")
 
+    def test_valid_structured_html_requires_report_classes(self) -> None:
+        valid = """
+        ```html
+        <div class="container">
+          <div class="card">
+            <span class="source-tag source-high">AlphaDesk</span>
+            <ul>
+              <li><span class="fact">事实</span> A</li>
+              <li><span class="infer">推断</span> B</li>
+              <li><span class="unverified">待核验</span> C</li>
+            </ul>
+          </div>
+        </div>
+        ```
+        """
+
+        self.assertIsNotNone(self.plugin._valid_structured_html(valid))
+        self.assertIsNone(self.plugin._valid_structured_html("尚未完成 HTML 文件保存与 PDF 渲染。"))
+        process_text_with_tag_examples = """
+        已加载 AlphaDesk 三信源报告生成规范。
+        顶层包含 `<div class="container">`，每个主题使用 `<div class="card">`。
+        每个 card 开头包含 `<span class="source-tag">`，主证据使用 `<span class="source-tag source-high">`。
+        每条要点标注 `<span class="fact">事实</span>`、`<span class="infer">推断</span>` 或
+        `<span class="unverified">待核验</span>`。
+        由于工具调用次数已达上限，我无法继续执行保存 HTML 文件或调用 render_report_pdf.py。
+        """
+        self.assertIsNone(self.plugin._valid_structured_html(process_text_with_tag_examples))
+
+    def test_analysis_prompt_strips_embedded_report_requirements(self) -> None:
+        evidence = """AlphaDesk 三信源证据包已就绪。
+Job: job-1
+Selected evidence:
+[1] zsxq | 2026-06-14 | title
+content
+
+Report requirements:
+- 默认交付 PDF：先把完整报告保存为 /tmp/alphadesk-report-job-1.html
+- 最终聊天回复必须发送 MEDIA:/absolute/path/to/report.pdf
+"""
+
+        prompt = self.plugin._analysis_prompt(evidence, days=30, query="卓胜微")
+
+        self.assertIn("Selected evidence:", prompt)
+        self.assertIn("content", prompt)
+        self.assertNotIn("默认交付 PDF", prompt)
+        self.assertNotIn("MEDIA:/absolute/path", prompt)
+
     def test_run_report_collects_analyzes_and_returns_pdf_media(self) -> None:
         async def fake_collect(days: int, query: str):
             self.assertEqual(days, 7)
@@ -213,6 +260,52 @@ class AlphaDeskCommandPluginTests(unittest.TestCase):
             result = __import__("asyncio").run(self.plugin._run_report("--days 7 --query 卓胜微"))
 
         self.assertEqual(result, "已生成 PDF 版报告，便于阅读和保存。\nMEDIA:/tmp/report.pdf")
+
+    def test_run_report_falls_back_to_structured_html_when_model_returns_process_text(self) -> None:
+        evidence = """AlphaDesk 三信源证据包已就绪。
+Job: job-1
+Status: partial_completed
+Lookback days: 30
+Research query: 卓胜微
+Source runs:
+- wechat-mp-rss: deduplicated
+- ima-knowledge: failed; note=IMA OpenAPI 200005: 请求超量
+- zsxq: completed; used=91
+
+Snapshot coverage:
+- wechat-mp-rss: 0 snapshots attached
+- ima-knowledge: 0 snapshots attached
+- zsxq: 91 snapshots attached
+
+Selected evidence:
+[1] zsxq | 2026-06-14 | 知识星球 | 半导体设备材料去日化
+半导体材料、设备国产化线索升温，但未直接指向卓胜微。
+"""
+
+        async def fake_collect(days: int, query: str):
+            return 0, evidence
+
+        async def fake_generate(evidence_text: str, *, days: int, query: str):
+            return 0, "已加载并核对 AlphaDesk 报告生成规范，但尚未完成 HTML 文件保存与 PDF 渲染。"
+
+        async def fake_render(text: str, *, days: int, query: str, is_html: bool):
+            self.assertTrue(is_html)
+            self.assertIn('class="container"', text)
+            self.assertIn('class="card"', text)
+            self.assertIn("逐信源状态", text)
+            self.assertIn("精选证据摘要", text)
+            self.assertIn("Hermes 模型本轮未返回合格结构化 HTML", text)
+            self.assertNotIn("尚未完成 HTML 文件保存", text)
+            return "已生成 PDF 版报告，便于阅读和保存。\nMEDIA:/tmp/fallback.pdf"
+
+        with (
+            patch.object(self.plugin, "_collect_evidence", side_effect=fake_collect),
+            patch.object(self.plugin, "_generate_html_with_hermes", side_effect=fake_generate),
+            patch.object(self.plugin, "_render_text_to_pdf", side_effect=fake_render),
+        ):
+            result = __import__("asyncio").run(self.plugin._run_report("--days 30 --query 卓胜微"))
+
+        self.assertEqual(result, "已生成 PDF 版报告，便于阅读和保存。\nMEDIA:/tmp/fallback.pdf")
 
 
 if __name__ == "__main__":
