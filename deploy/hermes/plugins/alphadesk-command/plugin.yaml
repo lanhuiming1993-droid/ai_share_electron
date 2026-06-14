@@ -1,6 +1,6 @@
 name: alphadesk-command
-version: "0.1.4"
-description: Gateway audit classifier for AlphaDesk cloud reports and scoped analysis intents.
+version: "0.1.5"
+description: Gateway audit classifier and PDF guardrail for AlphaDesk report and analysis intents.
 author: AlphaDesk
 provides_hooks:
   - pre_gateway_dispatch

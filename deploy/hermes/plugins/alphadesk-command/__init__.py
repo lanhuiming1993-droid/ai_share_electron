@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
 import re
 import shlex
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +17,10 @@ TRIGGER = "采集近30天数据并生成报告"
 COMMAND = "alphadesk-report"
 SUPPORTED_PLATFORMS = {"weixin", "lightclawbot"}
 REPORT_SCRIPT = Path.home() / ".hermes" / "skills" / "alphadesk-cloud-report" / "scripts" / "collect_report.py"
+RENDER_SCRIPT = Path.home() / ".hermes" / "skills" / "alphadesk-cloud-report" / "scripts" / "render_report_pdf.py"
+REPORT_OUTPUT_DIR = Path.home() / ".hermes" / "alphadesk-reports"
+HERMES_AGENT_ROOT = Path.home() / ".hermes" / "hermes-agent"
+HERMES_CONFIG_PATH = Path.home() / ".hermes" / "config.yaml"
 REPORT_REQUEST_RE = re.compile(r"采集近?(?P<days>\d{1,2})天(?:的)?数据.*生成(?:分析)?报告")
 REPORT_FALLBACK_RE = re.compile(r"(生成|输出|做|整理).{0,8}(信源|三信源|聚合).{0,8}(报告|PDF)", re.I)
 ANALYSIS_PREFIX_RE = re.compile(r"(?:帮我|请)?(?:分析一下|分析下|分析|研究一下|研究下|看看|看一下)(?P<query>[\w\u4e00-\u9fff·（）()\- ]{2,60})")
@@ -24,6 +30,8 @@ MARKET_HINT_RE = re.compile(
     re.I,
 )
 DEFAULT_AUDIT_PATH = Path.home() / ".hermes" / "alphadesk-command.audit.jsonl"
+DEFAULT_STATE_PATH = Path.home() / ".hermes" / "alphadesk-command.state.json"
+PDF_MEDIA_RE = re.compile(r"MEDIA:/\S+?\.pdf\b", re.I)
 logger = logging.getLogger(__name__)
 
 
@@ -105,9 +113,26 @@ def _extract_command_options(raw_args: str) -> tuple[int, str]:
     return days, query
 
 
+def _quote_command_arg(value: str) -> str:
+    return shlex.quote(str(value or ""))
+
+
+def _command_text_for_classification(classification: dict) -> str:
+    parts = [f"/{COMMAND}", "--days", str(int(classification.get("days") or 30))]
+    query = str(classification.get("query") or "").strip()
+    if query:
+        parts.extend(["--query", _quote_command_arg(query)])
+    return " ".join(parts)
+
+
 def _audit_path() -> Path:
     configured = os.environ.get("ALPHADESK_COMMAND_AUDIT_PATH", "").strip()
     return Path(configured) if configured else DEFAULT_AUDIT_PATH
+
+
+def _state_path() -> Path:
+    configured = os.environ.get("ALPHADESK_COMMAND_STATE_PATH", "").strip()
+    return Path(configured) if configured else DEFAULT_STATE_PATH
 
 
 def _source_attr(source, name: str) -> str:
@@ -157,24 +182,344 @@ def _record_alphadesk_request(event, *, intent: str, days: int, query: str) -> N
     )
 
 
-async def _run_report(raw_args: str) -> str:
-    days, query = _extract_command_options(raw_args)
-    if not REPORT_SCRIPT.exists():
-        return f"AlphaDesk report script is missing: {REPORT_SCRIPT}"
+def _load_state() -> dict:
+    path = _state_path()
+    try:
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        logger.debug("alphadesk state read failed", exc_info=True)
+    return {}
 
-    command = ["python3", str(REPORT_SCRIPT), "--days", str(days)]
-    if query:
-        command.extend(["--query", query])
+
+def _save_state(state: dict) -> None:
+    path = _state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        tmp.replace(path)
+    except Exception:
+        logger.debug("alphadesk state write failed", exc_info=True)
+
+
+def _remember_session_intent(session_id: str, classification: dict, user_message: str, platform: str) -> None:
+    if not session_id:
+        return
+    now = time.time()
+    state = _load_state()
+    sessions = state.setdefault("sessions", {})
+    if not isinstance(sessions, dict):
+        sessions = {}
+        state["sessions"] = sessions
+    for key, item in list(sessions.items()):
+        if not isinstance(item, dict) or now - float(item.get("timestamp") or 0) > 6 * 3600:
+            sessions.pop(key, None)
+    sessions[session_id] = {
+        "timestamp": now,
+        "intent": classification.get("intent") or "analysis",
+        "days": classification.get("days") or 30,
+        "query": classification.get("query") or "",
+        "platform": platform,
+        "content_preview": _preview_text(user_message),
+        "require_pdf": True,
+    }
+    _save_state(state)
+
+
+def _consume_session_intent(session_id: str) -> dict | None:
+    if not session_id:
+        return None
+    state = _load_state()
+    sessions = state.get("sessions")
+    if not isinstance(sessions, dict):
+        return None
+    item = sessions.pop(session_id, None)
+    _save_state(state)
+    if not isinstance(item, dict):
+        return None
+    if time.time() - float(item.get("timestamp") or 0) > 6 * 3600:
+        return None
+    return item if item.get("require_pdf") else None
+
+
+def _alphadesk_pre_llm_context(classification: dict) -> str:
+    query = str(classification.get("query") or "").strip()
+    days = int(classification.get("days") or 30)
+    query_arg = f' --query "{query}"' if query else ""
+    return (
+        "AlphaDesk mandatory routing context:\n"
+        "- This user request is an AlphaDesk stock/industry/source-report intent.\n"
+        "- You must act as the AlphaDesk industry analyst, not as a generic chat assistant.\n"
+        "- Use AlphaDesk evidence collection first when possible:\n"
+        f"  python3 ~/.hermes/skills/alphadesk-cloud-report/scripts/collect_report.py --days {days}{query_arg}\n"
+        "- The final user-visible answer must be a PDF file, not a long text report.\n"
+        "- If you produce analysis text, the AlphaDesk plugin will package it into PDF and replace the chat reply with MEDIA:/...pdf."
+    )
+
+
+def _plain_text_to_structured_html(response_text: str, title: str) -> str:
+    escaped = html.escape(str(response_text or "").strip()).replace("\n", "<br/>")
+    return f"""<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>{html.escape(title)}</title></head>
+<body>
+<div class="container">
+  <div class="header">
+    <h1>{html.escape(title)}</h1>
+    <div class="meta">
+      <span>生成方：Hermes / AlphaDesk</span>
+      <span>交付形式：PDF</span>
+      <span>说明：原始文字分析已转为文件版，便于阅读和保存</span>
+    </div>
+  </div>
+  <h2>一、Hermes 分析正文</h2>
+  <div class="card">
+    <p><span class="source-tag source-high">AlphaDesk</span><span class="source-tag">Hermes 分析</span></p>
+    <ul>
+      <li><span class="infer">分析</span> {escaped}</li>
+    </ul>
+  </div>
+  <h2>二、待核验与风险提示</h2>
+  <div class="card">
+    <p><span class="source-tag">AlphaDesk 风控</span></p>
+    <ul>
+      <li><span class="unverified">待核验</span> 若本报告未展示具体信源标签，说明本轮 Hermes 未按 AlphaDesk 证据模板输出，需复核证据采集日志。</li>
+    </ul>
+  </div>
+</div>
+</body>
+</html>
+"""
+
+
+def _render_response_pdf(response_text: str, state: dict) -> str | None:
+    if not response_text.strip() or PDF_MEDIA_RE.search(response_text):
+        return None
+    if not RENDER_SCRIPT.exists():
+        logger.warning("alphadesk render script missing: %s", RENDER_SCRIPT)
+        return None
+    query = str(state.get("query") or "").strip()
+    title = f"AlphaDesk-{query or '三信源'}分析报告"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    input_path = REPORT_OUTPUT_DIR / f"{title}-{stamp}.html"
+    output_path = REPORT_OUTPUT_DIR / f"{title}-{stamp}.pdf"
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+    input_path.write_text(_plain_text_to_structured_html(response_text, title), encoding="utf-8")
+    python_bin = "/opt/alphadesk/.venv/bin/python"
+    if not Path(python_bin).exists():
+        python_bin = "python3"
+    try:
+        proc = subprocess.run(
+            [
+                python_bin,
+                str(RENDER_SCRIPT),
+                "--input",
+                str(input_path),
+                "--format",
+                "html",
+                "--title",
+                title,
+                "--output",
+                str(output_path),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+        )
+    except Exception:
+        logger.warning("alphadesk pdf render failed", exc_info=True)
+        return None
+    if proc.returncode != 0 or not output_path.exists():
+        logger.warning("alphadesk pdf render returned %s: %s", proc.returncode, proc.stdout[-500:])
+        return None
+    return f"已生成 PDF 版报告，便于阅读和保存。\nMEDIA:{output_path}"
+
+
+def _load_hermes_provider() -> dict:
+    try:
+        import yaml
+        config = yaml.safe_load(HERMES_CONFIG_PATH.read_text(encoding="utf-8")) or {}
+    except Exception:
+        logger.warning("failed to read Hermes provider config", exc_info=True)
+        return {}
+    providers = config.get("providers") if isinstance(config.get("providers"), dict) else {}
+    for name in ("custom_jojo", "deepseek", "kimicode"):
+        provider = providers.get(name)
+        if isinstance(provider, dict) and provider.get("api_key") and provider.get("base_url") and provider.get("model"):
+            return {
+                "name": name,
+                "model": str(provider["model"]),
+                "api_key": str(provider["api_key"]),
+                "base_url": str(provider["base_url"]),
+            }
+    return {}
+
+
+def _extract_final_response(stdout: str) -> str:
+    marker = "🎯 FINAL RESPONSE:"
+    text = str(stdout or "")
+    if marker in text:
+        tail = text.split(marker, 1)[1]
+        tail = re.sub(r"^-{3,}\s*", "", tail.strip(), flags=re.M)
+        tail = tail.split("\n\n👋", 1)[0].strip()
+        if tail:
+            return tail
+    assistant_matches = re.findall(r"🤖 Assistant:\s*(.+)", text)
+    if assistant_matches:
+        return assistant_matches[-1].strip()
+    return text.strip()
+
+
+async def _run_subprocess(command: list[str], *, cwd: Path | None = None, timeout: int = 1800) -> tuple[int, str]:
     proc = await asyncio.create_subprocess_exec(
         *command,
+        cwd=str(cwd) if cwd else None,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
-    stdout, _ = await proc.communicate()
-    output = stdout.decode("utf-8", errors="replace").strip()
-    if proc.returncode == 0:
-        return output or "AlphaDesk report completed, but the script returned no output."
-    return f"AlphaDesk report failed with exit code {proc.returncode}.\n\n{output}"
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        stdout, _ = await proc.communicate()
+        return 124, stdout.decode("utf-8", errors="replace")
+    return proc.returncode or 0, stdout.decode("utf-8", errors="replace")
+
+
+def _analysis_prompt(evidence_text: str, *, days: int, query: str) -> str:
+    title = f"AlphaDesk {query or '三信源'}近{days}天分析报告"
+    return f"""
+你是 AlphaDesk 行业分析师。请基于下面的 AlphaDesk 三信源证据包生成完整中文 HTML 报告。
+
+硬性要求：
+1. 只输出 HTML，不要输出 Markdown，不要输出解释文字。
+2. 顶层必须包含 <div class="container">。
+3. 每个主题必须使用 <div class="card">。
+4. 每个 card 开头必须有 <span class="source-tag">，主证据用 <span class="source-tag source-high">。
+5. 每条要点必须使用 <span class="fact">事实</span>、<span class="infer">推断</span> 或 <span class="unverified">待核验</span>。
+6. 如果证据不足，仍然输出 PDF 友好的“证据不足/待补采”报告，不要编造事实。
+7. 报告标题：{title}
+
+证据包：
+{evidence_text}
+""".strip()
+
+
+async def _collect_evidence(days: int, query: str) -> tuple[int, str]:
+    if not REPORT_SCRIPT.exists():
+        return 2, f"AlphaDesk report script is missing: {REPORT_SCRIPT}"
+    command = ["python3", str(REPORT_SCRIPT), "--days", str(days)]
+    if query:
+        command.extend(["--query", query])
+    command.extend(["--max-evidence-chars", "24000", "--limit-per-channel", "12", "--preview-chars", "1200"])
+    return await _run_subprocess(command, timeout=1900)
+
+
+async def _generate_html_with_hermes(evidence_text: str, *, days: int, query: str) -> tuple[int, str]:
+    provider = _load_hermes_provider()
+    if not provider:
+        return 2, "Hermes provider config is missing"
+    run_agent = HERMES_AGENT_ROOT / "run_agent.py"
+    python_bin = HERMES_AGENT_ROOT / "venv" / "bin" / "python"
+    if not run_agent.exists():
+        return 2, f"Hermes run_agent.py is missing: {run_agent}"
+    command = [
+        str(python_bin if python_bin.exists() else "python3"),
+        str(run_agent),
+        "--query",
+        _analysis_prompt(evidence_text, days=days, query=query),
+        "--max_turns",
+        "1",
+        "--model",
+        provider["model"],
+        "--api_key",
+        provider["api_key"],
+        "--base_url",
+        provider["base_url"],
+    ]
+    code, stdout = await _run_subprocess(command, cwd=HERMES_AGENT_ROOT, timeout=240)
+    return code, _extract_final_response(stdout)
+
+
+async def _render_text_to_pdf(text: str, *, days: int, query: str, is_html: bool) -> str:
+    if not RENDER_SCRIPT.exists():
+        return f"AlphaDesk PDF render script is missing: {RENDER_SCRIPT}"
+    title = f"AlphaDesk-{query or '三信源'}近{days}天分析报告"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    suffix = "html" if is_html else "md"
+    input_path = REPORT_OUTPUT_DIR / f"{title}-{stamp}.{suffix}"
+    output_path = REPORT_OUTPUT_DIR / f"{title}-{stamp}.pdf"
+    input_path.parent.mkdir(parents=True, exist_ok=True)
+    input_path.write_text(text, encoding="utf-8")
+    python_bin = "/opt/alphadesk/.venv/bin/python"
+    if not Path(python_bin).exists():
+        python_bin = "python3"
+    code, stdout = await _run_subprocess(
+        [
+            python_bin,
+            str(RENDER_SCRIPT),
+            "--input",
+            str(input_path),
+            "--format",
+            "html" if is_html else "markdown",
+            "--title",
+            title,
+            "--output",
+            str(output_path),
+        ],
+        timeout=180,
+    )
+    if code != 0 or not output_path.exists():
+        return f"AlphaDesk PDF render failed: {stdout[-500:]}"
+    return f"已生成 PDF 版报告，便于阅读和保存。\nMEDIA:{output_path}"
+
+
+def _pre_llm_call(**kwargs):
+    platform = str(kwargs.get("platform") or "").lower()
+    if platform not in SUPPORTED_PLATFORMS:
+        return None
+    user_message = str(kwargs.get("user_message") or "")
+    classification = _classify_alphadesk_request(user_message)
+    if classification is None:
+        return None
+    session_id = str(kwargs.get("session_id") or "")
+    _remember_session_intent(session_id, classification, user_message, platform)
+    return {"context": _alphadesk_pre_llm_context(classification)}
+
+
+def _transform_llm_output(**kwargs):
+    platform = str(kwargs.get("platform") or "").lower()
+    if platform not in SUPPORTED_PLATFORMS:
+        return None
+    session_id = str(kwargs.get("session_id") or "")
+    state = _consume_session_intent(session_id)
+    if not state:
+        return None
+    return _render_response_pdf(str(kwargs.get("response_text") or ""), state)
+
+
+async def _run_report(raw_args: str) -> str:
+    days, query = _extract_command_options(raw_args)
+    collect_code, evidence = await _collect_evidence(days, query)
+    if collect_code != 0 and not evidence.strip():
+        return f"AlphaDesk 采集失败，未生成 PDF：exit={collect_code}"
+    html_code, html_report = await _generate_html_with_hermes(evidence, days=days, query=query)
+    if html_code == 0 and html_report.strip():
+        rendered = await _render_text_to_pdf(html_report, days=days, query=query, is_html=True)
+        if "MEDIA:" in rendered:
+            return rendered
+        logger.warning("alphadesk analysis pdf render failed, falling back to evidence pdf: %s", rendered)
+    fallback = (
+        f"# AlphaDesk {query or '三信源'}近{days}天证据包\n\n"
+        "Hermes 模型分析未能生成可渲染 HTML，以下为采集证据与失败边界，供复核。\n\n"
+        f"```text\n{evidence[-20000:]}\n```"
+    )
+    return await _render_text_to_pdf(fallback, days=days, query=query, is_html=False)
 
 
 def _pre_gateway_dispatch(event, **_kwargs):
@@ -193,11 +538,13 @@ def _pre_gateway_dispatch(event, **_kwargs):
         days=classification["days"],
         query=classification["query"],
     )
-    return None
+    return {"action": "rewrite", "text": _command_text_for_classification(classification)}
 
 
 def register(ctx):
     ctx.register_hook("pre_gateway_dispatch", _pre_gateway_dispatch)
+    ctx.register_hook("pre_llm_call", _pre_llm_call)
+    ctx.register_hook("transform_llm_output", _transform_llm_output)
     ctx.register_command(
         COMMAND,
         _run_report,

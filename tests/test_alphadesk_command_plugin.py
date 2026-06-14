@@ -44,7 +44,14 @@ class AlphaDeskCommandPluginTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.audit_path = Path(self.tmp.name) / "alphadesk-command.audit.jsonl"
-        self.env_patch = patch.dict(os.environ, {"ALPHADESK_COMMAND_AUDIT_PATH": str(self.audit_path)})
+        self.state_path = Path(self.tmp.name) / "alphadesk-command.state.json"
+        self.env_patch = patch.dict(
+            os.environ,
+            {
+                "ALPHADESK_COMMAND_AUDIT_PATH": str(self.audit_path),
+                "ALPHADESK_COMMAND_STATE_PATH": str(self.state_path),
+            },
+        )
         self.env_patch.start()
         self.plugin = load_plugin_module()
 
@@ -55,7 +62,7 @@ class AlphaDeskCommandPluginTests(unittest.TestCase):
     def test_audits_exact_weixin_report_command_without_rewrite(self) -> None:
         result = self.plugin._pre_gateway_dispatch(make_event("采集近30天数据并生成报告"))
 
-        self.assertIsNone(result)
+        self.assertEqual(result, {"action": "rewrite", "text": "/alphadesk-report --days 30"})
         payload = json.loads(self.audit_path.read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(payload["platform"], "weixin")
         self.assertEqual(payload["intent"], "report")
@@ -67,7 +74,7 @@ class AlphaDeskCommandPluginTests(unittest.TestCase):
             make_event("请帮我采集近 30 天的数据，并生成分析报告。", "lightclawbot")
         )
 
-        self.assertIsNone(result)
+        self.assertEqual(result, {"action": "rewrite", "text": "/alphadesk-report --days 30"})
         payload = json.loads(self.audit_path.read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(payload["platform"], "lightclawbot")
         self.assertEqual(payload["intent"], "report")
@@ -76,7 +83,7 @@ class AlphaDeskCommandPluginTests(unittest.TestCase):
     def test_clamps_supported_report_window_to_thirty_days(self) -> None:
         result = self.plugin._pre_gateway_dispatch(make_event("采集近99天数据并生成报告"))
 
-        self.assertIsNone(result)
+        self.assertEqual(result, {"action": "rewrite", "text": "/alphadesk-report --days 30"})
         payload = json.loads(self.audit_path.read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(payload["days"], 30)
 
@@ -94,7 +101,7 @@ class AlphaDeskCommandPluginTests(unittest.TestCase):
     def test_audits_stock_analysis_request_as_alphadesk_base_intent(self) -> None:
         result = self.plugin._pre_gateway_dispatch(make_event("分析一下长光华芯"))
 
-        self.assertIsNone(result)
+        self.assertEqual(result, {"action": "rewrite", "text": "/alphadesk-report --days 30 --query '长光华芯'"})
         payload = json.loads(self.audit_path.read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(payload["platform"], "weixin")
         self.assertEqual(payload["intent"], "analysis")
@@ -104,7 +111,7 @@ class AlphaDeskCommandPluginTests(unittest.TestCase):
     def test_audits_suffix_analysis_request_with_market_hint(self) -> None:
         result = self.plugin._pre_gateway_dispatch(make_event("A股机器人板块怎么看"))
 
-        self.assertIsNone(result)
+        self.assertEqual(result, {"action": "rewrite", "text": "/alphadesk-report --days 30 --query 'A股机器人板块'"})
         payload = json.loads(self.audit_path.read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(payload["intent"], "analysis")
         self.assertEqual(payload["query"], "A股机器人板块")
@@ -118,6 +125,94 @@ class AlphaDeskCommandPluginTests(unittest.TestCase):
 
         self.assertEqual(days, 7)
         self.assertEqual(query, "长光华芯")
+
+    def test_command_text_for_classification_quotes_query(self) -> None:
+        text = self.plugin._command_text_for_classification({"intent": "analysis", "days": 7, "query": "长光 华芯"})
+
+        self.assertEqual(text, "/alphadesk-report --days 7 --query '长光 华芯'")
+
+    def test_pre_llm_call_records_alphadesk_session_and_injects_pdf_context(self) -> None:
+        result = self.plugin._pre_llm_call(
+            platform="lightclawbot",
+            session_id="session-1",
+            user_message="分析一下卓胜微",
+        )
+
+        self.assertIsInstance(result, dict)
+        self.assertIn("collect_report.py --days 30 --query \"卓胜微\"", result["context"])
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertEqual(state["sessions"]["session-1"]["query"], "卓胜微")
+        self.assertTrue(state["sessions"]["session-1"]["require_pdf"])
+
+    def test_transform_llm_output_renders_text_to_pdf_media_reply(self) -> None:
+        self.plugin._remember_session_intent(
+            "session-2",
+            {"intent": "analysis", "days": 30, "query": "卓胜微"},
+            "分析一下卓胜微",
+            "lightclawbot",
+        )
+        fake_pdf = Path(self.tmp.name) / "report.pdf"
+
+        def fake_render(response_text: str, state: dict):
+            self.assertIn("深度分析", response_text)
+            self.assertEqual(state["query"], "卓胜微")
+            fake_pdf.write_bytes(b"%PDF-1.4")
+            return f"已生成 PDF 版报告，便于阅读和保存。\nMEDIA:{fake_pdf}"
+
+        with patch.object(self.plugin, "_render_response_pdf", side_effect=fake_render):
+            result = self.plugin._transform_llm_output(
+                platform="lightclawbot",
+                session_id="session-2",
+                response_text="卓胜微 深度分析正文",
+            )
+
+        self.assertEqual(result, f"已生成 PDF 版报告，便于阅读和保存。\nMEDIA:{fake_pdf}")
+        state = json.loads(self.state_path.read_text(encoding="utf-8"))
+        self.assertNotIn("session-2", state["sessions"])
+
+    def test_transform_llm_output_leaves_existing_pdf_media_unchanged(self) -> None:
+        self.plugin._remember_session_intent(
+            "session-3",
+            {"intent": "analysis", "days": 30, "query": "卓胜微"},
+            "分析一下卓胜微",
+            "lightclawbot",
+        )
+
+        result = self.plugin._transform_llm_output(
+            platform="lightclawbot",
+            session_id="session-3",
+            response_text="已生成。\nMEDIA:/tmp/report.pdf",
+        )
+
+        self.assertIsNone(result)
+
+    def test_extract_final_response_from_run_agent_stdout(self) -> None:
+        stdout = "logs\n🎯 FINAL RESPONSE:\n------------------------------\n<html>ok</html>\n\n👋 Agent execution completed!"
+
+        self.assertEqual(self.plugin._extract_final_response(stdout), "<html>ok</html>")
+
+    def test_run_report_collects_analyzes_and_returns_pdf_media(self) -> None:
+        async def fake_collect(days: int, query: str):
+            self.assertEqual(days, 7)
+            self.assertEqual(query, "卓胜微")
+            return 0, "evidence"
+
+        async def fake_generate(evidence: str, *, days: int, query: str):
+            self.assertEqual(evidence, "evidence")
+            return 0, "<div class='container'><div class='card'><span class='source-tag'>AlphaDesk</span><ul><li><span class='fact'>事实</span> ok</li></ul></div></div>"
+
+        async def fake_render(text: str, *, days: int, query: str, is_html: bool):
+            self.assertTrue(is_html)
+            return "已生成 PDF 版报告，便于阅读和保存。\nMEDIA:/tmp/report.pdf"
+
+        with (
+            patch.object(self.plugin, "_collect_evidence", side_effect=fake_collect),
+            patch.object(self.plugin, "_generate_html_with_hermes", side_effect=fake_generate),
+            patch.object(self.plugin, "_render_text_to_pdf", side_effect=fake_render),
+        ):
+            result = __import__("asyncio").run(self.plugin._run_report("--days 7 --query 卓胜微"))
+
+        self.assertEqual(result, "已生成 PDF 版报告，便于阅读和保存。\nMEDIA:/tmp/report.pdf")
 
 
 if __name__ == "__main__":
