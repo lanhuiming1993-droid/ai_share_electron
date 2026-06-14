@@ -1,6 +1,6 @@
 name: alphadesk-command
-version: "0.1.3"
-description: Direct gateway command for AlphaDesk cloud source reports.
+version: "0.1.4"
+description: Gateway audit classifier for AlphaDesk cloud reports and scoped analysis intents.
 author: AlphaDesk
 provides_hooks:
   - pre_gateway_dispatch

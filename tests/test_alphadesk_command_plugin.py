@@ -58,7 +58,9 @@ class AlphaDeskCommandPluginTests(unittest.TestCase):
         self.assertIsNone(result)
         payload = json.loads(self.audit_path.read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(payload["platform"], "weixin")
+        self.assertEqual(payload["intent"], "report")
         self.assertEqual(payload["days"], 30)
+        self.assertEqual(payload["query"], "")
 
     def test_audits_lightclawbot_command_with_spacing_and_punctuation(self) -> None:
         result = self.plugin._pre_gateway_dispatch(
@@ -68,6 +70,7 @@ class AlphaDeskCommandPluginTests(unittest.TestCase):
         self.assertIsNone(result)
         payload = json.loads(self.audit_path.read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(payload["platform"], "lightclawbot")
+        self.assertEqual(payload["intent"], "report")
         self.assertEqual(payload["days"], 30)
 
     def test_clamps_supported_report_window_to_thirty_days(self) -> None:
@@ -82,13 +85,39 @@ class AlphaDeskCommandPluginTests(unittest.TestCase):
 
         payload = json.loads(self.audit_path.read_text(encoding="utf-8").splitlines()[0])
         self.assertEqual(payload["platform"], "weixin")
+        self.assertEqual(payload["command"], "alphadesk-report")
+        self.assertEqual(payload["intent"], "report")
         self.assertEqual(payload["days"], 30)
         self.assertEqual(payload["content_preview"], "采集近30天数据并生成报告")
         self.assertEqual(payload["chat_id"], "chat-1")
 
+    def test_audits_stock_analysis_request_as_alphadesk_base_intent(self) -> None:
+        result = self.plugin._pre_gateway_dispatch(make_event("分析一下长光华芯"))
+
+        self.assertIsNone(result)
+        payload = json.loads(self.audit_path.read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(payload["platform"], "weixin")
+        self.assertEqual(payload["intent"], "analysis")
+        self.assertEqual(payload["days"], 30)
+        self.assertEqual(payload["query"], "长光华芯")
+
+    def test_audits_suffix_analysis_request_with_market_hint(self) -> None:
+        result = self.plugin._pre_gateway_dispatch(make_event("A股机器人板块怎么看"))
+
+        self.assertIsNone(result)
+        payload = json.loads(self.audit_path.read_text(encoding="utf-8").splitlines()[0])
+        self.assertEqual(payload["intent"], "analysis")
+        self.assertEqual(payload["query"], "A股机器人板块")
+
     def test_ignores_non_gateway_platform_and_unrelated_text(self) -> None:
         self.assertIsNone(self.plugin._pre_gateway_dispatch(make_event("采集近30天数据并生成报告", "cli")))
         self.assertIsNone(self.plugin._pre_gateway_dispatch(make_event("你有什么技能", "weixin")))
+
+    def test_extracts_command_options_with_query(self) -> None:
+        days, query = self.plugin._extract_command_options('--days 7 --query "长光华芯"')
+
+        self.assertEqual(days, 7)
+        self.assertEqual(query, "长光华芯")
 
 
 if __name__ == "__main__":

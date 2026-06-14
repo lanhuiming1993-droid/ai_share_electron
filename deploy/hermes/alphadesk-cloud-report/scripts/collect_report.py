@@ -72,12 +72,14 @@ def _clean_text(value: str) -> str:
 
 
 def format_evidence_for_hermes(latest_status: dict, evidence: dict, max_evidence_chars: int) -> str:
+    query = _clean_text(latest_status.get("query") or "")
     lines = [
         "AlphaDesk 三信源证据包已就绪。",
         "请你作为行业分析师，基于下列证据生成面向用户的中文分析报告；不要声称后端已经生成报告，也不要补写证据中不存在的事实。",
         f"Job: {latest_status.get('id') or latest_status.get('job_id')}",
         f"Status: {latest_status.get('status')}",
         f"Lookback days: {latest_status.get('lookback_days')}",
+        f"Research query: {query or '(general market/source report)'}",
         "Source runs:",
     ]
     run_lines = format_runs_for_chat(latest_status)
@@ -117,6 +119,7 @@ def format_evidence_for_hermes(latest_status: dict, evidence: dict, max_evidence
     lines.append("")
     lines.append("Report requirements:")
     lines.append("- 输出中文。不要生成纯长文报告，必须先写成带样式的结构化 HTML，再调用 render_report_pdf.py 转 PDF。")
+    lines.append("- 如果 Research query 非空，报告必须围绕该对象展开；其他内容只能作为上下游、竞品、行业背景或风险参照。")
     lines.append("- HTML 必须使用以下结构：顶层 .container；顶部 .header + .meta；每个主题用 h2/h3；每个主题内容放入 div.card。")
     lines.append("- 每个 card 开头必须列出信源标签：span.source-tag；高权重或主证据信源加 span.source-tag.source-high。")
     lines.append("- 每条要点必须标注资讯等级/类别：span.fact 表示事实，span.infer 表示推断，span.unverified 表示待核验。")
@@ -133,6 +136,7 @@ def format_evidence_for_hermes(latest_status: dict, evidence: dict, max_evidence
 def main() -> int:
     parser = argparse.ArgumentParser(description="Trigger AlphaDesk cloud source report generation.")
     parser.add_argument("--days", type=int, default=30, help="lookback days, 1-30")
+    parser.add_argument("--query", default="", help="optional stock/company/industry/topic query for scoped evidence collection")
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
     parser.add_argument("--interval", type=int, default=20, help="poll interval seconds")
@@ -155,7 +159,8 @@ def main() -> int:
         print(json.dumps({"ready": ready.get("status"), "service": ready.get("service"), "version": ready.get("version")}, ensure_ascii=False))
         return 0
 
-    job = request_json("POST", args.base_url, "/api/agent/collect-report", token, {"lookback_days": args.days, "force_refresh": True})
+    payload = {"lookback_days": args.days, "force_refresh": True, "query": args.query.strip()}
+    job = request_json("POST", args.base_url, "/api/agent/collect-report", token, payload)
     job_id = job["job_id"]
     print(json.dumps({"event": "queued", "job_id": job_id, "channel_ids": job.get("channel_ids")}, ensure_ascii=False))
 

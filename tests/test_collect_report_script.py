@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+import sys
+import tempfile
 import unittest
+from unittest.mock import patch
 
 
 def load_collect_report_module():
@@ -30,6 +33,7 @@ class AlphaDeskCollectReportScriptTests(unittest.TestCase):
             "id": "job-1",
             "status": "partial_completed",
             "lookback_days": 30,
+            "query": "长光华芯",
             "runs": [
                 {"channel_id": "wechat-mp-rss", "status": "deduplicated", "duplicate_count": 12},
                 {"channel_id": "ima-knowledge", "status": "cached_after_error", "duplicate_count": 2, "error": "forbidden"},
@@ -57,6 +61,7 @@ class AlphaDeskCollectReportScriptTests(unittest.TestCase):
         output = self.script.format_evidence_for_hermes(latest_status, evidence, 1000)
 
         self.assertIn("Job: job-1", output)
+        self.assertIn("Research query: 长光华芯", output)
         self.assertIn("- wechat-mp-rss: deduplicated; used=12", output)
         self.assertIn("- ima-knowledge: cached_after_error; used=2; note=forbidden", output)
         self.assertIn("- zsxq: completed; used=3", output)
@@ -87,6 +92,45 @@ class AlphaDeskCollectReportScriptTests(unittest.TestCase):
         output = self.script.format_evidence_for_hermes(latest_status, evidence, 260)
 
         self.assertIn("Evidence truncated for Hermes context", output)
+
+    def test_main_posts_query_to_agent_collect_report(self) -> None:
+        calls: list[tuple[str, str, dict | None]] = []
+
+        def fake_request(method: str, _base_url: str, path: str, _token: str, payload=None):
+            calls.append((method, path, payload))
+            if path == "/api/agent/collect-report":
+                return {"job_id": "job-1", "poll_url": "/api/agent/jobs/job-1", "channel_ids": ["wechat-mp-rss"]}
+            if path == "/api/agent/jobs/job-1":
+                return {"id": "job-1", "status": "completed", "lookback_days": 7, "query": "长光华芯", "runs": []}
+            if path.startswith("/api/agent/jobs/job-1/evidence"):
+                return {"selected_items": [], "attached_snapshot_counts": []}
+            raise AssertionError(path)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            env_file = Path(tmp) / "cloud.env"
+            env_file.write_text("ALPHADESK_AGENT_TOKEN=test-token\n", encoding="utf-8")
+            argv = [
+                "collect_report.py",
+                "--days",
+                "7",
+                "--query",
+                "长光华芯",
+                "--env-file",
+                str(env_file),
+                "--interval",
+                "0",
+            ]
+            with patch.object(sys, "argv", argv), patch.object(self.script, "request_json", side_effect=fake_request):
+                self.assertEqual(self.script.main(), 0)
+
+        self.assertEqual(
+            calls[0],
+            (
+                "POST",
+                "/api/agent/collect-report",
+                {"lookback_days": 7, "force_refresh": True, "query": "长光华芯"},
+            ),
+        )
 
 
 if __name__ == "__main__":
