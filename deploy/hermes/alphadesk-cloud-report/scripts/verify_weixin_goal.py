@@ -21,6 +21,7 @@ DEFAULT_ENV_FILE = Path("/opt/alphadesk/deploy/cloud.env")
 DEFAULT_HERMES_HOME = Path.home() / ".hermes"
 DEFAULT_SOURCE_STATUS_CACHE = Path(os.environ.get("ALPHADESK_SOURCE_STATUS_CACHE", "/tmp/alphadesk-source-status-cache.json"))
 AGENT_CHANNEL_IDS = ("wechat-mp-rss", "ima-knowledge", "zsxq")
+ALPHADESK_COMMAND_AUDIT_FILE = "alphadesk-command.audit.jsonl"
 GATEWAY_LOG_PATTERNS = {
     "weixin_adapter_inbound": re.compile(r"\[Weixin\] inbound"),
     "weixin_message": re.compile(r"inbound message: platform=weixin"),
@@ -235,11 +236,43 @@ def read_alphadesk_plugin_diagnostics(hermes_home: Path) -> dict[str, Any]:
     return details
 
 
+def read_alphadesk_command_audit_diagnostics(hermes_home: Path, max_lines: int = 1000) -> dict[str, Any]:
+    path = hermes_home / ALPHADESK_COMMAND_AUDIT_FILE
+    if not path.exists():
+        return {"exists": False}
+    latest: dict[str, Any] | None = None
+    parse_errors = 0
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    for line in lines[-max_lines:]:
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            parse_errors += 1
+            continue
+        latest = {
+            "timestamp_iso": item.get("timestamp_iso") or iso_from_epoch(item.get("timestamp")),
+            "platform": item.get("platform"),
+            "days": item.get("days"),
+            "chat_hash": sha_preview(str(item.get("chat_id") or "")),
+            "user_hash": sha_preview(str(item.get("user_id") or item.get("user_name") or "")),
+            "content_preview": str(item.get("content_preview") or "")[:120],
+        }
+    return {
+        "exists": True,
+        "updated_at": path_mtime_iso(path),
+        "latest": latest,
+        "parse_errors": parse_errors,
+    }
+
+
 def read_ingress_diagnostics(hermes_home: Path) -> dict[str, Any]:
     return {
         "weixin_sync": read_weixin_sync_diagnostics(hermes_home),
         "gateway_log": read_gateway_log_diagnostics(hermes_home),
         "alphadesk_command_plugin": read_alphadesk_plugin_diagnostics(hermes_home),
+        "alphadesk_command_audit": read_alphadesk_command_audit_diagnostics(hermes_home),
     }
 
 
@@ -248,8 +281,63 @@ def parse_sources(value: str) -> list[str]:
     return sources or ["weixin"]
 
 
+def compact_command_text(value: str) -> str:
+    return re.sub(r"\s+", "", str(value or "")).strip()
+
+
+def command_window_days(value: str) -> int | None:
+    match = re.search(r"采集近?\s*(\d{1,2})\s*天", str(value or ""))
+    if not match:
+        return None
+    return max(1, min(30, int(match.group(1))))
+
+
 def sql_placeholders(values: list[str]) -> str:
     return ",".join("?" for _ in values)
+
+
+def find_audited_platform_command(
+    hermes_home: Path,
+    sources: list[str],
+    command: str,
+    min_timestamp: float,
+) -> dict[str, Any] | None:
+    path = hermes_home / ALPHADESK_COMMAND_AUDIT_FILE
+    if not path.exists():
+        return None
+    target_days = command_window_days(command)
+    target_compact = compact_command_text(command)
+    best: dict[str, Any] | None = None
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        platform = str(item.get("platform") or "")
+        if platform not in sources:
+            continue
+        timestamp = float(item.get("timestamp") or 0)
+        if timestamp < min_timestamp:
+            continue
+        if target_days is not None and int(item.get("days") or 0) != target_days:
+            continue
+        content_preview = str(item.get("content_preview") or "")
+        if target_days is None and target_compact not in compact_command_text(content_preview):
+            continue
+        candidate = {
+            "id": None,
+            "session_id": "",
+            "source": platform,
+            "timestamp": timestamp,
+            "timestamp_iso": item.get("timestamp_iso") or iso_from_epoch(timestamp),
+            "content_preview": content_preview[:80],
+            "evidence": "alphadesk_command_audit",
+        }
+        if best is None or float(candidate["timestamp"]) > float(best["timestamp"]):
+            best = candidate
+    return best
 
 
 def find_platform_command(
@@ -260,39 +348,39 @@ def find_platform_command(
     min_timestamp: float,
 ) -> dict[str, Any] | None:
     state_db = hermes_home / "state.db"
-    if not state_db.exists():
-        return None
-    conn = sqlite3.connect(str(state_db))
-    conn.row_factory = sqlite3.Row
-    try:
-        source_marks = sql_placeholders(sources)
-        row = conn.execute(
-            f"""
-            SELECT m.id,m.session_id,s.source,m.role,m.content,m.timestamp
-            FROM messages m
-            LEFT JOIN sessions s ON s.id=m.session_id
-            WHERE s.source IN ({source_marks})
-              AND m.role='user'
-              AND m.id>?
-              AND m.timestamp>=?
-              AND m.content LIKE ?
-            ORDER BY m.id DESC
-            LIMIT 1
-            """,
-            (*sources, min_message_id, min_timestamp, f"%{command}%"),
-        ).fetchone()
-        if not row:
-            return None
-        return {
-            "id": row["id"],
-            "session_id": row["session_id"],
-            "source": row["source"],
-            "timestamp": row["timestamp"],
-            "timestamp_iso": iso_from_epoch(row["timestamp"]),
-            "content_preview": str(row["content"] or "")[:80],
-        }
-    finally:
-        conn.close()
+    if state_db.exists():
+        conn = sqlite3.connect(str(state_db))
+        conn.row_factory = sqlite3.Row
+        try:
+            source_marks = sql_placeholders(sources)
+            row = conn.execute(
+                f"""
+                SELECT m.id,m.session_id,s.source,m.role,m.content,m.timestamp
+                FROM messages m
+                LEFT JOIN sessions s ON s.id=m.session_id
+                WHERE s.source IN ({source_marks})
+                  AND m.role='user'
+                  AND m.id>?
+                  AND m.timestamp>=?
+                  AND m.content LIKE ?
+                ORDER BY m.id DESC
+                LIMIT 1
+                """,
+                (*sources, min_message_id, min_timestamp, f"%{command}%"),
+            ).fetchone()
+            if row:
+                return {
+                    "id": row["id"],
+                    "session_id": row["session_id"],
+                    "source": row["source"],
+                    "timestamp": row["timestamp"],
+                    "timestamp_iso": iso_from_epoch(row["timestamp"]),
+                    "content_preview": str(row["content"] or "")[:80],
+                    "evidence": "messages",
+                }
+        finally:
+            conn.close()
+    return find_audited_platform_command(hermes_home, sources, command, min_timestamp)
 
 
 def latest_platform_messages(hermes_home: Path, sources: list[str], limit: int = 5) -> list[dict[str, Any]]:

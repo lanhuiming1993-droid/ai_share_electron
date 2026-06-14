@@ -138,6 +138,85 @@ class VerifyWeixinGoalDiagnosticsTests(unittest.TestCase):
         self.assertFalse(result["_cache"]["hit"])
         self.assertEqual(result["ima-knowledge"]["status"], "online")
 
+    def test_audited_gateway_command_can_complete_goal_without_state_message(self) -> None:
+        command_ts = self.verify.parse_iso("2026-06-14T05:00:04+00:00")
+        audit_path = self.hermes_home / self.verify.ALPHADESK_COMMAND_AUDIT_FILE
+        audit_path.write_text(
+            json.dumps(
+                {
+                    "timestamp": command_ts,
+                    "timestamp_iso": "2026-06-14T05:00:04+00:00",
+                    "platform": "weixin",
+                    "days": 30,
+                    "chat_id": "chat-secret",
+                    "user_id": "user-secret",
+                    "content_preview": "请帮我采集近 30 天的数据，并生成分析报告。",
+                },
+                ensure_ascii=False,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        workbench_db = self.hermes_home / "workbench.db"
+        conn = sqlite3.connect(workbench_db)
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE source_collection_jobs (
+                  id TEXT PRIMARY KEY, action TEXT NOT NULL, status TEXT NOT NULL,
+                  lookback_days INTEGER NOT NULL, snapshot_count INTEGER NOT NULL DEFAULT 0,
+                  created_at TEXT NOT NULL, started_at TEXT NOT NULL DEFAULT '',
+                  completed_at TEXT NOT NULL DEFAULT '', report TEXT
+                );
+                CREATE TABLE source_collection_runs (
+                  job_id TEXT NOT NULL, channel_id TEXT NOT NULL, status TEXT NOT NULL,
+                  snapshot_count INTEGER NOT NULL DEFAULT 0, duplicate_count INTEGER NOT NULL DEFAULT 0,
+                  started_at TEXT NOT NULL DEFAULT '', completed_at TEXT NOT NULL DEFAULT '',
+                  error TEXT NOT NULL DEFAULT ''
+                );
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO source_collection_jobs(id,action,status,lookback_days,created_at,report)
+                VALUES('job','collect_report','review',30,'2026-06-14T05:00:05+00:00','<html></html>')
+                """
+            )
+            conn.executemany(
+                "INSERT INTO source_collection_runs(job_id,channel_id,status) VALUES('job',?,?)",
+                [
+                    ("wechat-mp-rss", "deduplicated"),
+                    ("ima-knowledge", "cached_after_error"),
+                    ("zsxq", "deduplicated"),
+                ],
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        args = SimpleNamespace(
+            env_file=self.hermes_home / "cloud.env",
+            workbench_db=workbench_db,
+            sources="weixin,lightclawbot",
+            command="采集近30天数据并生成报告",
+            since_message_id=0,
+            since_iso="2026-06-14T05:00:00+00:00",
+            check_sources=False,
+            base_url="http://127.0.0.1:18080",
+            source_status_cache=self.hermes_home / "source-cache.json",
+            source_check_ttl=900,
+            force_source_check=False,
+            hermes_home=self.hermes_home,
+        )
+
+        complete, summary = self.verify.verify_once(args)
+
+        self.assertTrue(complete)
+        self.assertEqual(summary["matched_platform_command"]["evidence"], "alphadesk_command_audit")
+        self.assertEqual(summary["matched_report_job"]["id"], "job")
+        audit_diagnostics = summary["ingress_diagnostics"]["alphadesk_command_audit"]
+        self.assertTrue(audit_diagnostics["exists"])
+        self.assertNotIn("chat-secret", json.dumps(audit_diagnostics, ensure_ascii=False))
+
     def test_partial_review_is_not_goal_complete(self) -> None:
         workbench_db = self.hermes_home / "workbench.db"
         conn = sqlite3.connect(workbench_db)
