@@ -457,11 +457,19 @@ def find_platform_response(
                 "timestamp": row["timestamp"],
                 "timestamp_iso": iso_from_epoch(row["timestamp"]),
                 "content_chars": len(content),
+                "content": content,
                 "content_preview": content[:160],
             }
         return None
     finally:
         conn.close()
+
+
+def pdf_media_paths(response: dict[str, Any] | None) -> list[str]:
+    if not response:
+        return []
+    content = str(response.get("content") or response.get("content_preview") or "")
+    return re.findall(r"MEDIA:(/\S+?\.pdf)\b", content)
 
 
 def collect_source_status(base_url: str) -> dict[str, dict[str, Any]]:
@@ -610,6 +618,8 @@ def verify_once(args: argparse.Namespace) -> tuple[bool, dict[str, Any]]:
             job_ready = job.get("status") in AGENT_COLLECTION_READY_STATUSES
         else:
             job_ready = bool(job.get("report_ready")) and job.get("status") in LEGACY_REPORT_READY_STATUSES
+    response_pdf_media = pdf_media_paths(response)
+    require_pdf_media = bool(getattr(args, "require_pdf_media", False))
     complete = bool(
         command
         and job
@@ -617,9 +627,11 @@ def verify_once(args: argparse.Namespace) -> tuple[bool, dict[str, Any]]:
         and required_run_ids.issubset(actual_run_ids)
         and required_run_ids.issubset(attached_run_ids)
         and response
+        and (not require_pdf_media or response_pdf_media)
     )
     summary = {
         "complete": complete,
+        "require_pdf_media": require_pdf_media,
         "command": args.command,
         "gateway": read_gateway_state(args.hermes_home),
         "weixin_directory": read_weixin_directory(args.hermes_home),
@@ -631,6 +643,7 @@ def verify_once(args: argparse.Namespace) -> tuple[bool, dict[str, Any]]:
         "workbench_db": str(workbench_db) if workbench_db else "",
         "matched_report_job": job,
         "matched_platform_response": response,
+        "response_pdf_media": response_pdf_media,
     }
     return complete, summary
 
@@ -651,6 +664,7 @@ def main() -> int:
     parser.add_argument("--source-status-cache", type=Path, default=DEFAULT_SOURCE_STATUS_CACHE)
     parser.add_argument("--source-check-ttl", type=int, default=900, help="seconds to cache expensive source checks")
     parser.add_argument("--force-source-check", action="store_true", help="ignore the source status cache")
+    parser.add_argument("--require-pdf-media", action="store_true", help="require the response to include MEDIA:/...pdf")
     args = parser.parse_args()
 
     deadline = time.time() + max(args.watch_seconds, 0)

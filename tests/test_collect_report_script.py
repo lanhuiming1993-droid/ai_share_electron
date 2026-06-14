@@ -63,6 +63,8 @@ class AlphaDeskCollectReportScriptTests(unittest.TestCase):
         self.assertIn("请你作为行业分析师", output)
         self.assertIn("光模块与材料涨价线索", output)
         self.assertIn("Snapshot coverage", output)
+        self.assertIn("render_report_pdf.py", output)
+        self.assertIn("MEDIA:/absolute/path/to/report.pdf", output)
 
     def test_format_evidence_for_hermes_truncates_selected_evidence(self) -> None:
         latest_status = {"id": "job-1", "status": "completed", "lookback_days": 30, "runs": []}

@@ -120,6 +120,8 @@ def format_evidence_for_hermes(latest_status: dict, evidence: dict, max_evidence
     lines.append("- 明确标注信息来自 WeRSS、IMA 知识库或知识星球；微信公众号内容尽量写出具体公众号/作者。")
     lines.append("- 对 IMA live 403 这类缓存兜底要如实说明为 cached evidence，不要包装成实时采集成功。")
     lines.append("- 给出待核验事项和风险提示。")
+    lines.append("- 默认交付 PDF：先把完整报告写成 HTML/Markdown 文件，再调用 render_report_pdf.py 生成 PDF。")
+    lines.append("- 最终聊天回复只发送一句简短说明和 MEDIA:/absolute/path/to/report.pdf，不要贴完整文字版报告。")
     return "\n".join(lines)
 
 

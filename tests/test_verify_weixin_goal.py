@@ -254,6 +254,77 @@ class VerifyWeixinGoalDiagnosticsTests(unittest.TestCase):
         self.assertTrue(audit_diagnostics["exists"])
         self.assertNotIn("chat-secret", json.dumps(audit_diagnostics, ensure_ascii=False))
 
+    def test_pdf_media_can_be_required_for_goal_completion(self) -> None:
+        job = {
+            "id": "job",
+            "action": "collect",
+            "status": "partial_completed",
+            "report_ready": 0,
+            "runs": [
+                {"channel_id": "wechat-mp-rss"},
+                {"channel_id": "ima-knowledge"},
+                {"channel_id": "zsxq"},
+            ],
+            "attached_snapshot_counts": [
+                {"channel_id": "wechat-mp-rss", "count": 1},
+                {"channel_id": "ima-knowledge", "count": 1},
+                {"channel_id": "zsxq", "count": 1},
+            ],
+        }
+        args = SimpleNamespace(
+            env_file=self.hermes_home / "cloud.env",
+            workbench_db=self.hermes_home / "workbench.db",
+            sources="weixin",
+            command="采集近30天数据并生成报告",
+            since_message_id=0,
+            since_iso="",
+            check_sources=False,
+            base_url="http://127.0.0.1:18080",
+            source_status_cache=self.hermes_home / "source-cache.json",
+            source_check_ttl=900,
+            force_source_check=False,
+            hermes_home=self.hermes_home,
+            require_pdf_media=True,
+        )
+
+        with (
+            patch.object(self.verify, "parse_env", return_value={}),
+            patch.object(self.verify, "resolve_workbench_db", return_value=args.workbench_db),
+            patch.object(self.verify, "find_platform_command", return_value={"timestamp": 1.0}),
+            patch.object(self.verify, "find_report_job", return_value=job),
+            patch.object(self.verify, "read_gateway_state", return_value={}),
+            patch.object(self.verify, "read_weixin_directory", return_value={}),
+            patch.object(self.verify, "latest_platform_messages", return_value=[]),
+            patch.object(self.verify, "read_ingress_diagnostics", return_value={}),
+            patch.object(
+                self.verify,
+                "find_platform_response",
+                return_value={"content": "已生成文字版报告，但没有文件。", "content_preview": "已生成文字版报告，但没有文件。"},
+            ),
+        ):
+            complete, summary = self.verify.verify_once(args)
+        self.assertFalse(complete)
+        self.assertEqual(summary["response_pdf_media"], [])
+
+        with (
+            patch.object(self.verify, "parse_env", return_value={}),
+            patch.object(self.verify, "resolve_workbench_db", return_value=args.workbench_db),
+            patch.object(self.verify, "find_platform_command", return_value={"timestamp": 1.0}),
+            patch.object(self.verify, "find_report_job", return_value=job),
+            patch.object(self.verify, "read_gateway_state", return_value={}),
+            patch.object(self.verify, "read_weixin_directory", return_value={}),
+            patch.object(self.verify, "latest_platform_messages", return_value=[]),
+            patch.object(self.verify, "read_ingress_diagnostics", return_value={}),
+            patch.object(
+                self.verify,
+                "find_platform_response",
+                return_value={"content": "已生成 PDF。\nMEDIA:/home/ubuntu/.hermes/alphadesk-reports/report.pdf"},
+            ),
+        ):
+            complete, summary = self.verify.verify_once(args)
+        self.assertTrue(complete)
+        self.assertEqual(summary["response_pdf_media"], ["/home/ubuntu/.hermes/alphadesk-reports/report.pdf"])
+
     def test_partial_review_is_not_goal_complete(self) -> None:
         workbench_db = self.hermes_home / "workbench.db"
         conn = sqlite3.connect(workbench_db)
