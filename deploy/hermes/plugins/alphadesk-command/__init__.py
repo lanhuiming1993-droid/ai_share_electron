@@ -29,6 +29,18 @@ MARKET_HINT_RE = re.compile(
     r"(A股|股票|个股|公司|行业|产业|板块|赛道|财报|公告|估值|订单|产能|半导体|芯片|光模块|算力|新能源|机器人|医药|消费|证券|银行|保险|[036]\d{5})",
     re.I,
 )
+META_OR_RUNTIME_QUESTION_RE = re.compile(
+    r"("
+    r"(hermes|agent|alphadesk|你|你们|这里|这次|当前|后台).{0,30}"
+    r"(配置|供应商|模型|provider|config\.ya?ml|deepseek|jojo|skill|插件|工具|mcp|日志|调用|用了|使用|走的)"
+    r"|"
+    r"(调用|用了|使用|走了).{0,16}(哪些|什么|哪个|哪几个).{0,16}(skill|插件|工具|mcp|供应商|模型)"
+    r"|"
+    r"(skill|插件|工具|mcp|配置|供应商|模型|provider|config\.ya?ml|deepseek|jojo|api\s*key).{0,30}"
+    r"(吗|么|什么|哪些|哪个|为什么|怎么|如何|是否|是不是)"
+    r")",
+    re.I,
+)
 DEFAULT_AUDIT_PATH = Path.home() / ".hermes" / "alphadesk-command.audit.jsonl"
 DEFAULT_STATE_PATH = Path.home() / ".hermes" / "alphadesk-command.state.json"
 PDF_MEDIA_RE = re.compile(r"MEDIA:/\S+?\.pdf\b", re.I)
@@ -60,6 +72,8 @@ def _match_analysis_request(value: str) -> str | None:
     text = re.sub(r"\s+", " ", str(value or "")).strip()
     if not text:
         return None
+    if META_OR_RUNTIME_QUESTION_RE.search(text):
+        return None
     for pattern in (ANALYSIS_PREFIX_RE, ANALYSIS_SUFFIX_RE):
         match = pattern.search(text)
         if not match:
@@ -73,6 +87,8 @@ def _match_analysis_request(value: str) -> str | None:
 
 
 def _classify_alphadesk_request(value: str) -> dict | None:
+    if META_OR_RUNTIME_QUESTION_RE.search(str(value or "")):
+        return None
     days = _match_report_request(value)
     if days is not None:
         return {"intent": "report", "days": days, "query": ""}

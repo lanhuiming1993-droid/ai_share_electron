@@ -120,6 +120,19 @@ class AlphaDeskCommandPluginTests(unittest.TestCase):
         self.assertIsNone(self.plugin._pre_gateway_dispatch(make_event("采集近30天数据并生成报告", "cli")))
         self.assertIsNone(self.plugin._pre_gateway_dispatch(make_event("你有什么技能", "weixin")))
 
+    def test_ignores_hermes_runtime_and_tooling_meta_questions(self) -> None:
+        meta_questions = [
+            "你在这里进行分析时，调用了哪些Skill/插件/工具？",
+            "为什么后台日志还是走 deepseek 供应商，而不是 jojo？",
+            "Hermes 的 config.yaml 现在配置的是哪个模型？",
+            "这个回答用了哪些 MCP 或 Skill？",
+        ]
+
+        for question in meta_questions:
+            with self.subTest(question=question):
+                self.assertIsNone(self.plugin._classify_alphadesk_request(question))
+                self.assertIsNone(self.plugin._pre_gateway_dispatch(make_event(question, "weixin")))
+
     def test_extracts_command_options_with_query(self) -> None:
         days, query = self.plugin._extract_command_options('--days 7 --query "长光华芯"')
 
