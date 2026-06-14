@@ -27,10 +27,14 @@ metadata: {"clawdbot":{"requires":{"bins":["python3"]},"os":["linux"],"files":["
 - `生成近7天信源报告`
 - `分析一下长光华芯`
 - `长光华芯分析`
+- `卓胜微是不是成长股机会`
+- `300782 有没有戴维斯双击`
 - `A股机器人板块怎么看`
 - `半导体产业链最近有什么变化`
 
 都应执行本 Skill。对于“分析一下 XXX / XXX 分析 / XXX 怎么看”这类请求，把 XXX 作为 `--query` 传给采集脚本；插件会在 AlphaDesk 采集后自动追加问财/研报/公告等 Skill 交叉验证证据。没有明确对象时，按泛化三信源报告处理。
+
+如果请求是单一 A 股公司/股票代码、成长股、戴维斯双击、财务拐点、订单、产能、估值弹性等公司级问题，插件会自动加载 `a-share-growth-hunter` 作为分析框架。该框架不是信源，也不替代 AlphaDesk；它只约束最终报告必须包含市值区间、六维评分、公开披露与私域线索一致性、右侧确认信号和证伪信号。
 
 ## Authorization First
 
@@ -103,8 +107,9 @@ python3 {baseDir}/scripts/collect_report.py --days 30 --query "长光华芯"
 5. 每个主题必须有信源标签和资讯等级/类别标签。
 6. 如果外部 Skill 与 AlphaDesk 证据冲突，要写出冲突来源、数据口径、时间戳和置信度，不要静默合并。
 7. 如果 IMA 使用 cached evidence，要如实说明为缓存兜底，不要包装成实时采集成功。
-8. HTML 保存为 `/tmp/alphadesk-report-{job_id}.html`。
-9. 调用 PDF 渲染脚本：
+8. 如果启用 `a-share-growth-hunter`，必须额外输出“市值区间与六维评分”“公开披露与私域线索一致性”“右侧确认信号/证伪信号”；证据不足时只能给 watchlist/cautious，不得强行高确信。
+9. HTML 保存为 `/tmp/alphadesk-report-{job_id}.html`。
+10. 调用 PDF 渲染脚本：
 
 ```bash
 /opt/alphadesk/.venv/bin/python {baseDir}/scripts/render_report_pdf.py \

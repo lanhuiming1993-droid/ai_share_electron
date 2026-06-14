@@ -209,6 +209,36 @@ class AlphaDeskCommandPluginTests(unittest.TestCase):
         self.assertEqual(env["IWENCAI_BASE_URL"], "https://openapi.iwencai.com")
         self.assertEqual(env["IWENCAI_API_KEY"], "test-key")
 
+    def test_growth_hunter_framework_routes_only_company_level_queries(self) -> None:
+        self.assertTrue(self.plugin._looks_like_single_stock_query("卓胜微"))
+        self.assertTrue(self.plugin._looks_like_single_stock_query("300782"))
+        self.assertTrue(self.plugin._looks_like_single_stock_query("戴维斯双击机会"))
+        self.assertFalse(self.plugin._looks_like_single_stock_query("A股机器人板块"))
+        self.assertFalse(self.plugin._looks_like_single_stock_query("近三十天信源聚合报告"))
+
+    def test_analysis_prompt_includes_growth_hunter_framework_for_stock_query(self) -> None:
+        skill_path = Path(self.tmp.name) / "a-share-growth-hunter" / "SKILL.md"
+        skill_path.parent.mkdir(parents=True, exist_ok=True)
+        skill_path.write_text("Growth framework: 六维评分、右侧确认信号、证伪信号。", encoding="utf-8")
+
+        with patch.object(self.plugin, "GROWTH_HUNTER_SKILL_PATH", skill_path):
+            prompt = self.plugin._analysis_prompt("Selected evidence:\ncontent", days=30, query="卓胜微")
+
+        self.assertIn("A-Share Growth Hunter Framework", prompt)
+        self.assertIn("六维评分", prompt)
+        self.assertIn("右侧确认信号/证伪信号", prompt)
+
+    def test_analysis_prompt_omits_growth_hunter_framework_for_broad_sector_query(self) -> None:
+        skill_path = Path(self.tmp.name) / "a-share-growth-hunter" / "SKILL.md"
+        skill_path.parent.mkdir(parents=True, exist_ok=True)
+        skill_path.write_text("Growth framework should not be loaded.", encoding="utf-8")
+
+        with patch.object(self.plugin, "GROWTH_HUNTER_SKILL_PATH", skill_path):
+            prompt = self.plugin._analysis_prompt("Selected evidence:\ncontent", days=30, query="A股机器人板块")
+
+        self.assertNotIn("A-Share Growth Hunter Framework", prompt)
+        self.assertNotIn("Growth framework should not be loaded", prompt)
+
     def test_pre_llm_call_records_alphadesk_session_and_injects_pdf_context(self) -> None:
         result = self.plugin._pre_llm_call(
             platform="lightclawbot",
