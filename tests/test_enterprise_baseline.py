@@ -61,6 +61,14 @@ class EnterpriseBaselineTests(unittest.TestCase):
         self.assertEqual(telemetry["status"], "disabled")
         self.assertEqual(telemetry_check(telemetry)["status"], "info")
 
+    def test_cloud_compose_leaves_llm_access_to_hermes(self) -> None:
+        compose = Path(__file__).resolve().parents[1].joinpath("compose.cloud.yaml").read_text(encoding="utf-8")
+
+        self.assertIn('ALPHADESK_BACKEND_REPORTS_ENABLED: "0"', compose)
+        self.assertNotIn("ALPHADESK_MODEL_API_KEY", compose)
+        self.assertNotIn("ALPHADESK_MODEL_BASE_URL", compose)
+        self.assertNotIn("ALPHADESK_MODEL_PROTOCOL", compose)
+
 
 if __name__ == "__main__":
     unittest.main()

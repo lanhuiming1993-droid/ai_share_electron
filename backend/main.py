@@ -111,6 +111,7 @@ REPORT_DEDUP_INTERVAL = timedelta(minutes=2)
 MASKED_SECRET = "****************"
 BROWSER_WORKSPACE_PUBLIC_URL = os.environ.get("ALPHADESK_BROWSER_PUBLIC_URL", "").strip()
 STARTUP_CHANNEL_CHECK_ENABLED = os.environ.get("ALPHADESK_STARTUP_CHANNEL_CHECK", "1").strip().lower() not in {"0", "false", "no"}
+BACKEND_REPORTS_ENABLED = os.environ.get("ALPHADESK_BACKEND_REPORTS_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
 CHANNEL_LOGIN_PROCESSES: dict[str, subprocess.Popen] = {}
 CHANNEL_LOGIN_PROCESSES_LOCK = threading.Lock()
 MAX_MX_HAR_BYTES = 32 * 1024 * 1024
@@ -3840,6 +3841,7 @@ collection_worker = CollectionWorker(
     report_after_collection=report_after_collection,
     normalize_snapshot=normalize_snapshot_record,
     request_config_for=channel_request_config,
+    reports_enabled=BACKEND_REPORTS_ENABLED,
 )
 
 
@@ -3891,6 +3893,8 @@ def source_job_list_response(conn: sqlite3.Connection, rows: list[dict]) -> list
 
 @app.post("/api/source-jobs")
 def create_source_job(payload: SourceJobInput) -> dict:
+    if not BACKEND_REPORTS_ENABLED and payload.action == "report":
+        raise HTTPException(409, "Backend report generation is disabled; use Hermes to analyze evidence and generate the report")
     if payload.action in ("collect_report", "report"):
         ensure_general_source_report(payload)
     scope_key = canonical_scope_key(payload.query)

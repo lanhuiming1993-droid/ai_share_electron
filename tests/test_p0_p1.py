@@ -162,6 +162,37 @@ class WorkerBehaviorTests(unittest.TestCase):
         self.assertIn("quota exhausted", run[2])
         self.assertEqual(linked, 1)
 
+    def test_collect_report_does_not_generate_backend_report_when_reports_are_disabled(self) -> None:
+        disabled_worker = CollectionWorker(
+            db_path=self.db_path,
+            profile_for=lambda channel_id: Path(self.temp_dir.name) / channel_id,
+            report_after_collection=Mock(side_effect=AssertionError("backend model report should not run")),
+            reports_enabled=False,
+            poll_seconds=0.01,
+        )
+        self.insert_channels("cached")
+        window = {"channel_id": "cached", "window_start": timestamp(-30), "window_end": timestamp()}
+        job = self.insert_job("disabled-report", [window], action="collect_report")
+        job["report_title"] = "disabled report"
+        with database(self.db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO source_snapshots(id,channel_id,occurred_at,collected_at,source_url,content,scope_type,scope_key)
+                VALUES('cached-disabled','cached',?,?, 'cached://disabled','{}','general','')
+                """,
+                (timestamp(-5), timestamp(-4)),
+            )
+
+        with patch("backend.worker.collect_channel", side_effect=RuntimeError("quota exhausted")):
+            disabled_worker.execute(job)
+
+        with database(self.db_path) as conn:
+            stored = conn.execute("SELECT status,report FROM source_collection_jobs WHERE id='disabled-report'").fetchone()
+            linked = conn.execute("SELECT COUNT(*) FROM source_job_snapshots WHERE job_id='disabled-report'").fetchone()[0]
+        self.assertEqual(stored[0], "partial_completed")
+        self.assertIsNone(stored[1])
+        self.assertEqual(linked, 1)
+
     def test_collect_uses_cached_window_snapshots_when_live_source_fails(self) -> None:
         self.insert_channels("cached")
         window = {"channel_id": "cached", "window_start": timestamp(-30), "window_end": timestamp()}

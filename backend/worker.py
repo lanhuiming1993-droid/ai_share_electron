@@ -50,6 +50,7 @@ class CollectionWorker:
         normalize_snapshot: Callable[..., dict] | None = None,
         on_evidence_ready: Callable[[str], None] | None = None,
         request_config_for: Callable[[str], dict] | None = None,
+        reports_enabled: bool = True,
         poll_seconds: float = 1.5,
     ) -> None:
         self.db_path = db_path
@@ -58,6 +59,7 @@ class CollectionWorker:
         self.normalize_snapshot = normalize_snapshot
         self.on_evidence_ready = on_evidence_ready
         self.request_config_for = request_config_for
+        self.reports_enabled = reports_enabled
         self.poll_seconds = poll_seconds
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
@@ -123,10 +125,11 @@ class CollectionWorker:
                 """
                 SELECT * FROM source_collection_jobs
                 WHERE status='queued'
-                   OR (action IN ('report','collect_report') AND report IS NULL
+                   OR (:reports_enabled AND action IN ('report','collect_report') AND report IS NULL
                        AND status IN ('completed','deduplicated','partial_completed','generating_report'))
                 ORDER BY created_at LIMIT 1
-                """
+                """,
+                {"reports_enabled": 1 if self.reports_enabled else 0},
             ).fetchone()
             if not row:
                 return None
@@ -435,7 +438,7 @@ class CollectionWorker:
         if not successful_channels:
             self.fail_job(job, json.dumps(errors, ensure_ascii=False) or "No source channel completed successfully")
             return
-        if job["action"] == "collect_report":
+        if job["action"] == "collect_report" and self.reports_enabled:
             status = "generating_report"
         elif errors:
             status = "partial_completed"
@@ -460,7 +463,7 @@ class CollectionWorker:
             successful_channels=sorted(successful_channels),
             channel_errors=errors,
         )
-        if job["action"] == "collect_report":
+        if job["action"] == "collect_report" and self.reports_enabled:
             self.generate_report(job)
         if job.get("parent_task_id") and self.on_evidence_ready:
             try:
